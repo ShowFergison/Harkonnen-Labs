@@ -5,6 +5,7 @@ pub mod benchmark;
 pub mod calvin_archive;
 pub mod calvin_client;
 pub mod capacity;
+pub mod causal_graph;
 pub mod chat;
 pub mod cladder;
 pub mod claude_pack;

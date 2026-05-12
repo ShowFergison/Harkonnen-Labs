@@ -2656,6 +2656,9 @@ mod mcp_e2e {
         let operator_models = crate::operator_model::OperatorModelStore::new(pool.clone());
         let dispatcher =
             crate::subagent::SubAgentDispatcher::new(Default::default(), setup.clone());
+        let causal_graph = Arc::new(crate::causal_graph::NoopCausalGraphStore::new(
+            crate::causal_graph::CausalGraphConfig::from(&paths.setup.typedb),
+        ));
 
         let app = crate::orchestrator::AppContext {
             paths,
@@ -2671,6 +2674,7 @@ mod mcp_e2e {
             calvin: None,
             open_brain: None,
             semantic_memory: Arc::new(crate::memory::NoopSemanticMemory),
+            causal_graph,
             dispatcher,
         };
 

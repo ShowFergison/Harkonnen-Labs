@@ -42,6 +42,13 @@ surface      = "vscode"
 # Optional for BYO OpenAI-compatible endpoints: e.g. "http://localhost:11434" or "https://openrouter.ai/api/v1"
 # base_url     = "http://localhost:11434"
 
+[typedb]
+enabled = false
+url = "localhost:1729"
+database = "harkonnen_semantic"
+schema_path = "factory/coobie_semantic/typedb/schema.tql"
+reasoning_mode = "function_backed"
+
 [routing.agents]
 coobie = "claude"
 mason  = "claude"

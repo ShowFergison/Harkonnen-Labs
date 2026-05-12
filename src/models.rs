@@ -645,6 +645,8 @@ pub struct CoobieBriefing {
     #[serde(default)]
     pub project_memory_hits: Vec<String>,
     #[serde(default)]
+    pub agent_memory_block_refs: Vec<String>,
+    #[serde(default)]
     pub resume_packet_summary: Vec<String>,
     #[serde(default)]
     pub resume_packet_risks: Vec<ProjectResumeRisk>,
@@ -780,6 +782,23 @@ pub struct AgentRuntimeState {
     pub source: String,
     #[serde(default)]
     pub last_heartbeat_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentState {
+    pub agent_name: String,
+    pub agent_role: String,
+    pub llm_provider: String,
+    pub llm_model: String,
+    #[serde(default)]
+    pub memory_block_ids: BTreeMap<String, String>,
+    #[serde(default)]
+    pub last_stop_reason: Option<String>,
+    #[serde(default)]
+    pub last_active_run: Option<String>,
+    #[serde(default)]
+    pub behavior_contract_hash: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

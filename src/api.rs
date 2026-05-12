@@ -21,8 +21,10 @@ use tracing::info;
 
 use crate::{
     calvin_archive::SoulBootstrapDocument,
+    causal_graph::{CausalGraphStatus, CausalGraphStatusResponse},
     chat::{dispatch_message, ChatThread, ChatThreadKind, OpenThreadRequest, PostMessageRequest},
     coobie::CausalReport,
+    db,
     llm::{self, LlmRequest},
     memory::{MemoryRetrievalHit, MemoryStore},
     models::{
@@ -847,6 +849,9 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         )
         .route("/api/chat", post(post_chat))
         .route("/api/coobie/query", post(post_coobie_query))
+        .route("/api/agent-state", get(list_agent_state))
+        .route("/api/agent-state/:name", get(get_agent_state))
+        .route("/api/causal-graph/status", get(get_causal_graph_status))
         .route("/api/agents/:id/chat", post(post_agent_chat))
         .route("/api/agents/:id/unblock", post(post_agent_unblock))
         .route(
@@ -890,6 +895,10 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route("/api/runs/:id/coobie-signals", get(get_coobie_signals))
         .route("/api/runs/:id/causal-report", get(get_causal_report))
         .route("/api/runs/:id/causal-events", get(get_run_causal_events))
+        .route(
+            "/api/runs/:id/causal-graph-projection",
+            get(get_run_causal_graph_projection),
+        )
         .route("/api/runs/:id/cost", get(get_run_cost))
         .route("/api/runs/:id/decisions", get(get_run_decisions))
         .route("/api/runs/:id/traces", get(get_run_traces))
@@ -2211,6 +2220,63 @@ fn briefing_scope_artifact(scope: Option<&str>) -> Option<(String, String)> {
     }
 }
 
+async fn list_agent_state(State(app): State<AppContext>) -> impl IntoResponse {
+    match crate::db::list_agent_state(&app.pool).await {
+        Ok(state) => (StatusCode::OK, Json(state)).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_agent_state(
+    Path(name): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match crate::db::get_agent_state(&app.pool, &name).await {
+        Ok(Some(state)) => (StatusCode::OK, Json(state)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Agent state not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_causal_graph_status(State(app): State<AppContext>) -> impl IntoResponse {
+    let config = app.causal_graph.config();
+    let projection_count = match db::count_causal_graph_projections(&app.pool).await {
+        Ok(count) => count,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    };
+    let latest_projection = match db::list_causal_graph_projection_summaries(&app.pool, 1).await {
+        Ok(mut records) => records.pop(),
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    };
+    let status = if config.enabled {
+        CausalGraphStatus::Unavailable
+    } else {
+        CausalGraphStatus::Disabled
+    };
+    let note = if config.enabled {
+        Some("TypeDB 3.x is configured; run graphs are currently mirrored into the SQLite projection ledger until the live adapter is enabled.".to_string())
+    } else {
+        Some("TypeDB is disabled; run graphs are mirrored into the SQLite projection ledger for inspectability and replay.".to_string())
+    };
+
+    (
+        StatusCode::OK,
+        Json(CausalGraphStatusResponse {
+            status,
+            backend: config.backend.clone(),
+            enabled: config.enabled,
+            url: config.url.clone(),
+            database: config.database.clone(),
+            schema_path: config.schema_path.clone(),
+            reasoning_mode: config.reasoning_mode.clone(),
+            projection_count,
+            latest_projection,
+            note,
+        }),
+    )
+        .into_response()
+}
+
 async fn get_coobie_response(
     Path(id): Path<String>,
     State(app): State<AppContext>,
@@ -2467,6 +2533,35 @@ async fn get_run_causal_events(
     match app.get_run(&id).await {
         Ok(Some(_)) => match app.get_run_causal_graph(&id).await {
             Ok(graph) => (StatusCode::OK, Json(graph)).into_response(),
+            Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_run_causal_graph_projection(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match db::get_causal_graph_projection(&app.pool, &id).await {
+            Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
+            Ok(None) => match app.get_run_causal_graph(&id).await {
+                Ok(_) => match db::get_causal_graph_projection(&app.pool, &id).await {
+                    Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
+                    Ok(None) => {
+                        (StatusCode::NOT_FOUND, "Causal graph projection not generated")
+                            .into_response()
+                    }
+                    Err(error) => {
+                        (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                    }
+                },
+                Err(error) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                }
+            },
             Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
         },
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
@@ -2927,6 +3022,63 @@ async fn answer_general_coobie_query(
 ) -> anyhow::Result<CoobieQueryResponse> {
     let mut retrieval_path = Vec::new();
     let mut sources = Vec::new();
+    let causal_graph_result = if looks_like_causal_graph_query(query) {
+        let result = app
+            .causal_graph
+            .query(crate::causal_graph::CausalGraphQuery {
+                question: query.to_string(),
+                run_id: run_id.map(str::to_string),
+                spec_id: None,
+                limit: 6,
+            })
+            .await?;
+        retrieval_path.push(format!("typed_causal_graph:{:?}", result.status));
+        sources.push(CoobieQuerySource {
+            kind: "typed_causal_graph".to_string(),
+            label: format!("{} ({:?})", result.database, result.status),
+            run_id: run_id.map(str::to_string),
+            phase: None,
+            artifact: Some(app.causal_graph.config().schema_path.clone()),
+            hop: None,
+            query: Some(query.to_string()),
+            score: None,
+            status: Some(format!("{:?}", result.status).to_ascii_lowercase()),
+            superseded_by: None,
+            challenged_by: Vec::new(),
+            note: result.note.clone(),
+        });
+        Some(result)
+    } else {
+        None
+    };
+    let projection_hits = if looks_like_causal_graph_query(query) {
+        search_causal_graph_projection_ledger(app, run_id, query, 6).await?
+    } else {
+        Vec::new()
+    };
+    if !projection_hits.is_empty() {
+        retrieval_path.push("causal_graph_projection_ledger".to_string());
+        for hit in &projection_hits {
+            sources.push(CoobieQuerySource {
+                kind: "causal_graph_projection".to_string(),
+                label: hit.label.clone(),
+                run_id: hit.evidence_refs.first().and_then(|evidence| {
+                    evidence
+                        .strip_prefix("run:")
+                        .map(|value| value.to_string())
+                }),
+                phase: None,
+                artifact: Some("causal_graph_projections".to_string()),
+                hop: None,
+                query: Some(query.to_string()),
+                score: Some(hit.confidence),
+                status: Some("sqlite_projection".to_string()),
+                superseded_by: None,
+                challenged_by: Vec::new(),
+                note: Some(hit.summary.clone()),
+            });
+        }
+    }
     let (memory_retrieval_path, memory_hits) =
         retrieve_multi_hop_memory_hits(app, run_id, query, retrieval_depth).await?;
     retrieval_path.extend(memory_retrieval_path);
@@ -2999,21 +3151,61 @@ async fn answer_general_coobie_query(
             response.push_str(&summary);
             response.push('.');
         }
+        if let Some(graph) = causal_graph_result
+            .as_ref()
+            .and_then(format_causal_graph_note)
+        {
+            response.push(' ');
+            response.push_str(&graph);
+        }
+        if let Some(summary) = format_projection_ledger_summary(&projection_hits) {
+            response.push(' ');
+            response.push_str(&summary);
+        }
         return Ok(CoobieQueryResponse {
             agent: "coobie".to_string(),
             response,
             retrieval_path,
-            confidence: if memory_hits.is_empty() { 0.72 } else { 0.82 },
+            confidence: if memory_hits.is_empty() && projection_hits.is_empty() {
+                0.72
+            } else {
+                0.82
+            },
+            sources,
+        });
+    }
+
+    if let Some(summary) = format_projection_ledger_summary(&projection_hits) {
+        let memory_summary = format_memory_chain_summary(&memory_hits)
+            .map(|value| format!(" {value}."))
+            .unwrap_or_default();
+        let graph_note = causal_graph_result
+            .as_ref()
+            .and_then(format_causal_graph_note)
+            .map(|note| format!(" {note}"))
+            .unwrap_or_default();
+        return Ok(CoobieQueryResponse {
+            agent: "coobie".to_string(),
+            response: format!(
+                "I do not have a run in working memory yet, but {summary}{memory_summary}{graph_note}"
+            ),
+            retrieval_path,
+            confidence: 0.68,
             sources,
         });
     }
 
     if let Some(summary) = format_memory_chain_summary(&memory_hits) {
+        let graph_note = causal_graph_result
+            .as_ref()
+            .and_then(format_causal_graph_note)
+            .map(|note| format!(" {note}"))
+            .unwrap_or_default();
         return Ok(CoobieQueryResponse {
             agent: "coobie".to_string(),
             response: format!(
-                "I do not have a run in working memory yet, but {}.",
-                summary
+                "I do not have a run in working memory yet, but {}.{}",
+                summary, graph_note
             ),
             retrieval_path,
             confidence: 0.61,
@@ -3021,13 +3213,234 @@ async fn answer_general_coobie_query(
         });
     }
 
+    retrieval_path.push("working_memory".to_string());
+    retrieval_path.push("memory_chain:hop_1_empty".to_string());
+    let graph_note = causal_graph_result
+        .as_ref()
+        .and_then(format_causal_graph_note)
+        .map(|note| format!(" {note}"))
+        .unwrap_or_default();
+
     Ok(CoobieQueryResponse {
         agent: "coobie".to_string(),
-        response: "I do not have a run in working memory yet. Commission a run or pass a run_id and I can answer from the blackboard, lessons, causal history, and memory chain retrieval.".to_string(),
-        retrieval_path: vec!["working_memory".to_string(), "memory_chain:hop_1_empty".to_string()],
+        response: format!("I do not have a run in working memory yet. Commission a run or pass a run_id and I can answer from the blackboard, lessons, causal history, and memory chain retrieval.{graph_note}"),
+        retrieval_path,
         confidence: 0.42,
         sources,
     })
+}
+
+fn looks_like_causal_graph_query(query: &str) -> bool {
+    let normalized = query.to_ascii_lowercase();
+    [
+        "cause",
+        "caused",
+        "causal",
+        "failure",
+        "failures",
+        "intervention",
+        "counterfactual",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
+}
+
+fn format_causal_graph_note(
+    result: &crate::causal_graph::CausalGraphQueryResult,
+) -> Option<String> {
+    match result.status {
+        crate::causal_graph::CausalGraphStatus::Ready if !result.hits.is_empty() => Some(format!(
+            "Typed causal graph returned {} graph hit(s).",
+            result.hits.len()
+        )),
+        crate::causal_graph::CausalGraphStatus::Unavailable
+        | crate::causal_graph::CausalGraphStatus::Disabled => result.note.clone(),
+        _ => None,
+    }
+}
+
+async fn search_causal_graph_projection_ledger(
+    app: &AppContext,
+    run_id: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<crate::causal_graph::CausalGraphHit>> {
+    let records = if let Some(run_id) = run_id {
+        match db::get_causal_graph_projection(&app.pool, run_id).await? {
+            Some(record) => vec![record],
+            None => {
+                let _ = app.get_run_causal_graph(run_id).await;
+                db::get_causal_graph_projection(&app.pool, run_id)
+                    .await?
+                    .into_iter()
+                    .collect()
+            }
+        }
+    } else {
+        db::list_recent_causal_graph_projections(&app.pool, 12).await?
+    };
+
+    let terms = causal_projection_query_terms(query);
+    let mut hits = Vec::new();
+    for record in records {
+        let graph = serde_json::from_value::<crate::models::RunCausalGraph>(record.graph_json)?;
+        collect_projection_hits(&graph, &terms, limit, &mut hits);
+        if hits.len() >= limit {
+            break;
+        }
+    }
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+fn causal_projection_query_terms(query: &str) -> Vec<String> {
+    query
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|term| term.len() >= 4)
+        .filter(|term| {
+            !matches!(
+                *term,
+                "what" | "when" | "where" | "which" | "from" | "that" | "with" | "have"
+                    | "were" | "been" | "this" | "there" | "into" | "about"
+            )
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn collect_projection_hits(
+    graph: &crate::models::RunCausalGraph,
+    terms: &[String],
+    limit: usize,
+    hits: &mut Vec<crate::causal_graph::CausalGraphHit>,
+) {
+    for hypothesis in &graph.hypotheses {
+        if hits.len() >= limit {
+            return;
+        }
+        let haystack = format!(
+            "{} {} {}",
+            hypothesis.cause_id,
+            hypothesis.description,
+            hypothesis
+                .evidence
+                .iter()
+                .map(|evidence| evidence.summary.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        if projection_text_matches(&haystack, terms) {
+            hits.push(crate::causal_graph::CausalGraphHit {
+                label: format!("hypothesis:{}", hypothesis.cause_id),
+                summary: hypothesis.description.clone(),
+                evidence_refs: vec![format!("run:{}", graph.run_id)],
+                confidence: hypothesis.confidence as f64,
+            });
+        }
+    }
+
+    for link in &graph.links {
+        if hits.len() >= limit {
+            return;
+        }
+        if projection_text_matches(&link.summary, terms)
+            || projection_text_matches(&link.link_type, terms)
+        {
+            hits.push(crate::causal_graph::CausalGraphHit {
+                label: format!("causal-link:{}", link.link_id),
+                summary: link.summary.clone(),
+                evidence_refs: vec![
+                    format!("run:{}", graph.run_id),
+                    format!("from_event:{}", link.from_event),
+                    format!("to_event:{}", link.to_event),
+                ],
+                confidence: link.confidence,
+            });
+        }
+    }
+
+    for episode in &graph.episodes {
+        if hits.len() >= limit {
+            return;
+        }
+        let outcome = episode.episode.outcome.as_deref().unwrap_or("unknown");
+        let haystack = format!(
+            "{} {} {}",
+            episode.episode.phase, episode.episode.goal, outcome
+        );
+        if matches!(outcome, "failure" | "blocked")
+            || projection_text_matches(&haystack, terms)
+        {
+            hits.push(crate::causal_graph::CausalGraphHit {
+                label: format!("episode:{}", episode.episode.episode_id),
+                summary: format!(
+                    "{} episode ended as {}: {}",
+                    episode.episode.phase, outcome, episode.episode.goal
+                ),
+                evidence_refs: vec![
+                    format!("run:{}", graph.run_id),
+                    format!("episode:{}", episode.episode.episode_id),
+                ],
+                confidence: episode.episode.confidence.unwrap_or(0.55),
+            });
+        }
+    }
+
+    for event in &graph.events {
+        if hits.len() >= limit {
+            return;
+        }
+        let haystack = format!(
+            "{} {} {} {}",
+            event.phase, event.agent, event.status, event.message
+        );
+        if projection_text_matches(&haystack, terms) {
+            hits.push(crate::causal_graph::CausalGraphHit {
+                label: format!("event:{}", event.event_id),
+                summary: format!(
+                    "{}:{} by {} - {}",
+                    event.phase, event.status, event.agent, event.message
+                ),
+                evidence_refs: vec![
+                    format!("run:{}", graph.run_id),
+                    format!("event:{}", event.event_id),
+                ],
+                confidence: if event.status.eq_ignore_ascii_case("failed") {
+                    0.8
+                } else {
+                    0.62
+                },
+            });
+        }
+    }
+}
+
+fn projection_text_matches(text: &str, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let normalized = text.to_ascii_lowercase();
+    terms.iter().any(|term| normalized.contains(term))
+}
+
+fn format_projection_ledger_summary(
+    hits: &[crate::causal_graph::CausalGraphHit],
+) -> Option<String> {
+    if hits.is_empty() {
+        return None;
+    }
+    let top = hits
+        .iter()
+        .take(3)
+        .map(|hit| format!("{} ({:.2})", hit.summary, hit.confidence))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "SQLite causal graph projection ledger surfaced {} hit(s): {}.",
+        hits.len(),
+        top
+    ))
 }
 
 async fn answer_memory_status_query(
@@ -6384,7 +6797,30 @@ async fn get_server_status(State(app): State<AppContext>) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::briefing_scope_artifact;
+    use super::{
+        briefing_scope_artifact, execute_coobie_query, get_agent_state, get_causal_graph_status,
+        get_run_causal_graph_projection, list_agent_state,
+    };
+    use crate::{
+        config::Paths,
+        db,
+        memory::MemoryStore,
+        models::BlackboardState,
+        orchestrator::AppContext,
+        setup::{
+            CalvinConfig, OpenBrainConfig, ProviderConfig, ProvidersConfig, SetupConfig, SetupMeta,
+            SubAgentConfig, TwilightBarkConfig,
+        },
+    };
+    use axum::{
+        body::to_bytes,
+        extract::{Path, State},
+        http::StatusCode,
+        response::IntoResponse,
+    };
+    use chrono::Utc;
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::RwLock;
 
     #[test]
     fn briefing_scope_artifact_maps_named_scopes_to_artifacts() {
@@ -6403,5 +6839,339 @@ mod tests {
             ))
         );
         assert_eq!(briefing_scope_artifact(Some("unknown")), None);
+    }
+
+    fn test_paths(root: &std::path::Path) -> Paths {
+        let factory = root.join("factory");
+        Paths {
+            root: root.to_path_buf(),
+            factory: factory.clone(),
+            specs: factory.join("specs"),
+            scenarios: factory.join("scenarios"),
+            artifacts: factory.join("artifacts"),
+            logs: factory.join("logs"),
+            workspaces: factory.join("workspaces"),
+            memory: factory.join("memory"),
+            db_file: factory.join("state.db"),
+            products: root.join("products"),
+            setup: SetupConfig {
+                setup: SetupMeta {
+                    name: "test".to_string(),
+                    template: None,
+                    role: None,
+                    organization: None,
+                    platform: "test".to_string(),
+                    anythingllm: Some(false),
+                    openclaw: Some(false),
+                },
+                machine: None,
+                providers: ProvidersConfig {
+                    default: "claude".to_string(),
+                    claude: Some(ProviderConfig {
+                        provider_type: "anthropic".to_string(),
+                        model: "claude-test-model".to_string(),
+                        api_key_env: "ANTHROPIC_API_KEY".to_string(),
+                        enabled: true,
+                        credential_kind: None,
+                        usage_rights: None,
+                        surface: None,
+                        base_url: None,
+                    }),
+                    gemini: None,
+                    codex: None,
+                    extras: HashMap::new(),
+                },
+                routing: None,
+                mcp: None,
+                calvin_archive: CalvinConfig::default(),
+                twilight_bark: TwilightBarkConfig::default(),
+                open_brain: OpenBrainConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                sub_agents: SubAgentConfig::default(),
+                typedb: Default::default(),
+            },
+        }
+    }
+
+    async fn test_app() -> (tempfile::TempDir, AppContext) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = test_paths(dir.path());
+        for path in [
+            &paths.factory,
+            &paths.specs,
+            &paths.scenarios,
+            &paths.artifacts,
+            &paths.logs,
+            &paths.workspaces,
+            &paths.memory,
+            &paths.products,
+            &paths.factory.join("agents").join("profiles"),
+            &paths.factory.join("agents").join("contracts"),
+        ] {
+            std::fs::create_dir_all(path).expect("create test dir");
+        }
+        std::fs::write(
+            paths
+                .factory
+                .join("agents")
+                .join("profiles")
+                .join("mason.yaml"),
+            r#"
+name: mason
+display_name: Mason
+role: build_retriever
+provider: claude
+model_override: ~
+personality_file: ../personality/labrador.md
+"#,
+        )
+        .expect("write profile");
+        std::fs::write(
+            paths
+                .factory
+                .join("agents")
+                .join("contracts")
+                .join("mason.yaml"),
+            "invariants:\n  - stays grounded\n",
+        )
+        .expect("write contract");
+
+        let pool = db::init_db(&paths).await.expect("init db");
+        db::update_agent_memory_block_ids(
+            &pool,
+            "mason",
+            [(
+                "recalled_lessons".to_string(),
+                "runs/run-api/mason_briefing.json#block=recalled_lessons".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .await
+        .expect("block ids");
+        let memory_store = MemoryStore::new(paths.memory.clone());
+        let coobie = crate::coobie::SqliteCoobie::new(pool.clone());
+        let (event_tx, _) = tokio::sync::broadcast::channel(16);
+        let chat = crate::chat::ChatStore::new(pool.clone());
+        let operator_models = crate::operator_model::OperatorModelStore::new(pool.clone());
+        let dispatcher = crate::subagent::SubAgentDispatcher::new(
+            paths.setup.sub_agents.clone(),
+            paths.setup.clone(),
+        );
+        let causal_graph = Arc::new(crate::causal_graph::NoopCausalGraphStore::new(
+            crate::causal_graph::CausalGraphConfig::from(&paths.setup.typedb),
+        ));
+        let app = AppContext {
+            paths,
+            pool,
+            memory_store,
+            blackboard: Arc::new(RwLock::new(BlackboardState::default())),
+            coobie,
+            embedding_store: None,
+            event_tx,
+            chat,
+            operator_models,
+            started_at: std::time::Instant::now(),
+            calvin: None,
+            open_brain: None,
+            semantic_memory: Arc::new(crate::memory::NoopSemanticMemory),
+            causal_graph,
+            dispatcher,
+        };
+        (dir, app)
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    #[tokio::test]
+    async fn agent_state_routes_return_canonical_rows() {
+        let (_dir, app) = test_app().await;
+
+        let list_response = list_agent_state(State(app.clone())).await.into_response();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = response_json(list_response).await;
+        let rows = list_body.as_array().expect("array response");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["agent_name"], "mason");
+        assert_eq!(rows[0]["llm_model"], "claude-test-model");
+
+        let get_response = get_agent_state(Path("mason".to_string()), State(app))
+            .await
+            .into_response();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_body = response_json(get_response).await;
+        assert_eq!(get_body["agent_name"], "mason");
+        assert_eq!(
+            get_body["memory_block_ids"]["recalled_lessons"],
+            "runs/run-api/mason_briefing.json#block=recalled_lessons"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_state_route_returns_404_for_unknown_agent() {
+        let (_dir, app) = test_app().await;
+
+        let response = get_agent_state(Path("unknown".to_string()), State(app))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn causal_questions_include_typed_graph_boundary_when_disabled() {
+        let (_dir, app) = test_app().await;
+
+        let response = execute_coobie_query(&app, None, "What caused recent failures?", 1)
+            .await
+            .expect("coobie query");
+
+        assert!(response
+            .retrieval_path
+            .iter()
+            .any(|entry| entry.starts_with("typed_causal_graph:")));
+        assert!(response
+            .sources
+            .iter()
+            .any(|source| source.kind == "typed_causal_graph"
+                && source.status.as_deref() == Some("disabled")));
+        assert!(response
+            .response
+            .contains("TypeDB semantic graph is disabled"));
+    }
+
+    #[tokio::test]
+    async fn causal_graph_status_reports_sqlite_projection_ledger() {
+        let (_dir, app) = test_app().await;
+
+        let status_response = get_causal_graph_status(State(app.clone()))
+            .await
+            .into_response();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = response_json(status_response).await;
+        assert_eq!(status_body["status"], "disabled");
+        assert_eq!(status_body["projection_count"], 0);
+
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        )
+        .bind("run-causal-projection")
+        .bind("spec-causal")
+        .bind("product")
+        .bind("completed")
+        .bind(&now)
+        .execute(&app.pool)
+        .await
+        .expect("insert run");
+        sqlx::query(
+            "INSERT INTO episodes (episode_id, run_id, phase, goal, outcome, confidence, started_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind("episode-causal-projection")
+        .bind("run-causal-projection")
+        .bind("validation")
+        .bind("Run validation")
+        .bind("success")
+        .bind(1.0)
+        .bind(&now)
+        .execute(&app.pool)
+        .await
+        .expect("insert episode");
+
+        let projection_response = get_run_causal_graph_projection(
+            Path("run-causal-projection".to_string()),
+            State(app.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(projection_response.status(), StatusCode::OK);
+        let projection_body = response_json(projection_response).await;
+        assert_eq!(projection_body["run_id"], "run-causal-projection");
+        assert_eq!(projection_body["status"], "sqlite_projection");
+        assert_eq!(projection_body["episode_count"], 1);
+
+        let updated_status = get_causal_graph_status(State(app)).await.into_response();
+        let updated_body = response_json(updated_status).await;
+        assert_eq!(updated_body["projection_count"], 1);
+        assert_eq!(
+            updated_body["latest_projection"]["run_id"],
+            "run-causal-projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn causal_questions_use_projection_ledger_hits_without_typedb() {
+        let (_dir, app) = test_app().await;
+        let graph = crate::models::RunCausalGraph {
+            run_id: "run-ledger-query".to_string(),
+            generated_at: Utc::now(),
+            episodes: vec![crate::models::EpisodeCausalState {
+                episode: crate::models::EpisodeRecord {
+                    episode_id: "episode-validation-failure".to_string(),
+                    run_id: "run-ledger-query".to_string(),
+                    phase: "validation".to_string(),
+                    goal: "Run visible validation".to_string(),
+                    outcome: Some("failure".to_string()),
+                    confidence: Some(0.77),
+                    started_at: Utc::now(),
+                    ended_at: None,
+                    state_before: None,
+                    state_after: None,
+                },
+                state_diff: None,
+            }],
+            events: vec![crate::models::CausalEventNode {
+                event_id: 42,
+                run_id: "run-ledger-query".to_string(),
+                episode_id: Some("episode-validation-failure".to_string()),
+                phase: "validation".to_string(),
+                agent: "bramble".to_string(),
+                status: "failed".to_string(),
+                message: "validation failed after dependency mismatch".to_string(),
+                created_at: Utc::now(),
+            }],
+            links: Vec::new(),
+            hypotheses: vec![crate::models::CausalHypothesis {
+                cause_id: "cause-dependency-mismatch".to_string(),
+                description: "Dependency mismatch caused validation failure".to_string(),
+                confidence: 0.84,
+                hierarchy_level: crate::models::PearlHierarchyLevel::Associational,
+                supporting_runs: vec!["run-ledger-query".to_string()],
+                evidence: Vec::new(),
+                counterfactuals: Vec::new(),
+            }],
+        };
+        db::upsert_causal_graph_projection(&app.pool, &graph, app.causal_graph.config())
+            .await
+            .expect("projection");
+
+        let response = execute_coobie_query(
+            &app,
+            None,
+            "What caused validation failures?",
+            1,
+        )
+        .await
+        .expect("coobie query");
+
+        assert!(response
+            .retrieval_path
+            .iter()
+            .any(|entry| entry == "causal_graph_projection_ledger"));
+        assert!(response
+            .sources
+            .iter()
+            .any(|source| source.kind == "causal_graph_projection"
+                && source.label.contains("cause-dependency-mismatch")));
+        assert!(response
+            .response
+            .contains("SQLite causal graph projection ledger surfaced"));
     }
 }

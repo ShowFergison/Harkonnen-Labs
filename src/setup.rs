@@ -19,6 +19,8 @@ pub struct SetupConfig {
     pub open_brain: OpenBrainConfig,
     #[serde(default)]
     pub sub_agents: SubAgentConfig,
+    #[serde(default)]
+    pub typedb: TypeDbConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -179,6 +181,48 @@ pub struct OpenBrainConfig {
     pub search_threshold: f64,
     #[serde(default = "default_open_brain_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TypeDbConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_typedb_url")]
+    pub url: String,
+    #[serde(default = "default_typedb_database")]
+    pub database: String,
+    #[serde(default = "default_typedb_schema_path")]
+    pub schema_path: String,
+    #[serde(default = "default_typedb_reasoning_mode")]
+    pub reasoning_mode: String,
+}
+
+impl Default for TypeDbConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: default_typedb_url(),
+            database: default_typedb_database(),
+            schema_path: default_typedb_schema_path(),
+            reasoning_mode: default_typedb_reasoning_mode(),
+        }
+    }
+}
+
+fn default_typedb_url() -> String {
+    "localhost:1729".to_string()
+}
+
+fn default_typedb_database() -> String {
+    "harkonnen_semantic".to_string()
+}
+
+fn default_typedb_schema_path() -> String {
+    "factory/coobie_semantic/typedb/schema.tql".to_string()
+}
+
+fn default_typedb_reasoning_mode() -> String {
+    "function_backed".to_string()
 }
 
 impl Default for OpenBrainConfig {
@@ -370,6 +414,7 @@ impl SetupConfig {
             twilight_bark: TwilightBarkConfig::default(),
             open_brain: OpenBrainConfig::default(),
             sub_agents: SubAgentConfig::default(),
+            typedb: TypeDbConfig::default(),
         }
     }
 

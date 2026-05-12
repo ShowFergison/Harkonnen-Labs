@@ -1,0 +1,133 @@
+# Harkonnen Coobie Semantic Graph — Phase 6 scaffold
+#
+# TypeDB 3.x target schema for typed cross-run causal queries. This file is a
+# contract for the upcoming Rust driver adapter; SQLite remains the hot path
+# until the adapter is live.
+
+define
+
+agent sub entity,
+    owns agent-name,
+    owns agent-role;
+
+goal sub entity,
+    owns goal-id,
+    owns summary;
+
+episode sub entity,
+    owns episode-id,
+    owns run-id,
+    owns spec-id,
+    owns phase,
+    owns started-at,
+    owns ended-at;
+
+observation sub entity,
+    owns observation-id,
+    owns summary,
+    owns score,
+    owns observed-at;
+
+action sub entity,
+    owns action-id,
+    owns summary,
+    owns phase;
+
+outcome sub entity,
+    owns outcome-id,
+    owns status,
+    owns summary,
+    owns confidence;
+
+artifact sub entity,
+    owns artifact-id,
+    owns path,
+    owns artifact-kind;
+
+lesson sub entity,
+    owns lesson-id,
+    owns summary,
+    owns confidence,
+    owns provenance;
+
+failure-mode sub entity,
+    owns failure-mode-id,
+    owns label,
+    owns summary;
+
+causal-link sub entity,
+    owns causal-link-id,
+    owns relation,
+    owns pearl-level,
+    owns epistemic-warrant,
+    owns warrant-gap,
+    owns confidence,
+    owns structural-spec-json;
+
+participated-in sub relation,
+    relates participant,
+    relates episode-context;
+
+episode-goal sub relation,
+    relates episode-context,
+    relates target-goal;
+
+observed-in sub relation,
+    relates observation,
+    relates episode-context;
+
+acted-in sub relation,
+    relates action,
+    relates episode-context;
+
+produced-outcome sub relation,
+    relates episode-context,
+    relates outcome;
+
+produced-artifact sub relation,
+    relates episode-context,
+    relates artifact;
+
+learned-from sub relation,
+    relates lesson,
+    relates episode-context;
+
+classifies-failure sub relation,
+    relates failure,
+    relates outcome;
+
+causally-connects sub relation,
+    relates cause,
+    relates effect,
+    relates link;
+
+agent-name sub attribute, value string;
+agent-role sub attribute, value string;
+goal-id sub attribute, value string;
+episode-id sub attribute, value string;
+run-id sub attribute, value string;
+spec-id sub attribute, value string;
+phase sub attribute, value string;
+started-at sub attribute, value datetime;
+ended-at sub attribute, value datetime;
+observation-id sub attribute, value string;
+action-id sub attribute, value string;
+outcome-id sub attribute, value string;
+artifact-id sub attribute, value string;
+lesson-id sub attribute, value string;
+failure-mode-id sub attribute, value string;
+causal-link-id sub attribute, value string;
+summary sub attribute, value string;
+status sub attribute, value string;
+path sub attribute, value string;
+artifact-kind sub attribute, value string;
+label sub attribute, value string;
+relation sub attribute, value string;
+pearl-level sub attribute, value string;
+epistemic-warrant sub attribute, value string;
+warrant-gap sub attribute, value boolean;
+structural-spec-json sub attribute, value string;
+provenance sub attribute, value string;
+observed-at sub attribute, value datetime;
+score sub attribute, value double;
+confidence sub attribute, value double;

@@ -77,6 +77,8 @@ pub struct AppContext {
     pub open_brain: Option<crate::openbrain::OpenBrainClient>,
     /// Default long-term semantic memory. OB1-backed when configured.
     pub semantic_memory: Arc<dyn crate::memory::SemanticMemory>,
+    /// Typed causal graph boundary. No-op until the TypeDB adapter is enabled.
+    pub causal_graph: Arc<dyn crate::causal_graph::CausalGraphStore>,
     /// Sub-agent dispatcher — routes high-context tasks to isolated backends.
     pub dispatcher: crate::subagent::SubAgentDispatcher,
 }
@@ -514,6 +516,7 @@ struct MemoryContextBundle {
     memory_hits: Vec<String>,
     core_memory_hits: Vec<String>,
     project_memory_hits: Vec<String>,
+    agent_memory_block_refs: Vec<String>,
     project_memory_root: Option<String>,
     core_memory_ids: Vec<String>,
     project_memory_ids: Vec<String>,
@@ -1140,6 +1143,9 @@ impl AppContext {
             paths.setup.sub_agents.clone(),
             paths.setup.clone(),
         );
+        let causal_graph = Arc::new(crate::causal_graph::NoopCausalGraphStore::new(
+            crate::causal_graph::CausalGraphConfig::from(&paths.setup.typedb),
+        ));
         Ok(Self {
             paths,
             pool,
@@ -1154,6 +1160,7 @@ impl AppContext {
             calvin,
             open_brain,
             semantic_memory,
+            causal_graph,
             dispatcher,
         })
     }
@@ -2451,6 +2458,29 @@ impl AppContext {
         tokio::fs::write(
             run_dir.join("sable_preflight_response.md"),
             &sable_briefing.coobie_response,
+        )
+        .await?;
+        self.update_agent_briefing_block_refs("coobie", run_id, "coobie_briefing.json", &briefing)
+            .await?;
+        self.update_agent_briefing_block_refs(
+            "scout",
+            run_id,
+            "scout_briefing.json",
+            &scout_briefing,
+        )
+        .await?;
+        self.update_agent_briefing_block_refs(
+            "mason",
+            run_id,
+            "mason_briefing.json",
+            &mason_briefing,
+        )
+        .await?;
+        self.update_agent_briefing_block_refs(
+            "sable",
+            run_id,
+            "sable_briefing.json",
+            &sable_briefing,
         )
         .await?;
         self.write_json_file(
@@ -4677,6 +4707,7 @@ Top memory hits:
         for bundle_hit in self.collect_repo_local_context_hits(target_source, query_terms, 4)? {
             project_memory.hits.push(bundle_hit);
         }
+        let agent_memory_block_refs = self.collect_agent_memory_block_refs().await?;
 
         let mut core_memory = self
             .collect_memory_hits(&self.memory_store, query_terms, "core memory")
@@ -4695,7 +4726,12 @@ Top memory hits:
 
         let mut memory_hits = Vec::new();
         let mut seen = HashSet::new();
-        for hit in project_memory.hits.iter().chain(core_memory.hits.iter()) {
+        for hit in project_memory
+            .hits
+            .iter()
+            .chain(core_memory.hits.iter())
+            .chain(agent_memory_block_refs.iter())
+        {
             if seen.insert(hit.clone()) {
                 memory_hits.push(hit.clone());
             }
@@ -4724,11 +4760,35 @@ Top memory hits:
             memory_hits,
             core_memory_hits: core_memory.hits,
             project_memory_hits: project_memory.hits,
+            agent_memory_block_refs,
             project_memory_root: Some(project_store.root.display().to_string()),
             core_memory_ids: core_memory.ids,
             project_memory_ids: project_memory.ids,
             spec_family_retrieval,
         })
+    }
+
+    async fn collect_agent_memory_block_refs(&self) -> Result<Vec<String>> {
+        let states = db::list_agent_state(&self.pool).await?;
+        let mut hits = states
+            .into_iter()
+            .filter(|state| !state.memory_block_ids.is_empty())
+            .map(|state| {
+                let refs = state
+                    .memory_block_ids
+                    .iter()
+                    .map(|(block, reference)| format!("{block} -> {reference}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!(
+                    "[agent state] {} latest briefing blocks: {}",
+                    state.agent_name, refs
+                )
+            })
+            .collect::<Vec<_>>();
+        hits.sort();
+        hits.truncate(12);
+        Ok(hits)
     }
 
     async fn collect_memory_hits(
@@ -6906,6 +6966,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             spec_family_retrieval: memory_context.spec_family_retrieval.clone(),
             core_memory_hits: memory_selection.core_memory_hits,
             project_memory_hits: memory_selection.project_memory_hits,
+            agent_memory_block_refs: memory_context.agent_memory_block_refs.clone(),
             resume_packet_summary: resume_packet.summary.clone(),
             resume_packet_risks: resume_packet.stale_memory.clone(),
             stale_memory_mitigation_plan,
@@ -16603,6 +16664,17 @@ Return JSON only.",
             .with_context(|| format!("parsing {}", path.display()))
     }
 
+    async fn update_agent_briefing_block_refs(
+        &self,
+        agent_name: &str,
+        run_id: &str,
+        artifact: &str,
+        briefing: &CoobieBriefing,
+    ) -> Result<()> {
+        let block_ids = briefing_block_refs(run_id, artifact, &briefing.briefing_blocks);
+        db::update_agent_memory_block_ids(&self.pool, agent_name, block_ids).await
+    }
+
     async fn finalize_blackboard(&self, final_status: &str, run_dir: &Path) -> Result<()> {
         let mut board = self.blackboard.write().await;
         board.current_phase = "complete".to_string();
@@ -16954,14 +17026,21 @@ Return JSON only.",
         let links = self.list_causal_event_edges(run_id).await?;
         let hypotheses = self.coobie.diagnose(run_id).await.unwrap_or_default();
 
-        Ok(RunCausalGraph {
+        let graph = RunCausalGraph {
             run_id: run_id.to_string(),
             generated_at: Utc::now(),
             episodes,
             events,
             links,
             hypotheses,
-        })
+        };
+        let _ = db::upsert_causal_graph_projection(
+            &self.pool,
+            &graph,
+            self.causal_graph.config(),
+        )
+        .await;
+        Ok(graph)
     }
 
     pub async fn list_phase_attributions_for_run(
@@ -25259,6 +25338,10 @@ fn format_memory_context_bundle(bundle: &MemoryContextBundle) -> String {
     sections.push("----------------".to_string());
     sections.push(format_memory_context(&bundle.core_memory_hits));
     sections.push(String::new());
+    sections.push("Agent Memory Block Refs".to_string());
+    sections.push("-----------------------".to_string());
+    sections.push(format_memory_context(&bundle.agent_memory_block_refs));
+    sections.push(String::new());
     sections.push("Combined Memory Hits".to_string());
     sections.push("--------------------".to_string());
     sections.push(format_memory_context(&bundle.memory_hits));
@@ -27351,6 +27434,10 @@ fn build_named_briefing_blocks(briefing: &CoobieBriefing) -> Vec<BriefingBlock> 
             ("Memory hits", briefing.memory_hits.clone()),
             ("Core memory hits", briefing.core_memory_hits.clone()),
             ("Project memory hits", briefing.project_memory_hits.clone()),
+            (
+                "Agent memory block refs",
+                briefing.agent_memory_block_refs.clone(),
+            ),
             ("Relevant lessons", lessons),
             ("Resume risks", resume_risks),
             (
@@ -27380,6 +27467,22 @@ fn build_named_briefing_blocks(briefing: &CoobieBriefing) -> Vec<BriefingBlock> 
             recalled_lessons,
         ),
     ]
+}
+
+fn briefing_block_refs(
+    run_id: &str,
+    artifact: &str,
+    blocks: &[BriefingBlock],
+) -> BTreeMap<String, String> {
+    blocks
+        .iter()
+        .map(|block| {
+            (
+                block.name.clone(),
+                format!("runs/{run_id}/{artifact}#block={}", block.name),
+            )
+        })
+        .collect()
 }
 
 fn briefing_block(name: &str, source: &str, content: String) -> BriefingBlock {
@@ -29406,6 +29509,7 @@ fn fallback_tool_gateway_briefing(run_id: &str, spec: Option<&Spec>) -> CoobieBr
         memory_hits: Vec::new(),
         core_memory_hits: Vec::new(),
         project_memory_hits: Vec::new(),
+        agent_memory_block_refs: Vec::new(),
         resume_packet_summary: Vec::new(),
         resume_packet_risks: Vec::new(),
         stale_memory_mitigation_plan: Vec::new(),
@@ -31319,6 +31423,7 @@ mod tests {
                 ..Default::default()
             },
             sub_agents: crate::setup::SubAgentConfig::default(),
+            typedb: crate::setup::TypeDbConfig::default(),
         };
 
         let paths = Paths {
@@ -31352,6 +31457,9 @@ mod tests {
             } else {
                 Arc::new(crate::memory::NoopSemanticMemory)
             };
+        let causal_graph = Arc::new(crate::causal_graph::NoopCausalGraphStore::new(
+            crate::causal_graph::CausalGraphConfig::from(&paths.setup.typedb),
+        ));
         let app = AppContext {
             paths,
             pool,
@@ -31366,6 +31474,7 @@ mod tests {
             calvin: None,
             open_brain,
             semantic_memory,
+            causal_graph,
             dispatcher,
         };
         (dir, app)
@@ -31552,6 +31661,7 @@ mod tests {
             memory_hits: Vec::new(),
             core_memory_hits: Vec::new(),
             project_memory_hits: Vec::new(),
+            agent_memory_block_refs: Vec::new(),
             resume_packet_summary: Vec::new(),
             resume_packet_risks: Vec::new(),
             stale_memory_mitigation_plan: Vec::new(),
@@ -31662,6 +31772,9 @@ mod tests {
         briefing.open_questions = vec!["Which login surface is in scope?".to_string()];
         briefing.pattern_matching_focus =
             vec!["Auth ambiguity repeats across similar specs".to_string()];
+        briefing.agent_memory_block_refs = vec![
+            "[agent state] mason latest briefing blocks: recalled_lessons -> runs/run-1/mason_briefing.json#block=recalled_lessons".to_string(),
+        ];
         briefing.briefing_blocks = build_named_briefing_blocks(&briefing);
 
         assert_eq!(briefing.briefing_blocks.len(), 5);
@@ -31671,6 +31784,7 @@ mod tests {
             .find(|block| block.name == "recalled_lessons")
             .expect("recalled lessons block");
         assert!(recalled.content.contains("Spec history"));
+        assert!(recalled.content.contains("mason latest briefing blocks"));
         assert!(recalled.token_count > 0);
 
         let checks = briefing
@@ -31690,6 +31804,28 @@ mod tests {
             .content
             .to_ascii_lowercase()
             .contains("implementation note"));
+    }
+
+    #[test]
+    fn briefing_block_refs_point_to_run_artifact_blocks() {
+        let mut briefing = sample_briefing();
+        briefing.briefing_blocks = build_named_briefing_blocks(&briefing);
+
+        let refs = briefing_block_refs(
+            "run-briefing-blocks",
+            "mason_briefing.json",
+            &briefing.briefing_blocks,
+        );
+
+        assert_eq!(refs.len(), 5);
+        assert_eq!(
+            refs.get("recalled_lessons").map(String::as_str),
+            Some("runs/run-briefing-blocks/mason_briefing.json#block=recalled_lessons")
+        );
+        assert_eq!(
+            refs.get("open_checks").map(String::as_str),
+            Some("runs/run-briefing-blocks/mason_briefing.json#block=open_checks")
+        );
     }
 
     #[test]
@@ -33253,6 +33389,7 @@ mod tests {
             twilight_bark: Default::default(),
             open_brain: Default::default(),
             sub_agents: Default::default(),
+            typedb: Default::default(),
         };
         let staged = std::env::temp_dir().join(format!("harkonnen-tool-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&staged).expect("create staged dir");

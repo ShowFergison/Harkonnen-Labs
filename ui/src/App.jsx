@@ -89,6 +89,21 @@ function normalizeStatus(status, ownership) {
   return 'idle';
 }
 
+function shortHash(value) {
+  if (!value) {
+    return 'untracked';
+  }
+  return value.length > 12 ? value.slice(0, 12) : value;
+}
+
+function memoryBlockEntries(agentState) {
+  return Object.entries(agentState?.memory_block_ids || {}).sort(([left], [right]) => left.localeCompare(right));
+}
+
+function graphCount(value) {
+  return Number.isFinite(Number(value)) ? Number(value) : 0;
+}
+
 function deriveAgents(events, blackboard, executions) {
   const claims = blackboard?.agent_claims || {};
   const executionMap = Object.fromEntries(
@@ -160,6 +175,9 @@ function App() {
   const [activeRunId, setActiveRunId] = useState('');
   const [runState, setRunState] = useState(null);
   const [memoryUpdates, setMemoryUpdates] = useState([]);
+  const [agentState, setAgentState] = useState([]);
+  const [causalGraphStatus, setCausalGraphStatus] = useState(null);
+  const [causalGraphProjection, setCausalGraphProjection] = useState(null);
   const [reviewingMemoryUpdateId, setReviewingMemoryUpdateId] = useState('');
   const [selectedRole, setSelectedRole] = useState('mason');
   const [roleBoard, setRoleBoard] = useState(null);
@@ -323,6 +341,82 @@ function App() {
   useEffect(() => {
     let cancelled = false;
 
+    const loadAgentState = async () => {
+      try {
+        const data = await fetchJson(`${API_BASE}/agent-state`);
+        if (!cancelled) {
+          setAgentState(Array.isArray(data) ? data : []);
+        }
+      } catch {
+        if (!cancelled) {
+          setAgentState([]);
+        }
+      }
+    };
+
+    loadAgentState();
+    const interval = setInterval(loadAgentState, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadGraphStatus = async () => {
+      try {
+        const data = await fetchJson(`${API_BASE}/causal-graph/status`);
+        if (!cancelled) {
+          setCausalGraphStatus(data);
+        }
+      } catch {
+        if (!cancelled) {
+          setCausalGraphStatus(null);
+        }
+      }
+    };
+
+    loadGraphStatus();
+    const interval = setInterval(loadGraphStatus, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!activeRunId) {
+      setCausalGraphProjection(null);
+      return undefined;
+    }
+
+    let cancelled = false;
+    const loadProjection = async () => {
+      try {
+        const data = await fetchJson(`${API_BASE}/runs/${activeRunId}/causal-graph-projection`);
+        if (!cancelled) {
+          setCausalGraphProjection(data);
+        }
+      } catch {
+        if (!cancelled) {
+          setCausalGraphProjection(null);
+        }
+      }
+    };
+
+    loadProjection();
+    const interval = setInterval(loadProjection, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [activeRunId]);
+
+  useEffect(() => {
+    let cancelled = false;
+
     const loadCapacity = async () => {
       try {
         const data = await fetchJson(`${API_BASE}/capacity`);
@@ -384,6 +478,15 @@ function App() {
   const phaseAttributions = runState?.phase_attributions || [];
   const coobieTranslations = runState?.coobie_translations || [];
   const agents = deriveAgents(events, blackboard, agentExecutions);
+  const agentStateByName = Object.fromEntries(
+    (agentState || []).map((state) => [state.agent_name?.toLowerCase(), state]),
+  );
+  const canonicalAgentState = AGENT_DEFS
+    .map((definition) => ({
+      ...definition,
+      state: agentStateByName[definition.id],
+    }))
+    .filter((entry) => entry.state);
   const planningAgents = agents.filter((agent) => agent.group === 'planning');
   const actionAgents = agents.filter((agent) => agent.group === 'action');
   const verificationAgents = agents.filter((agent) => agent.group === 'verification');
@@ -619,6 +722,98 @@ function App() {
                 <div className="info-row"><span>Visible claims</span><strong>{roleClaims.length}</strong></div>
               </div>
             </div>
+          </Panel>
+
+          <Panel title="Agent State" compact>
+            <div className="agent-state-list">
+              {canonicalAgentState.length === 0 ? (
+                <div className="empty-state">Canonical agent state has not been seeded yet.</div>
+              ) : (
+                canonicalAgentState.map(({ id, name, role, state }) => {
+                  const blocks = memoryBlockEntries(state);
+                  return (
+                    <div key={id} className="agent-state-card">
+                      <div className="agent-state-head">
+                        <div>
+                          <div className="agent-state-name">{name}</div>
+                          <div className="agent-state-role">{state.agent_role || role}</div>
+                        </div>
+                        <span className="agent-state-provider">
+                          {state.llm_provider || 'unknown'} / {state.llm_model || 'unknown'}
+                        </span>
+                      </div>
+                      <div className="agent-state-grid">
+                        <div>
+                          <span>Last run</span>
+                          <strong>{state.last_active_run ? state.last_active_run.slice(0, 8) : 'none'}</strong>
+                        </div>
+                        <div>
+                          <span>Contract</span>
+                          <strong className="mono">{shortHash(state.behavior_contract_hash)}</strong>
+                        </div>
+                        <div>
+                          <span>Stop reason</span>
+                          <strong>{state.last_stop_reason || 'none'}</strong>
+                        </div>
+                        <div>
+                          <span>Blocks</span>
+                          <strong>{blocks.length}</strong>
+                        </div>
+                      </div>
+                      {blocks.length > 0 ? (
+                        <div className="agent-state-blocks">
+                          {blocks.slice(0, 4).map(([block, ref]) => (
+                            <div key={block} className="agent-state-block">
+                              <span>{block.replaceAll('_', ' ')}</span>
+                              <code title={ref}>{ref}</code>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </Panel>
+
+          <Panel title="Causal Graph" compact>
+            {causalGraphStatus ? (
+              <div className="graph-ledger">
+                <div className="info-stack">
+                  <div className="info-row"><span>Typed graph</span><strong>{titleCase(causalGraphStatus.status)}</strong></div>
+                  <div className="info-row"><span>Backend</span><strong>{titleCase(causalGraphStatus.backend)}</strong></div>
+                  <div className="info-row"><span>Database</span><strong>{causalGraphStatus.database || 'unconfigured'}</strong></div>
+                  <div className="info-row"><span>Projection rows</span><strong>{graphCount(causalGraphStatus.projection_count)}</strong></div>
+                </div>
+                {causalGraphProjection ? (
+                  <div className="agent-state-card graph-projection-card">
+                    <div className="agent-state-head">
+                      <div>
+                        <div className="agent-state-name">Active run projection</div>
+                        <div className="agent-state-role">{causalGraphProjection.status || 'sqlite_projection'}</div>
+                      </div>
+                      <span className="agent-state-provider">
+                        {titleCase(causalGraphProjection.backend)}
+                      </span>
+                    </div>
+                    <div className="agent-state-grid">
+                      <div><span>Episodes</span><strong>{graphCount(causalGraphProjection.episode_count)}</strong></div>
+                      <div><span>Events</span><strong>{graphCount(causalGraphProjection.event_count)}</strong></div>
+                      <div><span>Links</span><strong>{graphCount(causalGraphProjection.link_count)}</strong></div>
+                      <div><span>Hypotheses</span><strong>{graphCount(causalGraphProjection.hypothesis_count)}</strong></div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="empty-state">No projection for the active run yet.</div>
+                )}
+                {causalGraphStatus.note ? (
+                  <div className="graph-note">{causalGraphStatus.note}</div>
+                ) : null}
+              </div>
+            ) : (
+              <div className="empty-state">Causal graph status is unavailable.</div>
+            )}
           </Panel>
 
           <Panel title="Evidence Board" compact>
@@ -1034,6 +1229,130 @@ function App() {
           flex-direction: column;
           gap: 0.55rem;
           margin-top: 0.9rem;
+        }
+
+        .agent-state-list {
+          display: flex;
+          flex-direction: column;
+          gap: 0.65rem;
+        }
+
+        .agent-state-card {
+          border: 1px solid rgba(255, 255, 255, 0.06);
+          background: rgba(255, 255, 255, 0.03);
+          border-radius: 12px;
+          padding: 0.72rem 0.8rem;
+        }
+
+        .graph-ledger {
+          display: flex;
+          flex-direction: column;
+          gap: 0.75rem;
+        }
+
+        .graph-projection-card {
+          border-color: rgba(103, 148, 131, 0.32);
+        }
+
+        .graph-note {
+          color: var(--text-secondary);
+          font-size: 0.82rem;
+          line-height: 1.45;
+          border-left: 2px solid rgba(194, 163, 114, 0.45);
+          padding-left: 0.7rem;
+        }
+
+        .agent-state-head {
+          display: flex;
+          justify-content: space-between;
+          align-items: start;
+          gap: 0.7rem;
+          margin-bottom: 0.65rem;
+        }
+
+        .agent-state-name {
+          font-size: 0.9rem;
+          font-weight: 800;
+        }
+
+        .agent-state-role {
+          margin-top: 0.12rem;
+          color: var(--text-secondary);
+          font-size: 0.72rem;
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+        }
+
+        .agent-state-provider {
+          max-width: 48%;
+          border: 1px solid rgba(194, 163, 114, 0.25);
+          background: rgba(194, 163, 114, 0.08);
+          color: var(--accent-gold);
+          border-radius: 999px;
+          padding: 0.22rem 0.5rem;
+          font-size: 0.64rem;
+          font-weight: 800;
+          text-transform: uppercase;
+          letter-spacing: 0.06em;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+
+        .agent-state-grid {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 0.45rem;
+        }
+
+        .agent-state-grid div {
+          min-width: 0;
+          border: 1px solid rgba(255, 255, 255, 0.05);
+          border-radius: 9px;
+          padding: 0.48rem 0.55rem;
+          background: rgba(0, 0, 0, 0.12);
+        }
+
+        .agent-state-grid span,
+        .agent-state-block span {
+          display: block;
+          color: var(--text-secondary);
+          font-size: 0.62rem;
+          font-weight: 800;
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          margin-bottom: 0.18rem;
+        }
+
+        .agent-state-grid strong {
+          display: block;
+          min-width: 0;
+          font-size: 0.76rem;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .agent-state-blocks {
+          display: flex;
+          flex-direction: column;
+          gap: 0.45rem;
+          margin-top: 0.65rem;
+        }
+
+        .agent-state-block {
+          min-width: 0;
+        }
+
+        .agent-state-block code {
+          display: block;
+          width: 100%;
+          color: #c9d4d8;
+          font-family: var(--font-mono);
+          font-size: 0.68rem;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
         }
 
         .compact-list {

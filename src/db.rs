@@ -1,8 +1,11 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     Row, SqlitePool,
 };
+use std::collections::BTreeMap;
 
 use crate::config::Paths;
 
@@ -1151,6 +1154,64 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS agent_state (
+            agent_name             TEXT PRIMARY KEY,
+            agent_role             TEXT NOT NULL,
+            llm_provider           TEXT NOT NULL,
+            llm_model              TEXT NOT NULL,
+            memory_block_ids       TEXT NOT NULL DEFAULT '{}',
+            last_stop_reason       TEXT,
+            last_active_run        TEXT,
+            behavior_contract_hash TEXT,
+            updated_at             TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_agent_state_updated_at
+        ON agent_state (updated_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    seed_agent_state_from_profiles(&pool, paths).await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS causal_graph_projections (
+            run_id           TEXT PRIMARY KEY,
+            backend          TEXT NOT NULL,
+            status           TEXT NOT NULL,
+            database_name    TEXT NOT NULL,
+            schema_path      TEXT NOT NULL,
+            graph_json       TEXT NOT NULL,
+            episode_count    INTEGER NOT NULL DEFAULT 0,
+            event_count      INTEGER NOT NULL DEFAULT 0,
+            link_count       INTEGER NOT NULL DEFAULT 0,
+            hypothesis_count INTEGER NOT NULL DEFAULT 0,
+            projected_at     TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_causal_graph_projections_projected_at
+        ON causal_graph_projections (projected_at DESC)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE INDEX IF NOT EXISTS idx_agent_runtime_state_run
         ON agent_runtime_state (run_id, canonical_role, updated_at)
         "#,
@@ -1395,7 +1456,408 @@ pub async fn sync_coordination_leases(
     }
 
     tx.commit().await?;
+
     Ok(())
+}
+
+pub async fn seed_agent_state_from_profiles(pool: &SqlitePool, paths: &Paths) -> Result<()> {
+    let profiles_dir = paths.factory.join("agents").join("profiles");
+    if !profiles_dir.exists() {
+        return Ok(());
+    }
+
+    let profiles = crate::agents::load_profiles(&profiles_dir)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    for profile in profiles.values() {
+        let provider_name = paths
+            .setup
+            .resolve_agent_provider_name(&profile.name, &profile.provider);
+        let provider = paths
+            .setup
+            .resolve_agent_provider(&profile.name, &profile.provider);
+        let model = profile
+            .model_override
+            .clone()
+            .or_else(|| provider.map(|provider| provider.model.clone()))
+            .unwrap_or_else(|| "unresolved".to_string());
+        let contract_hash = agent_contract_hash(paths, &profile.name)?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO agent_state (
+                agent_name,
+                agent_role,
+                llm_provider,
+                llm_model,
+                memory_block_ids,
+                behavior_contract_hash,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?6)
+            ON CONFLICT(agent_name) DO UPDATE SET
+                agent_role = excluded.agent_role,
+                llm_provider = excluded.llm_provider,
+                llm_model = excluded.llm_model,
+                behavior_contract_hash = excluded.behavior_contract_hash,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&profile.name)
+        .bind(&profile.role)
+        .bind(&provider_name)
+        .bind(&model)
+        .bind(contract_hash)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub async fn upsert_agent_state_from_runtime(
+    pool: &SqlitePool,
+    run_id: &str,
+    runtime: &crate::models::AgentRuntimeState,
+) -> Result<()> {
+    let agent_name = runtime.canonical_role.trim();
+    if agent_name.is_empty() {
+        return Ok(());
+    }
+    let updated_at = if runtime.last_heartbeat_at.trim().is_empty() {
+        chrono::Utc::now().to_rfc3339()
+    } else {
+        runtime.last_heartbeat_at.clone()
+    };
+    let provider = runtime
+        .provider
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("unknown");
+
+    sqlx::query(
+        r#"
+        INSERT INTO agent_state (
+            agent_name,
+            agent_role,
+            llm_provider,
+            llm_model,
+            memory_block_ids,
+            last_active_run,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, '', '{}', ?4, ?5)
+        ON CONFLICT(agent_name) DO UPDATE SET
+            llm_provider = CASE
+                WHEN excluded.llm_provider = 'unknown' THEN agent_state.llm_provider
+                ELSE excluded.llm_provider
+            END,
+            last_active_run = excluded.last_active_run,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(agent_name)
+    .bind(agent_name)
+    .bind(provider)
+    .bind(run_id)
+    .bind(&updated_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn record_agent_stop_reason(
+    pool: &SqlitePool,
+    agent_name: &str,
+    stop_reason: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE agent_state
+        SET last_stop_reason = ?2,
+            updated_at = ?3
+        WHERE agent_name = ?1
+        "#,
+    )
+    .bind(agent_name)
+    .bind(stop_reason)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn update_agent_memory_block_ids(
+    pool: &SqlitePool,
+    agent_name: &str,
+    block_ids: BTreeMap<String, String>,
+) -> Result<()> {
+    if block_ids.is_empty() {
+        return Ok(());
+    }
+
+    let existing = get_agent_state(pool, agent_name).await?;
+    let mut merged = existing
+        .as_ref()
+        .map(|state| state.memory_block_ids.clone())
+        .unwrap_or_default();
+    merged.extend(block_ids);
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let payload = serde_json::to_string(&merged)?;
+    sqlx::query(
+        r#"
+        INSERT INTO agent_state (
+            agent_name,
+            agent_role,
+            llm_provider,
+            llm_model,
+            memory_block_ids,
+            updated_at
+        )
+        VALUES (?1, ?1, 'unknown', 'unknown', ?2, ?3)
+        ON CONFLICT(agent_name) DO UPDATE SET
+            memory_block_ids = excluded.memory_block_ids,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(agent_name)
+    .bind(payload)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn list_agent_state(pool: &SqlitePool) -> Result<Vec<crate::models::AgentState>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT agent_name, agent_role, llm_provider, llm_model, memory_block_ids,
+               last_stop_reason, last_active_run, behavior_contract_hash, updated_at
+        FROM agent_state
+        ORDER BY agent_name
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(agent_state_from_row).collect()
+}
+
+pub async fn get_agent_state(
+    pool: &SqlitePool,
+    agent_name: &str,
+) -> Result<Option<crate::models::AgentState>> {
+    let row = sqlx::query(
+        r#"
+        SELECT agent_name, agent_role, llm_provider, llm_model, memory_block_ids,
+               last_stop_reason, last_active_run, behavior_contract_hash, updated_at
+        FROM agent_state
+        WHERE agent_name = ?1
+        "#,
+    )
+    .bind(agent_name)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(agent_state_from_row).transpose()
+}
+
+fn agent_state_from_row(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::AgentState> {
+    let memory_block_ids_json: String = row.get("memory_block_ids");
+    let memory_block_ids = serde_json::from_str::<BTreeMap<String, String>>(&memory_block_ids_json)
+        .unwrap_or_default();
+
+    Ok(crate::models::AgentState {
+        agent_name: row.get("agent_name"),
+        agent_role: row.get("agent_role"),
+        llm_provider: row.get("llm_provider"),
+        llm_model: row.get("llm_model"),
+        memory_block_ids,
+        last_stop_reason: row.get("last_stop_reason"),
+        last_active_run: row.get("last_active_run"),
+        behavior_contract_hash: row.get("behavior_contract_hash"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+pub async fn upsert_causal_graph_projection(
+    pool: &SqlitePool,
+    graph: &crate::models::RunCausalGraph,
+    config: &crate::causal_graph::CausalGraphConfig,
+) -> Result<crate::causal_graph::CausalGraphProjectionRecord> {
+    let projected_at = Utc::now();
+    let record = crate::causal_graph::CausalGraphProjectionRecord {
+        run_id: graph.run_id.clone(),
+        backend: config.backend.clone(),
+        status: "sqlite_projection".to_string(),
+        database: config.database.clone(),
+        schema_path: config.schema_path.clone(),
+        graph_json: serde_json::to_value(graph)?,
+        episode_count: graph.episodes.len() as u64,
+        event_count: graph.events.len() as u64,
+        link_count: graph.links.len() as u64,
+        hypothesis_count: graph.hypotheses.len() as u64,
+        projected_at,
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO causal_graph_projections (
+            run_id, backend, status, database_name, schema_path, graph_json,
+            episode_count, event_count, link_count, hypothesis_count, projected_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ON CONFLICT(run_id) DO UPDATE SET
+            backend = excluded.backend,
+            status = excluded.status,
+            database_name = excluded.database_name,
+            schema_path = excluded.schema_path,
+            graph_json = excluded.graph_json,
+            episode_count = excluded.episode_count,
+            event_count = excluded.event_count,
+            link_count = excluded.link_count,
+            hypothesis_count = excluded.hypothesis_count,
+            projected_at = excluded.projected_at
+        "#,
+    )
+    .bind(&record.run_id)
+    .bind(causal_graph_backend_label(&record.backend))
+    .bind(&record.status)
+    .bind(&record.database)
+    .bind(&record.schema_path)
+    .bind(serde_json::to_string(&record.graph_json)?)
+    .bind(record.episode_count as i64)
+    .bind(record.event_count as i64)
+    .bind(record.link_count as i64)
+    .bind(record.hypothesis_count as i64)
+    .bind(record.projected_at.to_rfc3339())
+    .execute(pool)
+    .await?;
+
+    Ok(record)
+}
+
+pub async fn get_causal_graph_projection(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Option<crate::causal_graph::CausalGraphProjectionRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT run_id, backend, status, database_name, schema_path, graph_json,
+               episode_count, event_count, link_count, hypothesis_count, projected_at
+        FROM causal_graph_projections
+        WHERE run_id = ?1
+        "#,
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(causal_graph_projection_from_row).transpose()
+}
+
+pub async fn list_causal_graph_projection_summaries(
+    pool: &SqlitePool,
+    limit: i64,
+) -> Result<Vec<crate::causal_graph::CausalGraphProjectionSummary>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT run_id, backend, status, database_name, schema_path, graph_json,
+               episode_count, event_count, link_count, hypothesis_count, projected_at
+        FROM causal_graph_projections
+        ORDER BY projected_at DESC
+        LIMIT ?1
+        "#,
+    )
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(causal_graph_projection_from_row)
+        .map(|record| {
+            record.map(|record| crate::causal_graph::CausalGraphProjectionSummary::from(&record))
+        })
+        .collect()
+}
+
+pub async fn list_recent_causal_graph_projections(
+    pool: &SqlitePool,
+    limit: i64,
+) -> Result<Vec<crate::causal_graph::CausalGraphProjectionRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT run_id, backend, status, database_name, schema_path, graph_json,
+               episode_count, event_count, link_count, hypothesis_count, projected_at
+        FROM causal_graph_projections
+        ORDER BY projected_at DESC
+        LIMIT ?1
+        "#,
+    )
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(causal_graph_projection_from_row).collect()
+}
+
+pub async fn count_causal_graph_projections(pool: &SqlitePool) -> Result<u64> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM causal_graph_projections")
+        .fetch_one(pool)
+        .await?;
+    Ok(count.max(0) as u64)
+}
+
+fn causal_graph_projection_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<crate::causal_graph::CausalGraphProjectionRecord> {
+    let backend = match row.get::<String, _>("backend").as_str() {
+        "type_db3" | "typedb3" => crate::causal_graph::CausalGraphBackend::TypeDb3,
+        _ => crate::causal_graph::CausalGraphBackend::Disabled,
+    };
+    let projected_at = DateTime::parse_from_rfc3339(
+        row.get::<String, _>("projected_at").as_str(),
+    )?
+    .with_timezone(&Utc);
+
+    Ok(crate::causal_graph::CausalGraphProjectionRecord {
+        run_id: row.get::<String, _>("run_id"),
+        backend,
+        status: row.get::<String, _>("status"),
+        database: row.get::<String, _>("database_name"),
+        schema_path: row.get::<String, _>("schema_path"),
+        graph_json: serde_json::from_str(row.get::<String, _>("graph_json").as_str())?,
+        episode_count: row.get::<i64, _>("episode_count").max(0) as u64,
+        event_count: row.get::<i64, _>("event_count").max(0) as u64,
+        link_count: row.get::<i64, _>("link_count").max(0) as u64,
+        hypothesis_count: row.get::<i64, _>("hypothesis_count").max(0) as u64,
+        projected_at,
+    })
+}
+
+fn causal_graph_backend_label(backend: &crate::causal_graph::CausalGraphBackend) -> &'static str {
+    match backend {
+        crate::causal_graph::CausalGraphBackend::TypeDb3 => "typedb3",
+        crate::causal_graph::CausalGraphBackend::Disabled => "disabled",
+    }
+}
+
+fn agent_contract_hash(paths: &Paths, agent_name: &str) -> Result<Option<String>> {
+    let path = paths
+        .factory
+        .join("agents")
+        .join("contracts")
+        .join(format!("{agent_name}.yaml"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)?;
+    let digest = Sha256::digest(bytes);
+    Ok(Some(format!("{digest:x}")))
 }
 
 pub async fn sync_agent_runtime_state(
@@ -1454,6 +1916,9 @@ pub async fn sync_agent_runtime_state(
     }
 
     tx.commit().await?;
+    for runtime in runtimes {
+        upsert_agent_state_from_runtime(pool, run_id, runtime).await?;
+    }
     Ok(())
 }
 
@@ -1489,6 +1954,184 @@ pub async fn insert_coordination_policy_event(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::setup::{
+        CalvinConfig, OpenBrainConfig, ProvidersConfig, SetupConfig, SetupMeta, SubAgentConfig,
+        TwilightBarkConfig,
+    };
+    use std::collections::HashMap;
+
+    fn test_paths(root: &std::path::Path) -> Paths {
+        let factory = root.join("factory");
+        Paths {
+            root: root.to_path_buf(),
+            factory: factory.clone(),
+            specs: factory.join("specs"),
+            scenarios: factory.join("scenarios"),
+            artifacts: factory.join("artifacts"),
+            logs: factory.join("logs"),
+            workspaces: factory.join("workspaces"),
+            memory: factory.join("memory"),
+            db_file: factory.join("state.db"),
+            products: root.join("products"),
+            setup: SetupConfig {
+                setup: SetupMeta {
+                    name: "test".to_string(),
+                    template: None,
+                    role: None,
+                    organization: None,
+                    platform: "test".to_string(),
+                    anythingllm: Some(false),
+                    openclaw: Some(false),
+                },
+                machine: None,
+                providers: ProvidersConfig {
+                    default: "claude".to_string(),
+                    claude: Some(crate::setup::ProviderConfig {
+                        provider_type: "anthropic".to_string(),
+                        model: "claude-test-model".to_string(),
+                        api_key_env: "ANTHROPIC_API_KEY".to_string(),
+                        enabled: true,
+                        credential_kind: None,
+                        usage_rights: None,
+                        surface: None,
+                        base_url: None,
+                    }),
+                    gemini: None,
+                    codex: None,
+                    extras: HashMap::new(),
+                },
+                routing: None,
+                mcp: None,
+                calvin_archive: CalvinConfig::default(),
+                twilight_bark: TwilightBarkConfig::default(),
+                open_brain: OpenBrainConfig::default(),
+                sub_agents: SubAgentConfig::default(),
+                typedb: Default::default(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn init_db_seeds_canonical_agent_state_and_runtime_sync_updates_last_run() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = test_paths(dir.path());
+        let profiles_dir = paths.factory.join("agents").join("profiles");
+        let contracts_dir = paths.factory.join("agents").join("contracts");
+        std::fs::create_dir_all(&profiles_dir).expect("profiles dir");
+        std::fs::create_dir_all(&contracts_dir).expect("contracts dir");
+        std::fs::write(
+            profiles_dir.join("mason.yaml"),
+            r#"
+name: mason
+display_name: Mason
+role: build_retriever
+provider: claude
+model_override: ~
+personality_file: ../personality/labrador.md
+"#,
+        )
+        .expect("profile");
+        std::fs::write(
+            contracts_dir.join("mason.yaml"),
+            "invariants:\n  - persists uncertainty\n",
+        )
+        .expect("contract");
+
+        let pool = init_db(&paths).await.expect("init db");
+        let mason = get_agent_state(&pool, "mason")
+            .await
+            .expect("get state")
+            .expect("mason state");
+        assert_eq!(mason.agent_role, "build_retriever");
+        assert_eq!(mason.llm_provider, "claude");
+        assert_eq!(mason.llm_model, "claude-test-model");
+        assert_eq!(
+            mason.behavior_contract_hash.as_deref().map(str::len),
+            Some(64)
+        );
+        assert!(mason.last_active_run.is_none());
+
+        sync_agent_runtime_state(
+            &pool,
+            "run-agent-state",
+            &[crate::models::AgentRuntimeState {
+                runtime_id: "mason#claude".to_string(),
+                canonical_role: "mason".to_string(),
+                display_name: "Mason".to_string(),
+                ownership: "implementation".to_string(),
+                status: "active".to_string(),
+                provider: Some("claude".to_string()),
+                surface: Some("local".to_string()),
+                thread_id: Some("thread-agent-state".to_string()),
+                source: "test".to_string(),
+                last_heartbeat_at: "2026-05-12T12:00:00Z".to_string(),
+            }],
+        )
+        .await
+        .expect("sync runtime");
+
+        let mason = get_agent_state(&pool, "mason")
+            .await
+            .expect("get state")
+            .expect("mason state");
+        assert_eq!(mason.last_active_run.as_deref(), Some("run-agent-state"));
+        assert_eq!(mason.updated_at, "2026-05-12T12:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn update_agent_memory_block_ids_merges_existing_blocks() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = test_paths(dir.path());
+        std::fs::create_dir_all(paths.factory.join("agents").join("profiles"))
+            .expect("profiles dir");
+        let pool = init_db(&paths).await.expect("init db");
+
+        update_agent_memory_block_ids(
+            &pool,
+            "mason",
+            BTreeMap::from([(
+                "recalled_lessons".to_string(),
+                "runs/run-1/mason_briefing.json#block=recalled_lessons".to_string(),
+            )]),
+        )
+        .await
+        .expect("first block update");
+        update_agent_memory_block_ids(
+            &pool,
+            "mason",
+            BTreeMap::from([(
+                "open_checks".to_string(),
+                "runs/run-2/mason_briefing.json#block=open_checks".to_string(),
+            )]),
+        )
+        .await
+        .expect("second block update");
+
+        let mason = get_agent_state(&pool, "mason")
+            .await
+            .expect("get state")
+            .expect("mason state");
+        assert_eq!(mason.memory_block_ids.len(), 2);
+        assert_eq!(
+            mason
+                .memory_block_ids
+                .get("recalled_lessons")
+                .map(String::as_str),
+            Some("runs/run-1/mason_briefing.json#block=recalled_lessons")
+        );
+        assert_eq!(
+            mason
+                .memory_block_ids
+                .get("open_checks")
+                .map(String::as_str),
+            Some("runs/run-2/mason_briefing.json#block=open_checks")
+        );
+    }
 }
 
 async fn ensure_column(
