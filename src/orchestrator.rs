@@ -17034,12 +17034,8 @@ Return JSON only.",
             links,
             hypotheses,
         };
-        let _ = db::upsert_causal_graph_projection(
-            &self.pool,
-            &graph,
-            self.causal_graph.config(),
-        )
-        .await;
+        let _ = db::upsert_causal_graph_projection(&self.pool, &graph, self.causal_graph.config())
+            .await;
         Ok(graph)
     }
 

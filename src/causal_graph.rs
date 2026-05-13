@@ -119,6 +119,60 @@ pub struct CausalGraphProjectionSummary {
     pub projected_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausalGraphProjectionInspection {
+    #[serde(flatten)]
+    pub record: CausalGraphProjectionRecord,
+    pub highlights: Vec<CausalGraphHit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausalSpecFailureHistory {
+    pub anchor_run_id: String,
+    pub spec_id: String,
+    pub projection_count: u64,
+    pub failure_run_count: u64,
+    pub repeated_causes: Vec<CausalRepeatedCause>,
+    pub runs: Vec<CausalFailureRunSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausalRepeatedCause {
+    pub cause_id: String,
+    pub count: u64,
+    pub average_confidence: f64,
+    pub run_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausalFailureRunSummary {
+    pub run_id: String,
+    pub projected_at: DateTime<Utc>,
+    pub failed_episode_count: u64,
+    pub hypothesis_count: u64,
+    pub top_causes: Vec<CausalGraphHit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausalFailureHistoryReplayExport {
+    pub schema: String,
+    pub generated_at: DateTime<Utc>,
+    pub anchor_run_id: String,
+    pub spec_id: String,
+    pub projection_source: String,
+    pub typedb_schema_path: String,
+    pub history: CausalSpecFailureHistory,
+    pub typedb_targets: Vec<String>,
+    pub replay_queries: Vec<CausalReplayQuery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausalReplayQuery {
+    pub label: String,
+    pub purpose: String,
+    pub typeql: String,
+}
+
 impl From<&CausalGraphProjectionRecord> for CausalGraphProjectionSummary {
     fn from(record: &CausalGraphProjectionRecord) -> Self {
         Self {

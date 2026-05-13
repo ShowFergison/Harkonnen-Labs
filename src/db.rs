@@ -1802,7 +1802,35 @@ pub async fn list_recent_causal_graph_projections(
     .fetch_all(pool)
     .await?;
 
-    rows.into_iter().map(causal_graph_projection_from_row).collect()
+    rows.into_iter()
+        .map(causal_graph_projection_from_row)
+        .collect()
+}
+
+pub async fn list_causal_graph_projections_for_spec(
+    pool: &SqlitePool,
+    spec_id: &str,
+    limit: i64,
+) -> Result<Vec<crate::causal_graph::CausalGraphProjectionRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT p.run_id, p.backend, p.status, p.database_name, p.schema_path, p.graph_json,
+               p.episode_count, p.event_count, p.link_count, p.hypothesis_count, p.projected_at
+        FROM causal_graph_projections p
+        JOIN runs r ON r.run_id = p.run_id
+        WHERE r.spec_id = ?1
+        ORDER BY p.projected_at DESC
+        LIMIT ?2
+        "#,
+    )
+    .bind(spec_id)
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(causal_graph_projection_from_row)
+        .collect()
 }
 
 pub async fn count_causal_graph_projections(pool: &SqlitePool) -> Result<u64> {
@@ -1819,10 +1847,8 @@ fn causal_graph_projection_from_row(
         "type_db3" | "typedb3" => crate::causal_graph::CausalGraphBackend::TypeDb3,
         _ => crate::causal_graph::CausalGraphBackend::Disabled,
     };
-    let projected_at = DateTime::parse_from_rfc3339(
-        row.get::<String, _>("projected_at").as_str(),
-    )?
-    .with_timezone(&Utc);
+    let projected_at = DateTime::parse_from_rfc3339(row.get::<String, _>("projected_at").as_str())?
+        .with_timezone(&Utc);
 
     Ok(crate::causal_graph::CausalGraphProjectionRecord {
         run_id: row.get::<String, _>("run_id"),

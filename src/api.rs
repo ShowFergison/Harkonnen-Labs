@@ -10,7 +10,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
@@ -606,6 +606,14 @@ struct CoobieQuerySource {
     note: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct CausalFailureHistoryMaterializeResponse {
+    run_id: String,
+    json_artifact: String,
+    markdown_artifact: String,
+    replay_query_count: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct QueryTargetSourceMetadata {
     source_path: String,
@@ -790,6 +798,7 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route("/api/runs/:id/lessons", get(get_run_lessons))
         .route("/api/runs/:id/state", get(get_run_state))
         .route("/api/runs/:id/health", get(get_run_health))
+        .route("/api/runs/:id/e2e-readiness", get(get_run_e2e_readiness))
         .route("/api/runs/:id/consolidate", post(post_run_consolidate))
         .route(
             "/api/runs/:id/consolidation/candidates",
@@ -898,6 +907,18 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route(
             "/api/runs/:id/causal-graph-projection",
             get(get_run_causal_graph_projection),
+        )
+        .route(
+            "/api/runs/:id/causal-failure-history",
+            get(get_run_causal_failure_history),
+        )
+        .route(
+            "/api/runs/:id/causal-failure-history/export",
+            get(get_run_causal_failure_history_export),
+        )
+        .route(
+            "/api/runs/:id/causal-failure-history/export/materialize",
+            post(post_materialize_causal_failure_history_export),
         )
         .route("/api/runs/:id/cost", get(get_run_cost))
         .route("/api/runs/:id/decisions", get(get_run_decisions))
@@ -1206,6 +1227,17 @@ async fn get_run_health(
 ) -> impl IntoResponse {
     match build_run_health(&app, &id).await {
         Ok(Some(health)) => (StatusCode::OK, Json(health)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_run_e2e_readiness(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match build_run_e2e_readiness(&app, &id).await {
+        Ok(Some(readiness)) => (StatusCode::OK, Json(readiness)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
@@ -2242,11 +2274,15 @@ async fn get_causal_graph_status(State(app): State<AppContext>) -> impl IntoResp
     let config = app.causal_graph.config();
     let projection_count = match db::count_causal_graph_projections(&app.pool).await {
         Ok(count) => count,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
     };
     let latest_projection = match db::list_causal_graph_projection_summaries(&app.pool, 1).await {
         Ok(mut records) => records.pop(),
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
     };
     let status = if config.enabled {
         CausalGraphStatus::Unavailable
@@ -2546,14 +2582,19 @@ async fn get_run_causal_graph_projection(
 ) -> impl IntoResponse {
     match app.get_run(&id).await {
         Ok(Some(_)) => match db::get_causal_graph_projection(&app.pool, &id).await {
-            Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
+            Ok(Some(record)) => {
+                (StatusCode::OK, Json(inspect_projection_record(record))).into_response()
+            }
             Ok(None) => match app.get_run_causal_graph(&id).await {
                 Ok(_) => match db::get_causal_graph_projection(&app.pool, &id).await {
-                    Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
-                    Ok(None) => {
-                        (StatusCode::NOT_FOUND, "Causal graph projection not generated")
-                            .into_response()
+                    Ok(Some(record)) => {
+                        (StatusCode::OK, Json(inspect_projection_record(record))).into_response()
                     }
+                    Ok(None) => (
+                        StatusCode::NOT_FOUND,
+                        "Causal graph projection not generated",
+                    )
+                        .into_response(),
                     Err(error) => {
                         (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
                     }
@@ -2564,6 +2605,39 @@ async fn get_run_causal_graph_projection(
             },
             Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
         },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_run_causal_failure_history(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match build_causal_failure_history(&app, &id, 8).await {
+        Ok(Some(history)) => (StatusCode::OK, Json(history)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_run_causal_failure_history_export(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match build_causal_failure_history_export(&app, &id, 8).await {
+        Ok(Some(export)) => (StatusCode::OK, Json(export)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn post_materialize_causal_failure_history_export(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match materialize_causal_failure_history_export(&app, &id).await {
+        Ok(Some(response)) => (StatusCode::OK, Json(response)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
@@ -3056,6 +3130,15 @@ async fn answer_general_coobie_query(
     } else {
         Vec::new()
     };
+    let failure_history = if let Some(run_id) = run_id {
+        if looks_like_causal_graph_query(query) && should_search_spec_projection_history(query) {
+            build_causal_failure_history(app, run_id, 8).await?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if !projection_hits.is_empty() {
         retrieval_path.push("causal_graph_projection_ledger".to_string());
         for hit in &projection_hits {
@@ -3063,9 +3146,7 @@ async fn answer_general_coobie_query(
                 kind: "causal_graph_projection".to_string(),
                 label: hit.label.clone(),
                 run_id: hit.evidence_refs.first().and_then(|evidence| {
-                    evidence
-                        .strip_prefix("run:")
-                        .map(|value| value.to_string())
+                    evidence.strip_prefix("run:").map(|value| value.to_string())
                 }),
                 phase: None,
                 artifact: Some("causal_graph_projections".to_string()),
@@ -3076,6 +3157,30 @@ async fn answer_general_coobie_query(
                 superseded_by: None,
                 challenged_by: Vec::new(),
                 note: Some(hit.summary.clone()),
+            });
+        }
+    }
+    if let Some(history) = failure_history.as_ref() {
+        retrieval_path.push("same_spec_causal_failure_history".to_string());
+        for cause in history.repeated_causes.iter().take(4) {
+            sources.push(CoobieQuerySource {
+                kind: "causal_failure_history".to_string(),
+                label: cause.cause_id.clone(),
+                run_id: Some(history.anchor_run_id.clone()),
+                phase: None,
+                artifact: Some("causal_graph_projections".to_string()),
+                hop: None,
+                query: Some(query.to_string()),
+                score: Some(cause.average_confidence),
+                status: Some("same_spec_history".to_string()),
+                superseded_by: None,
+                challenged_by: Vec::new(),
+                note: Some(format!(
+                    "{} occurrence(s) across {} same-spec run(s): {}",
+                    cause.count,
+                    cause.run_ids.len(),
+                    cause.run_ids.join(", ")
+                )),
             });
         }
     }
@@ -3162,11 +3267,23 @@ async fn answer_general_coobie_query(
             response.push(' ');
             response.push_str(&summary);
         }
+        if let Some(summary) = failure_history
+            .as_ref()
+            .and_then(format_failure_history_summary)
+        {
+            response.push(' ');
+            response.push_str(&summary);
+        }
         return Ok(CoobieQueryResponse {
             agent: "coobie".to_string(),
             response,
             retrieval_path,
-            confidence: if memory_hits.is_empty() && projection_hits.is_empty() {
+            confidence: if memory_hits.is_empty()
+                && projection_hits.is_empty()
+                && failure_history
+                    .as_ref()
+                    .is_none_or(|history| history.repeated_causes.is_empty())
+            {
                 0.72
             } else {
                 0.82
@@ -3259,28 +3376,330 @@ fn format_causal_graph_note(
     }
 }
 
+fn inspect_projection_record(
+    record: crate::causal_graph::CausalGraphProjectionRecord,
+) -> crate::causal_graph::CausalGraphProjectionInspection {
+    let highlights =
+        serde_json::from_value::<crate::models::RunCausalGraph>(record.graph_json.clone())
+            .map(|graph| {
+                let mut hits = Vec::new();
+                collect_projection_hits(&graph, &[], 8, &mut hits);
+                hits
+            })
+            .unwrap_or_default();
+
+    crate::causal_graph::CausalGraphProjectionInspection { record, highlights }
+}
+
+async fn build_causal_failure_history(
+    app: &AppContext,
+    run_id: &str,
+    limit: usize,
+) -> anyhow::Result<Option<crate::causal_graph::CausalSpecFailureHistory>> {
+    let Some(run) = app.get_run(run_id).await? else {
+        return Ok(None);
+    };
+    let records =
+        db::list_causal_graph_projections_for_spec(&app.pool, &run.spec_id, limit as i64).await?;
+    let projection_count = records.len() as u64;
+    let mut runs = Vec::new();
+    let mut cause_totals: BTreeMap<String, (u64, f64, Vec<String>)> = BTreeMap::new();
+
+    for record in records {
+        let graph =
+            serde_json::from_value::<crate::models::RunCausalGraph>(record.graph_json.clone())?;
+        let failed_episode_count = graph
+            .episodes
+            .iter()
+            .filter(|episode| {
+                matches!(
+                    episode.episode.outcome.as_deref(),
+                    Some("failure") | Some("blocked")
+                )
+            })
+            .count() as u64;
+        let top_causes = projection_hypothesis_hits(&graph, 3);
+        if failed_episode_count == 0 && top_causes.is_empty() {
+            continue;
+        }
+        for cause in &top_causes {
+            let cause_id = cause
+                .label
+                .strip_prefix("hypothesis:")
+                .unwrap_or(&cause.label)
+                .to_string();
+            let entry = cause_totals
+                .entry(cause_id)
+                .or_insert_with(|| (0, 0.0, Vec::new()));
+            entry.0 += 1;
+            entry.1 += cause.confidence;
+            if !entry.2.iter().any(|existing| existing == &graph.run_id) {
+                entry.2.push(graph.run_id.clone());
+            }
+        }
+        runs.push(crate::causal_graph::CausalFailureRunSummary {
+            run_id: graph.run_id,
+            projected_at: record.projected_at,
+            failed_episode_count,
+            hypothesis_count: graph.hypotheses.len() as u64,
+            top_causes,
+        });
+    }
+
+    let mut repeated_causes = cause_totals
+        .into_iter()
+        .map(|(cause_id, (count, confidence_sum, run_ids))| {
+            crate::causal_graph::CausalRepeatedCause {
+                cause_id,
+                count,
+                average_confidence: if count == 0 {
+                    0.0
+                } else {
+                    confidence_sum / count as f64
+                },
+                run_ids,
+            }
+        })
+        .collect::<Vec<_>>();
+    repeated_causes.sort_by(|left, right| {
+        right.count.cmp(&left.count).then_with(|| {
+            right
+                .average_confidence
+                .partial_cmp(&left.average_confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    Ok(Some(crate::causal_graph::CausalSpecFailureHistory {
+        anchor_run_id: run_id.to_string(),
+        spec_id: run.spec_id,
+        projection_count,
+        failure_run_count: runs.len() as u64,
+        repeated_causes,
+        runs,
+    }))
+}
+
+async fn build_causal_failure_history_export(
+    app: &AppContext,
+    run_id: &str,
+    limit: usize,
+) -> anyhow::Result<Option<crate::causal_graph::CausalFailureHistoryReplayExport>> {
+    let Some(history) = build_causal_failure_history(app, run_id, limit).await? else {
+        return Ok(None);
+    };
+    let schema_path = app.causal_graph.config().schema_path.clone();
+    let replay_queries = causal_failure_history_replay_queries(&history);
+
+    Ok(Some(
+        crate::causal_graph::CausalFailureHistoryReplayExport {
+            schema: "harkonnen.causal_failure_history_replay.v1".to_string(),
+            generated_at: Utc::now(),
+            anchor_run_id: history.anchor_run_id.clone(),
+            spec_id: history.spec_id.clone(),
+            projection_source: "sqlite.causal_graph_projections".to_string(),
+            typedb_schema_path: schema_path,
+            history,
+            typedb_targets: vec![
+                "agent".to_string(),
+                "goal".to_string(),
+                "episode".to_string(),
+                "outcome".to_string(),
+                "failure-mode".to_string(),
+                "causal-link".to_string(),
+                "causally-connects".to_string(),
+            ],
+            replay_queries,
+        },
+    ))
+}
+
+async fn materialize_causal_failure_history_export(
+    app: &AppContext,
+    run_id: &str,
+) -> anyhow::Result<Option<CausalFailureHistoryMaterializeResponse>> {
+    let Some(export) = build_causal_failure_history_export(app, run_id, 8).await? else {
+        return Ok(None);
+    };
+    let run_dir = app.paths.workspaces.join(run_id).join("run");
+    tokio::fs::create_dir_all(&run_dir).await?;
+    let json_artifact = "causal_failure_history_replay.json".to_string();
+    let markdown_artifact = "causal_failure_history_replay.md".to_string();
+    tokio::fs::write(
+        run_dir.join(&json_artifact),
+        serde_json::to_string_pretty(&export)?,
+    )
+    .await?;
+    tokio::fs::write(
+        run_dir.join(&markdown_artifact),
+        render_causal_failure_history_replay_markdown(&export),
+    )
+    .await?;
+
+    if let Some(mut board) =
+        read_optional_json::<BlackboardState>(&run_dir.join("blackboard.json")).await?
+    {
+        push_unique(&mut board.artifact_refs, json_artifact.clone());
+        push_unique(&mut board.artifact_refs, markdown_artifact.clone());
+        tokio::fs::write(
+            run_dir.join("blackboard.json"),
+            serde_json::to_string_pretty(&board)?,
+        )
+        .await?;
+        let mut live_board = app.blackboard.write().await;
+        if live_board.run_id == board.run_id {
+            *live_board = board;
+        }
+    }
+
+    Ok(Some(CausalFailureHistoryMaterializeResponse {
+        run_id: run_id.to_string(),
+        json_artifact,
+        markdown_artifact,
+        replay_query_count: export.replay_queries.len(),
+    }))
+}
+
+fn render_causal_failure_history_replay_markdown(
+    export: &crate::causal_graph::CausalFailureHistoryReplayExport,
+) -> String {
+    let mut lines = vec![
+        "# Causal Failure History Replay".to_string(),
+        String::new(),
+        format!("- Schema: {}", export.schema),
+        format!("- Anchor run: {}", export.anchor_run_id),
+        format!("- Spec: {}", export.spec_id),
+        format!("- Projection source: {}", export.projection_source),
+        format!("- TypeDB schema: {}", export.typedb_schema_path),
+        format!("- Failure runs: {}", export.history.failure_run_count),
+        format!("- Projection rows: {}", export.history.projection_count),
+        String::new(),
+        "## Repeated Causes".to_string(),
+    ];
+    if export.history.repeated_causes.is_empty() {
+        lines.push("- No repeated causes recorded.".to_string());
+    } else {
+        for cause in &export.history.repeated_causes {
+            lines.push(format!(
+                "- `{}`: {} run(s), average confidence {:.2}; supporting runs: {}",
+                cause.cause_id,
+                cause.count,
+                cause.average_confidence,
+                cause.run_ids.join(", ")
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## Replay Queries".to_string());
+    for query in &export.replay_queries {
+        lines.push(format!("- `{}`: {}", query.label, query.purpose));
+        lines.push("```typeql".to_string());
+        lines.push(query.typeql.clone());
+        lines.push("```".to_string());
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn causal_failure_history_replay_queries(
+    history: &crate::causal_graph::CausalSpecFailureHistory,
+) -> Vec<crate::causal_graph::CausalReplayQuery> {
+    let escaped_spec = typeql_string_literal(&history.spec_id);
+    let mut queries = vec![
+        crate::causal_graph::CausalReplayQuery {
+            label: "same_spec_failed_episodes".to_string(),
+            purpose: "Find failed or blocked episodes for this spec family once projections are replayed into TypeDB.".to_string(),
+            typeql: format!(
+                "match $g isa goal, has spec-id \"{escaped_spec}\"; (goal: $g, episode: $e) isa episode-goal; $e isa episode; $o isa outcome, has status $status; (episode: $e, outcome: $o) isa produced-outcome; {{ $status == \"failure\"; }} or {{ $status == \"blocked\"; }}; get $e, $o, $status;"
+            ),
+        },
+        crate::causal_graph::CausalReplayQuery {
+            label: "same_spec_repeated_failure_modes".to_string(),
+            purpose: "Group repeated failure-mode labels for the same spec after TypeDB replay.".to_string(),
+            typeql: format!(
+                "match $g isa goal, has spec-id \"{escaped_spec}\"; (goal: $g, episode: $e) isa episode-goal; $f isa failure-mode, has label $label; (episode: $e, failure: $f) isa classifies-failure; get $label;"
+            ),
+        },
+    ];
+
+    for cause in history.repeated_causes.iter().take(4) {
+        let escaped_cause = typeql_string_literal(&cause.cause_id);
+        queries.push(crate::causal_graph::CausalReplayQuery {
+            label: format!("cause_{}", cause.cause_id),
+            purpose: format!(
+                "Trace supporting causal links for repeated cause {} across same-spec runs.",
+                cause.cause_id
+            ),
+            typeql: format!(
+                "match $f isa failure-mode, has label \"{escaped_cause}\"; $c isa causal-link; (cause: $f, link: $c) isa causally-connects; get $f, $c;"
+            ),
+        });
+    }
+
+    queries
+}
+
+fn typeql_string_literal(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            _ => vec![ch],
+        })
+        .collect()
+}
+
+fn projection_hypothesis_hits(
+    graph: &crate::models::RunCausalGraph,
+    limit: usize,
+) -> Vec<crate::causal_graph::CausalGraphHit> {
+    graph
+        .hypotheses
+        .iter()
+        .take(limit)
+        .map(|hypothesis| crate::causal_graph::CausalGraphHit {
+            label: format!("hypothesis:{}", hypothesis.cause_id),
+            summary: hypothesis.description.clone(),
+            evidence_refs: vec![format!("run:{}", graph.run_id)],
+            confidence: hypothesis.confidence as f64,
+        })
+        .collect()
+}
+
 async fn search_causal_graph_projection_ledger(
     app: &AppContext,
     run_id: Option<&str>,
     query: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<crate::causal_graph::CausalGraphHit>> {
+    let terms = causal_projection_query_terms(query);
     let records = if let Some(run_id) = run_id {
         match db::get_causal_graph_projection(&app.pool, run_id).await? {
+            Some(record) if should_search_spec_projection_history(query) => {
+                let mut records = spec_projection_history(app, run_id, limit.max(6)).await?;
+                if !records.iter().any(|entry| entry.run_id == record.run_id) {
+                    records.insert(0, record);
+                }
+                records
+            }
             Some(record) => vec![record],
             None => {
                 let _ = app.get_run_causal_graph(run_id).await;
-                db::get_causal_graph_projection(&app.pool, run_id)
-                    .await?
-                    .into_iter()
-                    .collect()
+                if should_search_spec_projection_history(query) {
+                    spec_projection_history(app, run_id, limit.max(6)).await?
+                } else {
+                    db::get_causal_graph_projection(&app.pool, run_id)
+                        .await?
+                        .into_iter()
+                        .collect()
+                }
             }
         }
     } else {
         db::list_recent_causal_graph_projections(&app.pool, 12).await?
     };
 
-    let terms = causal_projection_query_terms(query);
     let mut hits = Vec::new();
     for record in records {
         let graph = serde_json::from_value::<crate::models::RunCausalGraph>(record.graph_json)?;
@@ -3293,6 +3712,31 @@ async fn search_causal_graph_projection_ledger(
     Ok(hits)
 }
 
+async fn spec_projection_history(
+    app: &AppContext,
+    run_id: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<crate::causal_graph::CausalGraphProjectionRecord>> {
+    let Some(run) = app.get_run(run_id).await? else {
+        return Ok(Vec::new());
+    };
+    db::list_causal_graph_projections_for_spec(&app.pool, &run.spec_id, limit as i64).await
+}
+
+fn should_search_spec_projection_history(query: &str) -> bool {
+    let normalized = query.to_ascii_lowercase();
+    [
+        "last",
+        "recent",
+        "previous",
+        "spec",
+        "same spec",
+        "failures",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
+}
+
 fn causal_projection_query_terms(query: &str) -> Vec<String> {
     query
         .to_ascii_lowercase()
@@ -3301,8 +3745,20 @@ fn causal_projection_query_terms(query: &str) -> Vec<String> {
         .filter(|term| {
             !matches!(
                 *term,
-                "what" | "when" | "where" | "which" | "from" | "that" | "with" | "have"
-                    | "were" | "been" | "this" | "there" | "into" | "about"
+                "what"
+                    | "when"
+                    | "where"
+                    | "which"
+                    | "from"
+                    | "that"
+                    | "with"
+                    | "have"
+                    | "were"
+                    | "been"
+                    | "this"
+                    | "there"
+                    | "into"
+                    | "about"
             )
         })
         .map(str::to_string)
@@ -3369,9 +3825,7 @@ fn collect_projection_hits(
             "{} {} {}",
             episode.episode.phase, episode.episode.goal, outcome
         );
-        if matches!(outcome, "failure" | "blocked")
-            || projection_text_matches(&haystack, terms)
-        {
+        if matches!(outcome, "failure" | "blocked") || projection_text_matches(&haystack, terms) {
             hits.push(crate::causal_graph::CausalGraphHit {
                 label: format!("episode:{}", episode.episode.episode_id),
                 summary: format!(
@@ -3440,6 +3894,36 @@ fn format_projection_ledger_summary(
         "SQLite causal graph projection ledger surfaced {} hit(s): {}.",
         hits.len(),
         top
+    ))
+}
+
+fn format_failure_history_summary(
+    history: &crate::causal_graph::CausalSpecFailureHistory,
+) -> Option<String> {
+    if history.failure_run_count == 0 {
+        return None;
+    }
+    if history.repeated_causes.is_empty() {
+        return Some(format!(
+            "Same-spec causal history found {} failure run(s) across {} projection(s), but no repeated cause has enough hypothesis evidence yet.",
+            history.failure_run_count, history.projection_count
+        ));
+    }
+    let top = history
+        .repeated_causes
+        .iter()
+        .take(3)
+        .map(|cause| {
+            format!(
+                "{} appeared in {} run(s), avg confidence {:.2}",
+                cause.cause_id, cause.count, cause.average_confidence
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "Same-spec causal history found {} failure run(s) across {} projection(s): {}.",
+        history.failure_run_count, history.projection_count, top
     ))
 }
 
@@ -4549,6 +5033,125 @@ async fn build_run_health(app: &AppContext, id: &str) -> anyhow::Result<Option<s
             },
         },
     })))
+}
+
+async fn build_run_e2e_readiness(
+    app: &AppContext,
+    id: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let Some(run) = app.get_run(id).await? else {
+        return Ok(None);
+    };
+    let run_dir = app.paths.workspaces.join(id).join("run");
+    let health = build_run_health(app, id)
+        .await?
+        .unwrap_or_else(|| serde_json::json!({}));
+    let required_artifacts = [
+        ("blackboard", "blackboard.json"),
+        ("coobie_briefing", "coobie_briefing.json"),
+        ("phase_attributions", "phase_attributions.json"),
+        ("validation", "validation.json"),
+        ("hidden_scenarios", "hidden_scenarios.json"),
+        ("causal_report", "causal_report.json"),
+        ("plan_completion_audit", "plan_completion_audit.json"),
+        ("behavioral_change_report", "behavioral_change_report.json"),
+        (
+            "causal_failure_replay",
+            "causal_failure_history_replay.json",
+        ),
+    ];
+    let mut checks = Vec::new();
+    let mut missing = Vec::new();
+    for (name, artifact) in required_artifacts {
+        let present = run_dir.join(artifact).exists();
+        if !present {
+            missing.push(artifact.to_string());
+        }
+        checks.push(serde_json::json!({
+            "name": name,
+            "artifact": artifact,
+            "present": present,
+        }));
+    }
+
+    let health_status = health
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let health_blockers = health
+        .get("blockers")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let ready_artifacts = checks
+        .iter()
+        .filter(|check| check.get("present").and_then(serde_json::Value::as_bool) == Some(true))
+        .count();
+    let artifact_score = if checks.is_empty() {
+        0.0
+    } else {
+        ready_artifacts as f64 / checks.len() as f64
+    };
+    let status = if !health_blockers.is_empty() {
+        "blocked"
+    } else if missing.is_empty() && health_status == "ready" {
+        "ready"
+    } else {
+        "needs_evidence"
+    };
+    let next_actions = e2e_readiness_next_actions(&missing, health_status);
+
+    Ok(Some(serde_json::json!({
+        "schema": "harkonnen.e2e_readiness.v1",
+        "run_id": id,
+        "spec_id": run.spec_id,
+        "status": status,
+        "run_status": run.status,
+        "health_status": health_status,
+        "artifact_score": artifact_score,
+        "ready_artifact_count": ready_artifacts,
+        "required_artifact_count": checks.len(),
+        "missing_artifacts": missing,
+        "checks": checks,
+        "health_blockers": health_blockers,
+        "next_actions": next_actions,
+        "month_end_goal": "full_end_to_end_functionality",
+    })))
+}
+
+fn e2e_readiness_next_actions(missing: &[String], health_status: &str) -> Vec<String> {
+    let mut actions = Vec::new();
+    if missing.iter().any(|artifact| artifact == "validation.json") {
+        actions.push("run visible validation so Bramble emits validation.json".to_string());
+    }
+    if missing
+        .iter()
+        .any(|artifact| artifact == "hidden_scenarios.json")
+    {
+        actions.push("run hidden scenarios so Sable emits hidden_scenarios.json".to_string());
+    }
+    if missing
+        .iter()
+        .any(|artifact| artifact == "causal_report.json")
+    {
+        actions
+            .push("complete Coobie causal ingest so causal_report.json is available".to_string());
+    }
+    if missing
+        .iter()
+        .any(|artifact| artifact == "causal_failure_history_replay.json")
+    {
+        actions.push(
+            "materialize same-spec causal failure replay from the Causal Graph panel".to_string(),
+        );
+    }
+    if health_status != "ready" {
+        actions.push(format!("resolve run health status `{health_status}`"));
+    }
+    if actions.is_empty() {
+        actions.push("run is ready for end-to-end evidence review".to_string());
+    }
+    actions
 }
 
 async fn read_optional_json<T: DeserializeOwned>(path: &FsPath) -> anyhow::Result<Option<T>> {
@@ -6799,7 +7402,9 @@ async fn get_server_status(State(app): State<AppContext>) -> impl IntoResponse {
 mod tests {
     use super::{
         briefing_scope_artifact, execute_coobie_query, get_agent_state, get_causal_graph_status,
-        get_run_causal_graph_projection, list_agent_state,
+        get_run_causal_failure_history, get_run_causal_failure_history_export,
+        get_run_causal_graph_projection, get_run_e2e_readiness, list_agent_state,
+        post_materialize_causal_failure_history_export,
     };
     use crate::{
         config::Paths,
@@ -7096,6 +7701,7 @@ personality_file: ../personality/labrador.md
         assert_eq!(projection_body["run_id"], "run-causal-projection");
         assert_eq!(projection_body["status"], "sqlite_projection");
         assert_eq!(projection_body["episode_count"], 1);
+        assert!(projection_body["highlights"].as_array().is_some());
 
         let updated_status = get_causal_graph_status(State(app)).await.into_response();
         let updated_body = response_json(updated_status).await;
@@ -7152,14 +7758,9 @@ personality_file: ../personality/labrador.md
             .await
             .expect("projection");
 
-        let response = execute_coobie_query(
-            &app,
-            None,
-            "What caused validation failures?",
-            1,
-        )
-        .await
-        .expect("coobie query");
+        let response = execute_coobie_query(&app, None, "What caused validation failures?", 1)
+            .await
+            .expect("coobie query");
 
         assert!(response
             .retrieval_path
@@ -7173,5 +7774,425 @@ personality_file: ../personality/labrador.md
         assert!(response
             .response
             .contains("SQLite causal graph projection ledger surfaced"));
+    }
+
+    #[tokio::test]
+    async fn causal_graph_projection_endpoint_returns_inspection_highlights() {
+        let (_dir, app) = test_app().await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        )
+        .bind("run-projection-inspect")
+        .bind("spec-inspect")
+        .bind("product")
+        .bind("completed")
+        .bind(&now)
+        .execute(&app.pool)
+        .await
+        .expect("insert run");
+        let graph = crate::models::RunCausalGraph {
+            run_id: "run-projection-inspect".to_string(),
+            generated_at: Utc::now(),
+            episodes: Vec::new(),
+            events: Vec::new(),
+            links: Vec::new(),
+            hypotheses: vec![crate::models::CausalHypothesis {
+                cause_id: "cause-plan-drift".to_string(),
+                description: "Plan drift caused hidden scenario instability".to_string(),
+                confidence: 0.73,
+                hierarchy_level: crate::models::PearlHierarchyLevel::Associational,
+                supporting_runs: vec!["run-projection-inspect".to_string()],
+                evidence: Vec::new(),
+                counterfactuals: Vec::new(),
+            }],
+        };
+        db::upsert_causal_graph_projection(&app.pool, &graph, app.causal_graph.config())
+            .await
+            .expect("projection");
+
+        let response =
+            get_run_causal_graph_projection(Path("run-projection-inspect".to_string()), State(app))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["run_id"], "run-projection-inspect");
+        assert_eq!(
+            body["highlights"][0]["label"],
+            "hypothesis:cause-plan-drift"
+        );
+    }
+
+    #[tokio::test]
+    async fn causal_questions_with_run_id_search_same_spec_projection_history() {
+        let (_dir, app) = test_app().await;
+        let now = Utc::now().to_rfc3339();
+        for run_id in ["run-spec-history-1", "run-spec-history-2"] {
+            sqlx::query(
+                "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            )
+            .bind(run_id)
+            .bind("spec-shared-history")
+            .bind("product")
+            .bind("completed")
+            .bind(&now)
+            .execute(&app.pool)
+            .await
+            .expect("insert run");
+        }
+        let graph_one = crate::models::RunCausalGraph {
+            run_id: "run-spec-history-1".to_string(),
+            generated_at: Utc::now(),
+            episodes: Vec::new(),
+            events: Vec::new(),
+            links: Vec::new(),
+            hypotheses: vec![crate::models::CausalHypothesis {
+                cause_id: "cause-auth-timeout".to_string(),
+                description: "Auth timeout caused validation failure".to_string(),
+                confidence: 0.81,
+                hierarchy_level: crate::models::PearlHierarchyLevel::Associational,
+                supporting_runs: vec!["run-spec-history-1".to_string()],
+                evidence: Vec::new(),
+                counterfactuals: Vec::new(),
+            }],
+        };
+        let graph_two = crate::models::RunCausalGraph {
+            run_id: "run-spec-history-2".to_string(),
+            generated_at: Utc::now(),
+            episodes: Vec::new(),
+            events: Vec::new(),
+            links: Vec::new(),
+            hypotheses: vec![crate::models::CausalHypothesis {
+                cause_id: "cause-auth-schema".to_string(),
+                description: "Auth schema mismatch caused hidden scenario failure".to_string(),
+                confidence: 0.79,
+                hierarchy_level: crate::models::PearlHierarchyLevel::Associational,
+                supporting_runs: vec!["run-spec-history-2".to_string()],
+                evidence: Vec::new(),
+                counterfactuals: Vec::new(),
+            }],
+        };
+        db::upsert_causal_graph_projection(&app.pool, &graph_one, app.causal_graph.config())
+            .await
+            .expect("projection one");
+        db::upsert_causal_graph_projection(&app.pool, &graph_two, app.causal_graph.config())
+            .await
+            .expect("projection two");
+
+        let response = execute_coobie_query(
+            &app,
+            Some("run-spec-history-2"),
+            "What caused recent failures on this spec?",
+            1,
+        )
+        .await
+        .expect("coobie query");
+
+        let labels = response
+            .sources
+            .iter()
+            .filter(|source| source.kind == "causal_graph_projection")
+            .map(|source| source.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels
+            .iter()
+            .any(|label| label.contains("cause-auth-timeout")));
+        assert!(labels
+            .iter()
+            .any(|label| label.contains("cause-auth-schema")));
+        assert!(response
+            .retrieval_path
+            .iter()
+            .any(|entry| entry == "same_spec_causal_failure_history"));
+        assert!(response
+            .sources
+            .iter()
+            .any(|source| source.kind == "causal_failure_history"
+                && source.label == "cause-auth-timeout"));
+        assert!(response.response.contains("Same-spec causal history found"));
+    }
+
+    #[tokio::test]
+    async fn causal_failure_history_summarizes_same_spec_repeated_causes() {
+        let (_dir, app) = test_app().await;
+        let now = Utc::now().to_rfc3339();
+        for run_id in ["run-history-a", "run-history-b", "run-history-c"] {
+            sqlx::query(
+                "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            )
+            .bind(run_id)
+            .bind("spec-history-summary")
+            .bind("product")
+            .bind("completed")
+            .bind(&now)
+            .execute(&app.pool)
+            .await
+            .expect("insert run");
+        }
+        for run_id in ["run-history-a", "run-history-b"] {
+            let graph = crate::models::RunCausalGraph {
+                run_id: run_id.to_string(),
+                generated_at: Utc::now(),
+                episodes: vec![crate::models::EpisodeCausalState {
+                    episode: crate::models::EpisodeRecord {
+                        episode_id: format!("episode-{run_id}"),
+                        run_id: run_id.to_string(),
+                        phase: "validation".to_string(),
+                        goal: "Run visible validation".to_string(),
+                        outcome: Some("failure".to_string()),
+                        confidence: Some(0.7),
+                        started_at: Utc::now(),
+                        ended_at: None,
+                        state_before: None,
+                        state_after: None,
+                    },
+                    state_diff: None,
+                }],
+                events: Vec::new(),
+                links: Vec::new(),
+                hypotheses: vec![crate::models::CausalHypothesis {
+                    cause_id: "cause-shared-timeout".to_string(),
+                    description: "Shared timeout caused validation failure".to_string(),
+                    confidence: 0.8,
+                    hierarchy_level: crate::models::PearlHierarchyLevel::Associational,
+                    supporting_runs: vec![run_id.to_string()],
+                    evidence: Vec::new(),
+                    counterfactuals: Vec::new(),
+                }],
+            };
+            db::upsert_causal_graph_projection(&app.pool, &graph, app.causal_graph.config())
+                .await
+                .expect("projection");
+        }
+
+        let response =
+            get_run_causal_failure_history(Path("run-history-b".to_string()), State(app))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["spec_id"], "spec-history-summary");
+        assert_eq!(body["failure_run_count"], 2);
+        assert_eq!(
+            body["repeated_causes"][0]["cause_id"],
+            "cause-shared-timeout"
+        );
+        assert_eq!(body["repeated_causes"][0]["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn causal_failure_history_export_returns_typedb_replay_contract() {
+        let (_dir, app) = test_app().await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        )
+        .bind("run-export-history")
+        .bind("spec-export-history")
+        .bind("product")
+        .bind("completed")
+        .bind(&now)
+        .execute(&app.pool)
+        .await
+        .expect("insert run");
+        let graph = crate::models::RunCausalGraph {
+            run_id: "run-export-history".to_string(),
+            generated_at: Utc::now(),
+            episodes: vec![crate::models::EpisodeCausalState {
+                episode: crate::models::EpisodeRecord {
+                    episode_id: "episode-export-history".to_string(),
+                    run_id: "run-export-history".to_string(),
+                    phase: "validation".to_string(),
+                    goal: "Run visible validation".to_string(),
+                    outcome: Some("failure".to_string()),
+                    confidence: Some(0.7),
+                    started_at: Utc::now(),
+                    ended_at: None,
+                    state_before: None,
+                    state_after: None,
+                },
+                state_diff: None,
+            }],
+            events: Vec::new(),
+            links: Vec::new(),
+            hypotheses: vec![crate::models::CausalHypothesis {
+                cause_id: "cause-export-timeout".to_string(),
+                description: "Export timeout caused validation failure".to_string(),
+                confidence: 0.82,
+                hierarchy_level: crate::models::PearlHierarchyLevel::Associational,
+                supporting_runs: vec!["run-export-history".to_string()],
+                evidence: Vec::new(),
+                counterfactuals: Vec::new(),
+            }],
+        };
+        db::upsert_causal_graph_projection(&app.pool, &graph, app.causal_graph.config())
+            .await
+            .expect("projection");
+
+        let response = get_run_causal_failure_history_export(
+            Path("run-export-history".to_string()),
+            State(app),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["schema"], "harkonnen.causal_failure_history_replay.v1");
+        assert_eq!(body["history"]["failure_run_count"], 1);
+        assert!(body["typedb_targets"]
+            .as_array()
+            .expect("typedb targets")
+            .iter()
+            .any(|target| target == "causal-link"));
+        assert!(body["replay_queries"]
+            .as_array()
+            .expect("replay queries")
+            .iter()
+            .any(|query| query["typeql"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("spec-export-history")));
+    }
+
+    #[tokio::test]
+    async fn materialize_causal_failure_history_export_writes_artifacts_and_blackboard_refs() {
+        let (_dir, app) = test_app().await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        )
+        .bind("run-materialize-history")
+        .bind("spec-materialize-history")
+        .bind("product")
+        .bind("completed")
+        .bind(&now)
+        .execute(&app.pool)
+        .await
+        .expect("insert run");
+        let run_dir = app
+            .paths
+            .workspaces
+            .join("run-materialize-history")
+            .join("run");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let mut board = BlackboardState::default();
+        board.run_id = "run-materialize-history".to_string();
+        std::fs::write(
+            run_dir.join("blackboard.json"),
+            serde_json::to_string_pretty(&board).expect("board json"),
+        )
+        .expect("write board");
+        let graph = crate::models::RunCausalGraph {
+            run_id: "run-materialize-history".to_string(),
+            generated_at: Utc::now(),
+            episodes: vec![crate::models::EpisodeCausalState {
+                episode: crate::models::EpisodeRecord {
+                    episode_id: "episode-materialize-history".to_string(),
+                    run_id: "run-materialize-history".to_string(),
+                    phase: "validation".to_string(),
+                    goal: "Run visible validation".to_string(),
+                    outcome: Some("failure".to_string()),
+                    confidence: Some(0.7),
+                    started_at: Utc::now(),
+                    ended_at: None,
+                    state_before: None,
+                    state_after: None,
+                },
+                state_diff: None,
+            }],
+            events: Vec::new(),
+            links: Vec::new(),
+            hypotheses: vec![crate::models::CausalHypothesis {
+                cause_id: "cause-materialize-timeout".to_string(),
+                description: "Materialize timeout caused validation failure".to_string(),
+                confidence: 0.82,
+                hierarchy_level: crate::models::PearlHierarchyLevel::Associational,
+                supporting_runs: vec!["run-materialize-history".to_string()],
+                evidence: Vec::new(),
+                counterfactuals: Vec::new(),
+            }],
+        };
+        db::upsert_causal_graph_projection(&app.pool, &graph, app.causal_graph.config())
+            .await
+            .expect("projection");
+
+        let response = post_materialize_causal_failure_history_export(
+            Path("run-materialize-history".to_string()),
+            State(app.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["json_artifact"], "causal_failure_history_replay.json");
+        assert!(run_dir.join("causal_failure_history_replay.json").exists());
+        let markdown = std::fs::read_to_string(run_dir.join("causal_failure_history_replay.md"))
+            .expect("markdown");
+        assert!(markdown.contains("Causal Failure History Replay"));
+        let updated_board: BlackboardState = serde_json::from_str(
+            &std::fs::read_to_string(run_dir.join("blackboard.json")).expect("board"),
+        )
+        .expect("updated board");
+        assert!(updated_board
+            .artifact_refs
+            .iter()
+            .any(|artifact| artifact == "causal_failure_history_replay.json"));
+        assert!(updated_board
+            .artifact_refs
+            .iter()
+            .any(|artifact| artifact == "causal_failure_history_replay.md"));
+    }
+
+    #[tokio::test]
+    async fn e2e_readiness_reports_missing_month_end_artifacts() {
+        let (_dir, app) = test_app().await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        )
+        .bind("run-e2e-readiness-missing")
+        .bind("spec-e2e-readiness")
+        .bind("product")
+        .bind("completed")
+        .bind(&now)
+        .execute(&app.pool)
+        .await
+        .expect("insert run");
+        let run_dir = app
+            .paths
+            .workspaces
+            .join("run-e2e-readiness-missing")
+            .join("run");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let mut board = BlackboardState::default();
+        board.run_id = "run-e2e-readiness-missing".to_string();
+        std::fs::write(
+            run_dir.join("blackboard.json"),
+            serde_json::to_string_pretty(&board).expect("board json"),
+        )
+        .expect("blackboard");
+
+        let response =
+            get_run_e2e_readiness(Path("run-e2e-readiness-missing".to_string()), State(app))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["schema"], "harkonnen.e2e_readiness.v1");
+        assert_eq!(body["status"], "needs_evidence");
+        assert!(body["missing_artifacts"]
+            .as_array()
+            .expect("missing artifacts")
+            .iter()
+            .any(|artifact| artifact == "validation.json"));
+        assert!(body["next_actions"]
+            .as_array()
+            .expect("next actions")
+            .iter()
+            .any(|action| action
+                .as_str()
+                .unwrap_or_default()
+                .contains("visible validation")));
     }
 }

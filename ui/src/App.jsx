@@ -178,6 +178,11 @@ function App() {
   const [agentState, setAgentState] = useState([]);
   const [causalGraphStatus, setCausalGraphStatus] = useState(null);
   const [causalGraphProjection, setCausalGraphProjection] = useState(null);
+  const [causalFailureHistory, setCausalFailureHistory] = useState(null);
+  const [causalFailureExport, setCausalFailureExport] = useState(null);
+  const [e2eReadiness, setE2eReadiness] = useState(null);
+  const [materializedCausalExport, setMaterializedCausalExport] = useState(null);
+  const [materializingCausalExport, setMaterializingCausalExport] = useState(false);
   const [reviewingMemoryUpdateId, setReviewingMemoryUpdateId] = useState('');
   const [selectedRole, setSelectedRole] = useState('mason');
   const [roleBoard, setRoleBoard] = useState(null);
@@ -389,30 +394,62 @@ function App() {
   useEffect(() => {
     if (!activeRunId) {
       setCausalGraphProjection(null);
+      setCausalFailureHistory(null);
+      setCausalFailureExport(null);
+      setE2eReadiness(null);
+      setMaterializedCausalExport(null);
       return undefined;
     }
 
     let cancelled = false;
-    const loadProjection = async () => {
+    const loadCausalGraphRunData = async () => {
       try {
-        const data = await fetchJson(`${API_BASE}/runs/${activeRunId}/causal-graph-projection`);
+        const [projection, history, replayExport, readiness] = await Promise.allSettled([
+          fetchJson(`${API_BASE}/runs/${activeRunId}/causal-graph-projection`),
+          fetchJson(`${API_BASE}/runs/${activeRunId}/causal-failure-history`),
+          fetchJson(`${API_BASE}/runs/${activeRunId}/causal-failure-history/export`),
+          fetchJson(`${API_BASE}/runs/${activeRunId}/e2e-readiness`),
+        ]);
         if (!cancelled) {
-          setCausalGraphProjection(data);
+          setCausalGraphProjection(projection.status === 'fulfilled' ? projection.value : null);
+          setCausalFailureHistory(history.status === 'fulfilled' ? history.value : null);
+          setCausalFailureExport(replayExport.status === 'fulfilled' ? replayExport.value : null);
+          setE2eReadiness(readiness.status === 'fulfilled' ? readiness.value : null);
+          setMaterializedCausalExport(null);
         }
       } catch {
         if (!cancelled) {
           setCausalGraphProjection(null);
+          setCausalFailureHistory(null);
+          setCausalFailureExport(null);
+          setE2eReadiness(null);
         }
       }
     };
 
-    loadProjection();
-    const interval = setInterval(loadProjection, 5000);
+    loadCausalGraphRunData();
+    const interval = setInterval(loadCausalGraphRunData, 5000);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
   }, [activeRunId]);
+
+  const materializeCausalExport = async () => {
+    if (!activeRunId) {
+      return;
+    }
+    setMaterializingCausalExport(true);
+    try {
+      const response = await postJson(`${API_BASE}/runs/${activeRunId}/causal-failure-history/export/materialize`, {});
+      setMaterializedCausalExport(response);
+      setError('');
+    } catch (materializeError) {
+      setError(materializeError.message);
+    } finally {
+      setMaterializingCausalExport(false);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -777,6 +814,35 @@ function App() {
             </div>
           </Panel>
 
+          <Panel title="E2E Readiness" compact>
+            {e2eReadiness ? (
+              <div className="readiness-stack">
+                <div className={`readiness-status ${e2eReadiness.status || 'unknown'}`}>
+                  <div>
+                    <span>Month-end goal</span>
+                    <strong>{titleCase(e2eReadiness.status || 'unknown')}</strong>
+                  </div>
+                  <strong>{Math.round(Number(e2eReadiness.artifact_score || 0) * 100)}%</strong>
+                </div>
+                <div className="agent-state-grid">
+                  <div><span>Artifacts</span><strong>{graphCount(e2eReadiness.ready_artifact_count)} / {graphCount(e2eReadiness.required_artifact_count)}</strong></div>
+                  <div><span>Missing</span><strong>{graphCount(e2eReadiness.missing_artifacts?.length || 0)}</strong></div>
+                  <div><span>Run</span><strong>{titleCase(e2eReadiness.run_status || 'unknown')}</strong></div>
+                  <div><span>Health</span><strong>{titleCase(e2eReadiness.health_status || 'unknown')}</strong></div>
+                </div>
+                {(e2eReadiness.next_actions || []).length > 0 ? (
+                  <div className="readiness-actions">
+                    {e2eReadiness.next_actions.slice(0, 4).map((action) => (
+                      <div key={action} className="readiness-action">{action}</div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <div className="empty-state">Readiness has not been computed for this run yet.</div>
+            )}
+          </Panel>
+
           <Panel title="Causal Graph" compact>
             {causalGraphStatus ? (
               <div className="graph-ledger">
@@ -803,10 +869,85 @@ function App() {
                       <div><span>Links</span><strong>{graphCount(causalGraphProjection.link_count)}</strong></div>
                       <div><span>Hypotheses</span><strong>{graphCount(causalGraphProjection.hypothesis_count)}</strong></div>
                     </div>
+                    {(causalGraphProjection.highlights || []).length > 0 ? (
+                      <div className="graph-highlights">
+                        {causalGraphProjection.highlights.slice(0, 3).map((hit) => (
+                          <div key={hit.label} className="graph-highlight">
+                            <div>
+                              <span>{hit.label}</span>
+                              <p>{hit.summary}</p>
+                            </div>
+                            <strong>{Number(hit.confidence || 0).toFixed(2)}</strong>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
                   </div>
                 ) : (
                   <div className="empty-state">No projection for the active run yet.</div>
                 )}
+                {causalFailureHistory ? (
+                  <div className="agent-state-card graph-history-card">
+                    <div className="agent-state-head">
+                      <div>
+                        <div className="agent-state-name">Same spec failure history</div>
+                        <div className="agent-state-role">{causalFailureHistory.spec_id}</div>
+                      </div>
+                      <span className="agent-state-provider">
+                        {graphCount(causalFailureHistory.failure_run_count)} / {graphCount(causalFailureHistory.projection_count)}
+                      </span>
+                    </div>
+                    {(causalFailureHistory.repeated_causes || []).length > 0 ? (
+                      <div className="graph-highlights">
+                        {causalFailureHistory.repeated_causes.slice(0, 3).map((cause) => (
+                          <div key={cause.cause_id} className="graph-highlight">
+                            <div>
+                              <span>{cause.cause_id}</span>
+                              <p>{cause.count} run(s), avg confidence {Number(cause.average_confidence || 0).toFixed(2)}</p>
+                            </div>
+                            <strong>{cause.run_ids?.length || 0}</strong>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="empty-state">No repeated causes for this spec yet.</div>
+                    )}
+                    {(causalFailureHistory.runs || []).length > 0 ? (
+                      <div className="graph-run-history">
+                        {causalFailureHistory.runs.slice(0, 3).map((entry) => {
+                          const topCause = entry.top_causes?.[0];
+                          return (
+                            <div key={entry.run_id} className="graph-run-row">
+                              <span>{entry.run_id.slice(0, 10)}</span>
+                              <p>{topCause ? topCause.summary : `${graphCount(entry.failed_episode_count)} failed episode(s)`}</p>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : null}
+                    {causalFailureExport ? (
+                      <div className="graph-export-row">
+                        <span>Replay contract</span>
+                        <strong>{causalFailureExport.replay_queries?.length || 0} TypeQL queries</strong>
+                      </div>
+                    ) : null}
+                    {causalFailureExport ? (
+                      <div className="graph-export-actions">
+                        <button
+                          type="button"
+                          className="memory-update-btn"
+                          onClick={materializeCausalExport}
+                          disabled={materializingCausalExport}
+                        >
+                          {materializingCausalExport ? 'Writing artifacts' : 'Materialize replay'}
+                        </button>
+                        {materializedCausalExport ? (
+                          <span>{materializedCausalExport.json_artifact}</span>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
                 {causalGraphStatus.note ? (
                   <div className="graph-note">{causalGraphStatus.note}</div>
                 ) : null}
@@ -1254,12 +1395,159 @@ function App() {
           border-color: rgba(103, 148, 131, 0.32);
         }
 
+        .graph-history-card {
+          border-color: rgba(194, 163, 114, 0.3);
+        }
+
+        .readiness-stack {
+          display: flex;
+          flex-direction: column;
+          gap: 0.75rem;
+        }
+
+        .readiness-status {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          gap: 0.8rem;
+          align-items: center;
+          border: 1px solid rgba(194, 163, 114, 0.25);
+          background: rgba(194, 163, 114, 0.07);
+          border-radius: 12px;
+          padding: 0.72rem 0.8rem;
+        }
+
+        .readiness-status.ready {
+          border-color: rgba(143, 174, 124, 0.38);
+          background: rgba(143, 174, 124, 0.08);
+        }
+
+        .readiness-status.blocked {
+          border-color: rgba(216, 135, 110, 0.38);
+          background: rgba(216, 135, 110, 0.08);
+        }
+
+        .readiness-status span {
+          display: block;
+          color: var(--text-secondary);
+          font-size: 0.62rem;
+          font-weight: 800;
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          margin-bottom: 0.18rem;
+        }
+
+        .readiness-status strong {
+          font-size: 0.92rem;
+        }
+
+        .readiness-actions {
+          display: flex;
+          flex-direction: column;
+          gap: 0.45rem;
+        }
+
+        .readiness-action {
+          border-left: 2px solid rgba(194, 163, 114, 0.42);
+          color: var(--text-secondary);
+          font-size: 0.8rem;
+          line-height: 1.35;
+          padding-left: 0.6rem;
+        }
+
         .graph-note {
           color: var(--text-secondary);
           font-size: 0.82rem;
           line-height: 1.45;
           border-left: 2px solid rgba(194, 163, 114, 0.45);
           padding-left: 0.7rem;
+        }
+
+        .graph-highlights {
+          display: flex;
+          flex-direction: column;
+          gap: 0.5rem;
+          margin-top: 0.7rem;
+        }
+
+        .graph-highlight {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          gap: 0.65rem;
+          align-items: start;
+          border-top: 1px solid rgba(255, 255, 255, 0.06);
+          padding-top: 0.55rem;
+        }
+
+        .graph-highlight span {
+          color: var(--accent-gold);
+          font-size: 0.68rem;
+          font-weight: 800;
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+        }
+
+        .graph-highlight p {
+          margin: 0.18rem 0 0;
+          color: var(--text-secondary);
+          font-size: 0.8rem;
+          line-height: 1.35;
+        }
+
+        .graph-highlight strong {
+          color: var(--text-primary);
+          font-size: 0.78rem;
+        }
+
+        .graph-run-history {
+          display: flex;
+          flex-direction: column;
+          gap: 0.42rem;
+          margin-top: 0.65rem;
+          border-top: 1px solid rgba(255, 255, 255, 0.06);
+          padding-top: 0.6rem;
+        }
+
+        .graph-run-row {
+          display: grid;
+          grid-template-columns: 72px minmax(0, 1fr);
+          gap: 0.55rem;
+          align-items: start;
+        }
+
+        .graph-run-row span {
+          color: var(--text-secondary);
+          font-size: 0.72rem;
+          font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+
+        .graph-run-row p {
+          margin: 0;
+          color: var(--text-secondary);
+          font-size: 0.78rem;
+          line-height: 1.35;
+        }
+
+        .graph-export-row {
+          display: flex;
+          justify-content: space-between;
+          gap: 0.65rem;
+          margin-top: 0.65rem;
+          border-top: 1px solid rgba(255, 255, 255, 0.06);
+          padding-top: 0.6rem;
+          color: var(--text-secondary);
+          font-size: 0.78rem;
+        }
+
+        .graph-export-row span {
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          font-weight: 800;
+        }
+
+        .graph-export-row strong {
+          color: var(--text-primary);
+          font-size: 0.8rem;
+          text-align: right;
         }
 
         .agent-state-head {
