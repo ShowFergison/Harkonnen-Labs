@@ -7454,7 +7454,7 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
         &self,
         run_id: &str,
         spec_obj: &Spec,
-        target_source: &TargetSourceMetadata,
+        _target_source: &TargetSourceMetadata,
         briefing: &CoobieBriefing,
         run_dir: &Path,
     ) -> crate::models::OptimizationProgram {
@@ -31273,13 +31273,13 @@ pub(crate) fn compute_prediction_error(predicted: &str, actual: &str) -> f64 {
     match (predicted, actual) {
         ("pass", "completed") => 0.0,
         ("fail", "failed") => 0.0,
+        ("uncertain", "completed") => 0.1,
+        ("uncertain", "failed") => 0.2,
         ("uncertain", _) => 0.2,      // never fully wrong when uncertain
         ("pass", "failed") => 1.0,    // missed a real failure — worst outcome
         ("fail", "completed") => 0.6, // false alarm — less harmful than false confidence
         ("pass", "completed_with_issues") => 0.4,
         ("fail", "completed_with_issues") => 0.1,
-        ("uncertain", "completed") => 0.1,
-        ("uncertain", "failed") => 0.2,
         _ => 0.5,
     }
 }

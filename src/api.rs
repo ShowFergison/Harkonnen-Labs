@@ -614,6 +614,62 @@ struct CausalFailureHistoryMaterializeResponse {
     replay_query_count: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct E2eReadinessMaterializeResponse {
+    run_id: String,
+    json_artifact: String,
+    markdown_artifact: String,
+    status: String,
+    missing_artifact_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct E2eEvidenceManifestMaterializeResponse {
+    run_id: String,
+    json_artifact: String,
+    markdown_artifact: String,
+    status: String,
+    present_artifact_count: usize,
+    required_artifact_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct E2eEvidenceBundleMaterializeResponse {
+    run_id: String,
+    json_artifact: String,
+    markdown_artifact: String,
+    status: String,
+    artifact_score: f64,
+    bundle_artifacts: Vec<String>,
+    bundle_artifact_urls: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct E2eReadinessIndexResponse {
+    schema: &'static str,
+    generated_at: DateTime<Utc>,
+    run_count: usize,
+    ready_count: usize,
+    best_run_id: Option<String>,
+    entries: Vec<E2eReadinessIndexEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct E2eReadinessIndexEntry {
+    run_id: String,
+    spec_id: String,
+    product: String,
+    run_status: String,
+    status: String,
+    health_status: String,
+    artifact_score: f64,
+    ready_artifact_count: usize,
+    required_artifact_count: usize,
+    missing_artifact_count: usize,
+    next_action: Option<String>,
+    updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Deserialize)]
 struct QueryTargetSourceMetadata {
     source_path: String,
@@ -778,6 +834,7 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
 
     let router = Router::new()
         .route("/api/runs", get(list_runs))
+        .route("/api/e2e-readiness", get(get_e2e_readiness_index))
         .route("/api/runs/:id", get(get_run))
         .route("/api/runs/:id/events", get(get_run_events))
         .route("/api/runs/:id/events/stream", get(get_run_events_stream))
@@ -799,6 +856,18 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route("/api/runs/:id/state", get(get_run_state))
         .route("/api/runs/:id/health", get(get_run_health))
         .route("/api/runs/:id/e2e-readiness", get(get_run_e2e_readiness))
+        .route(
+            "/api/runs/:id/e2e-readiness/materialize",
+            post(post_materialize_e2e_readiness),
+        )
+        .route(
+            "/api/runs/:id/e2e-evidence-manifest/materialize",
+            post(post_materialize_e2e_evidence_manifest),
+        )
+        .route(
+            "/api/runs/:id/e2e-evidence-bundle/materialize",
+            post(post_materialize_e2e_evidence_bundle),
+        )
         .route("/api/runs/:id/consolidate", post(post_run_consolidate))
         .route(
             "/api/runs/:id/consolidation/candidates",
@@ -997,6 +1066,13 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
 async fn list_runs(State(app): State<AppContext>) -> impl IntoResponse {
     match app.list_runs(50).await {
         Ok(runs) => (StatusCode::OK, Json(runs)).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_e2e_readiness_index(State(app): State<AppContext>) -> impl IntoResponse {
+    match build_e2e_readiness_index(&app, 20).await {
+        Ok(index) => (StatusCode::OK, Json(index)).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
@@ -1238,6 +1314,39 @@ async fn get_run_e2e_readiness(
 ) -> impl IntoResponse {
     match build_run_e2e_readiness(&app, &id).await {
         Ok(Some(readiness)) => (StatusCode::OK, Json(readiness)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn post_materialize_e2e_readiness(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match materialize_e2e_readiness(&app, &id).await {
+        Ok(Some(response)) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn post_materialize_e2e_evidence_manifest(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match materialize_e2e_evidence_manifest(&app, &id).await {
+        Ok(Some(response)) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn post_materialize_e2e_evidence_bundle(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match materialize_e2e_evidence_bundle(&app, &id).await {
+        Ok(Some(response)) => (StatusCode::OK, Json(response)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
@@ -5154,6 +5263,673 @@ fn e2e_readiness_next_actions(missing: &[String], health_status: &str) -> Vec<St
     actions
 }
 
+async fn build_e2e_readiness_index(
+    app: &AppContext,
+    limit: i64,
+) -> anyhow::Result<E2eReadinessIndexResponse> {
+    let runs = app.list_runs(limit).await?;
+    let mut entries = Vec::new();
+    for run in runs {
+        let Some(readiness) = build_run_e2e_readiness(app, &run.run_id).await? else {
+            continue;
+        };
+        entries.push(e2e_readiness_index_entry(&run, &readiness));
+    }
+
+    entries.sort_by(|left, right| {
+        readiness_status_rank(&left.status)
+            .cmp(&readiness_status_rank(&right.status))
+            .then_with(|| {
+                right
+                    .artifact_score
+                    .partial_cmp(&left.artifact_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+    });
+    let ready_count = entries
+        .iter()
+        .filter(|entry| entry.status == "ready")
+        .count();
+    let best_run_id = entries.first().map(|entry| entry.run_id.clone());
+
+    Ok(E2eReadinessIndexResponse {
+        schema: "harkonnen.e2e_readiness_index.v1",
+        generated_at: Utc::now(),
+        run_count: entries.len(),
+        ready_count,
+        best_run_id,
+        entries,
+    })
+}
+
+fn e2e_readiness_index_entry(
+    run: &RunRecord,
+    readiness: &serde_json::Value,
+) -> E2eReadinessIndexEntry {
+    E2eReadinessIndexEntry {
+        run_id: run.run_id.clone(),
+        spec_id: run.spec_id.clone(),
+        product: run.product.clone(),
+        run_status: run.status.clone(),
+        status: readiness
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        health_status: readiness
+            .get("health_status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        artifact_score: readiness
+            .get("artifact_score")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_default(),
+        ready_artifact_count: readiness
+            .get("ready_artifact_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default() as usize,
+        required_artifact_count: readiness
+            .get("required_artifact_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default() as usize,
+        missing_artifact_count: readiness
+            .get("missing_artifacts")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default(),
+        next_action: readiness
+            .get("next_actions")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|actions| actions.first())
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        updated_at: run.updated_at,
+    }
+}
+
+fn readiness_status_rank(status: &str) -> u8 {
+    match status {
+        "ready" => 0,
+        "needs_evidence" => 1,
+        "blocked" => 2,
+        _ => 3,
+    }
+}
+
+async fn materialize_e2e_readiness(
+    app: &AppContext,
+    run_id: &str,
+) -> anyhow::Result<Option<E2eReadinessMaterializeResponse>> {
+    let Some(readiness) = build_run_e2e_readiness(app, run_id).await? else {
+        return Ok(None);
+    };
+    let run_dir = app.paths.workspaces.join(run_id).join("run");
+    tokio::fs::create_dir_all(&run_dir).await?;
+    let json_artifact = "e2e_readiness.json".to_string();
+    let markdown_artifact = "e2e_readiness.md".to_string();
+    tokio::fs::write(
+        run_dir.join(&json_artifact),
+        serde_json::to_string_pretty(&readiness)?,
+    )
+    .await?;
+    tokio::fs::write(
+        run_dir.join(&markdown_artifact),
+        render_e2e_readiness_markdown(&readiness),
+    )
+    .await?;
+
+    if let Some(mut board) =
+        read_optional_json::<BlackboardState>(&run_dir.join("blackboard.json")).await?
+    {
+        push_unique(&mut board.artifact_refs, json_artifact.clone());
+        push_unique(&mut board.artifact_refs, markdown_artifact.clone());
+        tokio::fs::write(
+            run_dir.join("blackboard.json"),
+            serde_json::to_string_pretty(&board)?,
+        )
+        .await?;
+        let mut live_board = app.blackboard.write().await;
+        if live_board.run_id == board.run_id {
+            *live_board = board;
+        }
+    }
+
+    let status = readiness
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let missing_artifact_count = readiness
+        .get("missing_artifacts")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+
+    Ok(Some(E2eReadinessMaterializeResponse {
+        run_id: run_id.to_string(),
+        json_artifact,
+        markdown_artifact,
+        status,
+        missing_artifact_count,
+    }))
+}
+
+fn render_e2e_readiness_markdown(readiness: &serde_json::Value) -> String {
+    let status = readiness
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let run_id = readiness
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let spec_id = readiness
+        .get("spec_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let health_status = readiness
+        .get("health_status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let ready_artifacts = readiness
+        .get("ready_artifact_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let required_artifacts = readiness
+        .get("required_artifact_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let artifact_score = readiness
+        .get("artifact_score")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_default();
+
+    let mut lines = vec![
+        "# E2E Readiness".to_string(),
+        String::new(),
+        format!(
+            "- Schema: {}",
+            readiness
+                .get("schema")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        ),
+        format!("- Run: {run_id}"),
+        format!("- Spec: {spec_id}"),
+        format!("- Status: {status}"),
+        format!("- Health: {health_status}"),
+        format!(
+            "- Artifacts: {ready_artifacts}/{required_artifacts} ({:.0}%)",
+            artifact_score * 100.0
+        ),
+        String::new(),
+        "## Missing Artifacts".to_string(),
+    ];
+
+    let missing = readiness
+        .get("missing_artifacts")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if missing.is_empty() {
+        lines.push("- none".to_string());
+    } else {
+        for artifact in missing {
+            if let Some(artifact) = artifact.as_str() {
+                lines.push(format!("- `{artifact}`"));
+            }
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## Next Actions".to_string());
+    let actions = readiness
+        .get("next_actions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if actions.is_empty() {
+        lines.push("- none".to_string());
+    } else {
+        for action in actions {
+            if let Some(action) = action.as_str() {
+                lines.push(format!("- {action}"));
+            }
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## Checks".to_string());
+    for check in readiness
+        .get("checks")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let name = check
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("artifact");
+        let artifact = check
+            .get("artifact")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let marker = if check.get("present").and_then(serde_json::Value::as_bool) == Some(true) {
+            "x"
+        } else {
+            " "
+        };
+        lines.push(format!("- [{marker}] {name}: `{artifact}`"));
+    }
+
+    lines.join("\n")
+}
+
+async fn materialize_e2e_evidence_manifest(
+    app: &AppContext,
+    run_id: &str,
+) -> anyhow::Result<Option<E2eEvidenceManifestMaterializeResponse>> {
+    let Some(readiness) = build_run_e2e_readiness(app, run_id).await? else {
+        return Ok(None);
+    };
+    let run_dir = app.paths.workspaces.join(run_id).join("run");
+    tokio::fs::create_dir_all(&run_dir).await?;
+    let manifest = build_e2e_evidence_manifest(run_id, &run_dir, &readiness);
+    let json_artifact = "e2e_evidence_manifest.json".to_string();
+    let markdown_artifact = "e2e_evidence_manifest.md".to_string();
+    tokio::fs::write(
+        run_dir.join(&json_artifact),
+        serde_json::to_string_pretty(&manifest)?,
+    )
+    .await?;
+    tokio::fs::write(
+        run_dir.join(&markdown_artifact),
+        render_e2e_evidence_manifest_markdown(&manifest),
+    )
+    .await?;
+
+    if let Some(mut board) =
+        read_optional_json::<BlackboardState>(&run_dir.join("blackboard.json")).await?
+    {
+        push_unique(&mut board.artifact_refs, json_artifact.clone());
+        push_unique(&mut board.artifact_refs, markdown_artifact.clone());
+        tokio::fs::write(
+            run_dir.join("blackboard.json"),
+            serde_json::to_string_pretty(&board)?,
+        )
+        .await?;
+        let mut live_board = app.blackboard.write().await;
+        if live_board.run_id == board.run_id {
+            *live_board = board;
+        }
+    }
+
+    let status = manifest
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let present_artifact_count = manifest
+        .get("present_artifact_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default() as usize;
+    let required_artifact_count = manifest
+        .get("required_artifact_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default() as usize;
+
+    Ok(Some(E2eEvidenceManifestMaterializeResponse {
+        run_id: run_id.to_string(),
+        json_artifact,
+        markdown_artifact,
+        status,
+        present_artifact_count,
+        required_artifact_count,
+    }))
+}
+
+fn build_e2e_evidence_manifest(
+    run_id: &str,
+    run_dir: &FsPath,
+    readiness: &serde_json::Value,
+) -> serde_json::Value {
+    let entries = readiness
+        .get("checks")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|check| {
+            let name = check
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("artifact");
+            let artifact = check
+                .get("artifact")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let present = run_dir.join(artifact).exists();
+            let size_bytes = std::fs::metadata(run_dir.join(artifact))
+                .map(|metadata| metadata.len())
+                .ok();
+            serde_json::json!({
+                "name": name,
+                "artifact": artifact,
+                "present": present,
+                "size_bytes": size_bytes,
+                "download_url": if present {
+                    Some(format!("/api/runs/{run_id}/artifacts/{artifact}"))
+                } else {
+                    None
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let present_artifact_count = entries
+        .iter()
+        .filter(|entry| entry.get("present").and_then(serde_json::Value::as_bool) == Some(true))
+        .count();
+
+    serde_json::json!({
+        "schema": "harkonnen.e2e_evidence_manifest.v1",
+        "run_id": run_id,
+        "generated_at": Utc::now(),
+        "status": readiness.get("status").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
+        "health_status": readiness.get("health_status").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
+        "artifact_score": readiness.get("artifact_score").and_then(serde_json::Value::as_f64).unwrap_or_default(),
+        "present_artifact_count": present_artifact_count,
+        "required_artifact_count": entries.len(),
+        "missing_artifacts": readiness.get("missing_artifacts").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "next_actions": readiness.get("next_actions").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "entries": entries,
+    })
+}
+
+fn render_e2e_evidence_manifest_markdown(manifest: &serde_json::Value) -> String {
+    let run_id = manifest
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let status = manifest
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let present_artifact_count = manifest
+        .get("present_artifact_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let required_artifact_count = manifest
+        .get("required_artifact_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let mut lines = vec![
+        "# E2E Evidence Manifest".to_string(),
+        String::new(),
+        format!("- Run: {run_id}"),
+        format!("- Status: {status}"),
+        format!("- Artifacts: {present_artifact_count}/{required_artifact_count}"),
+        String::new(),
+        "## Artifact Checklist".to_string(),
+    ];
+
+    for entry in manifest
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let name = entry
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("artifact");
+        let artifact = entry
+            .get("artifact")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let marker = if entry.get("present").and_then(serde_json::Value::as_bool) == Some(true) {
+            "x"
+        } else {
+            " "
+        };
+        let download = entry
+            .get("download_url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if download.is_empty() {
+            lines.push(format!("- [{marker}] {name}: `{artifact}`"));
+        } else {
+            lines.push(format!("- [{marker}] {name}: `{artifact}` ({download})"));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## Next Actions".to_string());
+    let actions = manifest
+        .get("next_actions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if actions.is_empty() {
+        lines.push("- none".to_string());
+    } else {
+        for action in actions {
+            if let Some(action) = action.as_str() {
+                lines.push(format!("- {action}"));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+async fn materialize_e2e_evidence_bundle(
+    app: &AppContext,
+    run_id: &str,
+) -> anyhow::Result<Option<E2eEvidenceBundleMaterializeResponse>> {
+    let Some(readiness) = build_run_e2e_readiness(app, run_id).await? else {
+        return Ok(None);
+    };
+    let run_dir = app.paths.workspaces.join(run_id).join("run");
+    tokio::fs::create_dir_all(&run_dir).await?;
+
+    let manifest = build_e2e_evidence_manifest(run_id, &run_dir, &readiness);
+    let readiness_json = "e2e_readiness.json".to_string();
+    let readiness_markdown = "e2e_readiness.md".to_string();
+    let manifest_json = "e2e_evidence_manifest.json".to_string();
+    let manifest_markdown = "e2e_evidence_manifest.md".to_string();
+    let bundle_json = "e2e_evidence_bundle.json".to_string();
+    let bundle_markdown = "e2e_evidence_bundle.md".to_string();
+
+    tokio::fs::write(
+        run_dir.join(&readiness_json),
+        serde_json::to_string_pretty(&readiness)?,
+    )
+    .await?;
+    tokio::fs::write(
+        run_dir.join(&readiness_markdown),
+        render_e2e_readiness_markdown(&readiness),
+    )
+    .await?;
+    tokio::fs::write(
+        run_dir.join(&manifest_json),
+        serde_json::to_string_pretty(&manifest)?,
+    )
+    .await?;
+    tokio::fs::write(
+        run_dir.join(&manifest_markdown),
+        render_e2e_evidence_manifest_markdown(&manifest),
+    )
+    .await?;
+
+    let bundle_artifacts = vec![
+        readiness_json.clone(),
+        readiness_markdown.clone(),
+        manifest_json.clone(),
+        manifest_markdown.clone(),
+        bundle_json.clone(),
+        bundle_markdown.clone(),
+    ];
+    let bundle_entries = bundle_artifacts
+        .iter()
+        .map(|artifact| {
+            let path = run_dir.join(artifact);
+            serde_json::json!({
+                "artifact": artifact,
+                "download_url": format!("/api/runs/{run_id}/artifacts/{artifact}"),
+                "size_bytes": std::fs::metadata(path).map(|metadata| metadata.len()).ok(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let bundle = serde_json::json!({
+        "schema": "harkonnen.e2e_evidence_bundle.v1",
+        "run_id": run_id,
+        "generated_at": Utc::now(),
+        "status": readiness.get("status").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
+        "artifact_score": readiness.get("artifact_score").and_then(serde_json::Value::as_f64).unwrap_or_default(),
+        "readiness_artifact": readiness_json.clone(),
+        "readiness_markdown": readiness_markdown.clone(),
+        "manifest_artifact": manifest_json.clone(),
+        "manifest_markdown": manifest_markdown.clone(),
+        "bundle_artifacts": bundle_artifacts.clone(),
+        "bundle_entries": bundle_entries,
+        "missing_artifacts": readiness.get("missing_artifacts").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "next_actions": readiness.get("next_actions").cloned().unwrap_or_else(|| serde_json::json!([])),
+    });
+    tokio::fs::write(
+        run_dir.join(&bundle_json),
+        serde_json::to_string_pretty(&bundle)?,
+    )
+    .await?;
+    tokio::fs::write(
+        run_dir.join(&bundle_markdown),
+        render_e2e_evidence_bundle_markdown(&bundle),
+    )
+    .await?;
+
+    if let Some(mut board) =
+        read_optional_json::<BlackboardState>(&run_dir.join("blackboard.json")).await?
+    {
+        for artifact in bundle_artifacts_from_bundle(&bundle) {
+            push_unique(&mut board.artifact_refs, artifact);
+        }
+        tokio::fs::write(
+            run_dir.join("blackboard.json"),
+            serde_json::to_string_pretty(&board)?,
+        )
+        .await?;
+        let mut live_board = app.blackboard.write().await;
+        if live_board.run_id == board.run_id {
+            *live_board = board;
+        }
+    }
+
+    Ok(Some(E2eEvidenceBundleMaterializeResponse {
+        run_id: run_id.to_string(),
+        json_artifact: bundle_json,
+        markdown_artifact: bundle_markdown,
+        status: bundle
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        artifact_score: bundle
+            .get("artifact_score")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_default(),
+        bundle_artifacts: bundle_artifacts_from_bundle(&bundle),
+        bundle_artifact_urls: bundle_artifact_urls_from_bundle(&bundle),
+    }))
+}
+
+fn bundle_artifacts_from_bundle(bundle: &serde_json::Value) -> Vec<String> {
+    bundle
+        .get("bundle_artifacts")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|artifact| artifact.as_str().map(ToString::to_string))
+        .collect()
+}
+
+fn bundle_artifact_urls_from_bundle(bundle: &serde_json::Value) -> Vec<String> {
+    bundle
+        .get("bundle_entries")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| {
+            entry
+                .get("download_url")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect()
+}
+
+fn render_e2e_evidence_bundle_markdown(bundle: &serde_json::Value) -> String {
+    let run_id = bundle
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let status = bundle
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let artifact_score = bundle
+        .get("artifact_score")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_default();
+    let mut lines = vec![
+        "# E2E Evidence Bundle".to_string(),
+        String::new(),
+        format!("- Run: {run_id}"),
+        format!("- Status: {status}"),
+        format!("- Artifact score: {:.0}%", artifact_score * 100.0),
+        String::new(),
+        "## Bundle Artifacts".to_string(),
+    ];
+
+    for entry in bundle
+        .get("bundle_entries")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let artifact = entry
+            .get("artifact")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let download = entry
+            .get("download_url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        lines.push(format!("- `{artifact}` ({download})"));
+    }
+
+    lines.push(String::new());
+    lines.push("## Next Actions".to_string());
+    let actions = bundle
+        .get("next_actions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if actions.is_empty() {
+        lines.push("- none".to_string());
+    } else {
+        for action in actions {
+            if let Some(action) = action.as_str() {
+                lines.push(format!("- {action}"));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
 async fn read_optional_json<T: DeserializeOwned>(path: &FsPath) -> anyhow::Result<Option<T>> {
     if !path.exists() {
         return Ok(None);
@@ -7402,9 +8178,11 @@ async fn get_server_status(State(app): State<AppContext>) -> impl IntoResponse {
 mod tests {
     use super::{
         briefing_scope_artifact, execute_coobie_query, get_agent_state, get_causal_graph_status,
-        get_run_causal_failure_history, get_run_causal_failure_history_export,
-        get_run_causal_graph_projection, get_run_e2e_readiness, list_agent_state,
-        post_materialize_causal_failure_history_export,
+        get_e2e_readiness_index, get_run_causal_failure_history,
+        get_run_causal_failure_history_export, get_run_causal_graph_projection,
+        get_run_e2e_readiness, list_agent_state, post_materialize_causal_failure_history_export,
+        post_materialize_e2e_evidence_bundle, post_materialize_e2e_evidence_manifest,
+        post_materialize_e2e_readiness,
     };
     use crate::{
         config::Paths,
@@ -8194,5 +8972,268 @@ personality_file: ../personality/labrador.md
                 .as_str()
                 .unwrap_or_default()
                 .contains("visible validation")));
+    }
+
+    #[tokio::test]
+    async fn materialize_e2e_readiness_writes_artifacts_and_blackboard_refs() {
+        let (_dir, app) = test_app().await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        )
+        .bind("run-e2e-readiness-materialize")
+        .bind("spec-e2e-readiness")
+        .bind("product")
+        .bind("completed")
+        .bind(&now)
+        .execute(&app.pool)
+        .await
+        .expect("insert run");
+        let run_dir = app
+            .paths
+            .workspaces
+            .join("run-e2e-readiness-materialize")
+            .join("run");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let mut board = BlackboardState::default();
+        board.run_id = "run-e2e-readiness-materialize".to_string();
+        std::fs::write(
+            run_dir.join("blackboard.json"),
+            serde_json::to_string_pretty(&board).expect("board json"),
+        )
+        .expect("blackboard");
+
+        let response = post_materialize_e2e_readiness(
+            Path("run-e2e-readiness-materialize".to_string()),
+            State(app),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["json_artifact"], "e2e_readiness.json");
+        assert_eq!(body["markdown_artifact"], "e2e_readiness.md");
+        assert_eq!(body["status"], "needs_evidence");
+        assert!(run_dir.join("e2e_readiness.json").exists());
+        let markdown = std::fs::read_to_string(run_dir.join("e2e_readiness.md")).expect("markdown");
+        assert!(markdown.contains("E2E Readiness"));
+        assert!(markdown.contains("validation.json"));
+        let updated_board: BlackboardState = serde_json::from_str(
+            &std::fs::read_to_string(run_dir.join("blackboard.json")).expect("board"),
+        )
+        .expect("updated board");
+        assert!(updated_board
+            .artifact_refs
+            .iter()
+            .any(|artifact| artifact == "e2e_readiness.json"));
+        assert!(updated_board
+            .artifact_refs
+            .iter()
+            .any(|artifact| artifact == "e2e_readiness.md"));
+    }
+
+    #[tokio::test]
+    async fn e2e_readiness_index_ranks_recent_candidate_runs() {
+        let (_dir, app) = test_app().await;
+        let now = Utc::now();
+        for (run_id, offset) in [("run-e2e-index-low", 0), ("run-e2e-index-high", 1)] {
+            let timestamp = (now + chrono::Duration::seconds(offset)).to_rfc3339();
+            sqlx::query(
+                "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            )
+            .bind(run_id)
+            .bind("spec-e2e-index")
+            .bind("product")
+            .bind("completed")
+            .bind(&timestamp)
+            .execute(&app.pool)
+            .await
+            .expect("insert run");
+            let run_dir = app.paths.workspaces.join(run_id).join("run");
+            std::fs::create_dir_all(&run_dir).expect("run dir");
+            let mut board = BlackboardState::default();
+            board.run_id = run_id.to_string();
+            std::fs::write(
+                run_dir.join("blackboard.json"),
+                serde_json::to_string_pretty(&board).expect("board json"),
+            )
+            .expect("blackboard");
+            if run_id == "run-e2e-index-high" {
+                for artifact in [
+                    "coobie_briefing.json",
+                    "phase_attributions.json",
+                    "causal_report.json",
+                    "causal_failure_history_replay.json",
+                ] {
+                    std::fs::write(run_dir.join(artifact), "{}").expect("artifact");
+                }
+            }
+        }
+
+        let response = get_e2e_readiness_index(State(app)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["schema"], "harkonnen.e2e_readiness_index.v1");
+        assert_eq!(body["run_count"], 2);
+        assert_eq!(body["best_run_id"], "run-e2e-index-high");
+        assert_eq!(body["entries"][0]["run_id"], "run-e2e-index-high");
+        assert!(
+            body["entries"][0]["artifact_score"]
+                .as_f64()
+                .unwrap_or_default()
+                > body["entries"][1]["artifact_score"]
+                    .as_f64()
+                    .unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_e2e_evidence_manifest_writes_downloadable_checklist() {
+        let (_dir, app) = test_app().await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        )
+        .bind("run-e2e-manifest")
+        .bind("spec-e2e-manifest")
+        .bind("product")
+        .bind("completed")
+        .bind(&now)
+        .execute(&app.pool)
+        .await
+        .expect("insert run");
+        let run_dir = app.paths.workspaces.join("run-e2e-manifest").join("run");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let mut board = BlackboardState::default();
+        board.run_id = "run-e2e-manifest".to_string();
+        std::fs::write(
+            run_dir.join("blackboard.json"),
+            serde_json::to_string_pretty(&board).expect("board json"),
+        )
+        .expect("blackboard");
+        std::fs::write(run_dir.join("coobie_briefing.json"), "{}").expect("artifact");
+
+        let response = post_materialize_e2e_evidence_manifest(
+            Path("run-e2e-manifest".to_string()),
+            State(app),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["json_artifact"], "e2e_evidence_manifest.json");
+        assert_eq!(body["markdown_artifact"], "e2e_evidence_manifest.md");
+        assert!(run_dir.join("e2e_evidence_manifest.json").exists());
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(run_dir.join("e2e_evidence_manifest.json")).expect("manifest"),
+        )
+        .expect("manifest json");
+        assert_eq!(manifest["schema"], "harkonnen.e2e_evidence_manifest.v1");
+        assert!(manifest["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .any(|entry| entry["artifact"] == "coobie_briefing.json"
+                && entry["download_url"]
+                    == "/api/runs/run-e2e-manifest/artifacts/coobie_briefing.json"));
+        let markdown =
+            std::fs::read_to_string(run_dir.join("e2e_evidence_manifest.md")).expect("markdown");
+        assert!(markdown.contains("E2E Evidence Manifest"));
+        let updated_board: BlackboardState = serde_json::from_str(
+            &std::fs::read_to_string(run_dir.join("blackboard.json")).expect("board"),
+        )
+        .expect("updated board");
+        assert!(updated_board
+            .artifact_refs
+            .iter()
+            .any(|artifact| artifact == "e2e_evidence_manifest.json"));
+        assert!(updated_board
+            .artifact_refs
+            .iter()
+            .any(|artifact| artifact == "e2e_evidence_manifest.md"));
+    }
+
+    #[tokio::test]
+    async fn materialize_e2e_evidence_bundle_writes_full_handoff_set() {
+        let (_dir, app) = test_app().await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        )
+        .bind("run-e2e-bundle")
+        .bind("spec-e2e-bundle")
+        .bind("product")
+        .bind("completed")
+        .bind(&now)
+        .execute(&app.pool)
+        .await
+        .expect("insert run");
+        let run_dir = app.paths.workspaces.join("run-e2e-bundle").join("run");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let mut board = BlackboardState::default();
+        board.run_id = "run-e2e-bundle".to_string();
+        std::fs::write(
+            run_dir.join("blackboard.json"),
+            serde_json::to_string_pretty(&board).expect("board json"),
+        )
+        .expect("blackboard");
+        std::fs::write(run_dir.join("coobie_briefing.json"), "{}").expect("artifact");
+
+        let response =
+            post_materialize_e2e_evidence_bundle(Path("run-e2e-bundle".to_string()), State(app))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["json_artifact"], "e2e_evidence_bundle.json");
+        assert_eq!(body["markdown_artifact"], "e2e_evidence_bundle.md");
+        for artifact in [
+            "e2e_readiness.json",
+            "e2e_readiness.md",
+            "e2e_evidence_manifest.json",
+            "e2e_evidence_manifest.md",
+            "e2e_evidence_bundle.json",
+            "e2e_evidence_bundle.md",
+        ] {
+            assert!(run_dir.join(artifact).exists(), "missing {artifact}");
+        }
+        let bundle: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(run_dir.join("e2e_evidence_bundle.json")).expect("bundle"),
+        )
+        .expect("bundle json");
+        assert_eq!(bundle["schema"], "harkonnen.e2e_evidence_bundle.v1");
+        assert!(bundle["bundle_artifacts"]
+            .as_array()
+            .expect("bundle artifacts")
+            .iter()
+            .any(|artifact| artifact == "e2e_evidence_manifest.json"));
+        assert!(bundle["bundle_entries"]
+            .as_array()
+            .expect("bundle entries")
+            .iter()
+            .any(|entry| entry["artifact"] == "e2e_evidence_bundle.json"
+                && entry["download_url"]
+                    == "/api/runs/run-e2e-bundle/artifacts/e2e_evidence_bundle.json"));
+        assert!(body["bundle_artifact_urls"]
+            .as_array()
+            .expect("bundle artifact urls")
+            .iter()
+            .any(|url| url == "/api/runs/run-e2e-bundle/artifacts/e2e_evidence_bundle.md"));
+        let markdown =
+            std::fs::read_to_string(run_dir.join("e2e_evidence_bundle.md")).expect("markdown");
+        assert!(markdown.contains("E2E Evidence Bundle"));
+        assert!(markdown.contains("/api/runs/run-e2e-bundle/artifacts/e2e_evidence_bundle.json"));
+        let updated_board: BlackboardState = serde_json::from_str(
+            &std::fs::read_to_string(run_dir.join("blackboard.json")).expect("board"),
+        )
+        .expect("updated board");
+        assert!(updated_board
+            .artifact_refs
+            .iter()
+            .any(|artifact| artifact == "e2e_evidence_bundle.json"));
+        assert!(updated_board
+            .artifact_refs
+            .iter()
+            .any(|artifact| artifact == "e2e_evidence_manifest.json"));
     }
 }

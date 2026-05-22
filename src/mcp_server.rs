@@ -837,7 +837,7 @@ async fn call_tool(state: &McpState, params: &Value) -> std::result::Result<Valu
                 .map_err(|e| (-32004, format!("db_query failed: {e}")))?;
             let mut lines: Vec<String> = Vec::new();
             for row in &rows {
-                use sqlx::{Column as _, Row as _, TypeInfo as _};
+                use sqlx::{Column as _, Row as _};
                 let mut cols: Vec<String> = Vec::new();
                 for i in 0..row.len() {
                     let col_name = row.column(i).name().to_string();

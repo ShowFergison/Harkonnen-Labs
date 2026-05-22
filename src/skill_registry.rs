@@ -16,6 +16,7 @@ pub(crate) struct SkillToml {
     pub(crate) name: String,
     pub(crate) tier: String,
     pub(crate) description: String,
+    #[allow(dead_code)]
     #[serde(default)]
     pub(crate) tags: Vec<String>,
     #[serde(default)]

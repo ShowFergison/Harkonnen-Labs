@@ -9,6 +9,7 @@ import OperationsDeck from './components/OperationsDeck';
 import PackChat from './components/PackChat';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:3057/api';
+const API_ORIGIN = API_BASE.replace(/\/api\/?$/, '');
 
 // Agent roster — source of truth, kept in sync with AGENTS.md
 // pinned: 'claude' means trust-critical, always routed to Claude
@@ -180,7 +181,14 @@ function App() {
   const [causalGraphProjection, setCausalGraphProjection] = useState(null);
   const [causalFailureHistory, setCausalFailureHistory] = useState(null);
   const [causalFailureExport, setCausalFailureExport] = useState(null);
+  const [e2eReadinessIndex, setE2eReadinessIndex] = useState(null);
   const [e2eReadiness, setE2eReadiness] = useState(null);
+  const [materializedE2eReadiness, setMaterializedE2eReadiness] = useState(null);
+  const [materializingE2eReadiness, setMaterializingE2eReadiness] = useState(false);
+  const [materializedE2eManifest, setMaterializedE2eManifest] = useState(null);
+  const [materializingE2eManifest, setMaterializingE2eManifest] = useState(false);
+  const [materializedE2eBundle, setMaterializedE2eBundle] = useState(null);
+  const [materializingE2eBundle, setMaterializingE2eBundle] = useState(false);
   const [materializedCausalExport, setMaterializedCausalExport] = useState(null);
   const [materializingCausalExport, setMaterializingCausalExport] = useState(false);
   const [reviewingMemoryUpdateId, setReviewingMemoryUpdateId] = useState('');
@@ -372,13 +380,18 @@ function App() {
 
     const loadGraphStatus = async () => {
       try {
-        const data = await fetchJson(`${API_BASE}/causal-graph/status`);
+        const [graphStatus, readinessIndex] = await Promise.allSettled([
+          fetchJson(`${API_BASE}/causal-graph/status`),
+          fetchJson(`${API_BASE}/e2e-readiness`),
+        ]);
         if (!cancelled) {
-          setCausalGraphStatus(data);
+          setCausalGraphStatus(graphStatus.status === 'fulfilled' ? graphStatus.value : null);
+          setE2eReadinessIndex(readinessIndex.status === 'fulfilled' ? readinessIndex.value : null);
         }
       } catch {
         if (!cancelled) {
           setCausalGraphStatus(null);
+          setE2eReadinessIndex(null);
         }
       }
     };
@@ -397,6 +410,9 @@ function App() {
       setCausalFailureHistory(null);
       setCausalFailureExport(null);
       setE2eReadiness(null);
+      setMaterializedE2eReadiness(null);
+      setMaterializedE2eManifest(null);
+      setMaterializedE2eBundle(null);
       setMaterializedCausalExport(null);
       return undefined;
     }
@@ -415,6 +431,9 @@ function App() {
           setCausalFailureHistory(history.status === 'fulfilled' ? history.value : null);
           setCausalFailureExport(replayExport.status === 'fulfilled' ? replayExport.value : null);
           setE2eReadiness(readiness.status === 'fulfilled' ? readiness.value : null);
+          setMaterializedE2eReadiness(null);
+          setMaterializedE2eManifest(null);
+          setMaterializedE2eBundle(null);
           setMaterializedCausalExport(null);
         }
       } catch {
@@ -423,6 +442,9 @@ function App() {
           setCausalFailureHistory(null);
           setCausalFailureExport(null);
           setE2eReadiness(null);
+          setMaterializedE2eReadiness(null);
+          setMaterializedE2eManifest(null);
+          setMaterializedE2eBundle(null);
         }
       }
     };
@@ -448,6 +470,54 @@ function App() {
       setError(materializeError.message);
     } finally {
       setMaterializingCausalExport(false);
+    }
+  };
+
+  const materializeE2eReadiness = async () => {
+    if (!activeRunId) {
+      return;
+    }
+    setMaterializingE2eReadiness(true);
+    try {
+      const response = await postJson(`${API_BASE}/runs/${activeRunId}/e2e-readiness/materialize`, {});
+      setMaterializedE2eReadiness(response);
+      setError('');
+    } catch (materializeError) {
+      setError(materializeError.message);
+    } finally {
+      setMaterializingE2eReadiness(false);
+    }
+  };
+
+  const materializeE2eManifest = async () => {
+    if (!activeRunId) {
+      return;
+    }
+    setMaterializingE2eManifest(true);
+    try {
+      const response = await postJson(`${API_BASE}/runs/${activeRunId}/e2e-evidence-manifest/materialize`, {});
+      setMaterializedE2eManifest(response);
+      setError('');
+    } catch (materializeError) {
+      setError(materializeError.message);
+    } finally {
+      setMaterializingE2eManifest(false);
+    }
+  };
+
+  const materializeE2eBundle = async () => {
+    if (!activeRunId) {
+      return;
+    }
+    setMaterializingE2eBundle(true);
+    try {
+      const response = await postJson(`${API_BASE}/runs/${activeRunId}/e2e-evidence-bundle/materialize`, {});
+      setMaterializedE2eBundle(response);
+      setError('');
+    } catch (materializeError) {
+      setError(materializeError.message);
+    } finally {
+      setMaterializingE2eBundle(false);
     }
   };
 
@@ -814,6 +884,37 @@ function App() {
             </div>
           </Panel>
 
+          <Panel title="E2E Candidates" compact>
+            {e2eReadinessIndex && (e2eReadinessIndex.entries || []).length > 0 ? (
+              <div className="candidate-stack">
+                <div className="info-row">
+                  <span>Best run</span>
+                  <strong>{e2eReadinessIndex.best_run_id ? e2eReadinessIndex.best_run_id.slice(0, 10) : 'none'}</strong>
+                </div>
+                {(e2eReadinessIndex.entries || []).slice(0, 4).map((entry) => (
+                  <button
+                    key={entry.run_id}
+                    type="button"
+                    className={`candidate-row ${entry.run_id === activeRunId ? 'active' : ''}`}
+                    onClick={() => setActiveRunId(entry.run_id)}
+                  >
+                    <div>
+                      <strong>{entry.run_id.slice(0, 10)}</strong>
+                      <span>{entry.product} · {entry.spec_id}</span>
+                      {entry.next_action ? <p>{entry.next_action}</p> : null}
+                    </div>
+                    <div className="candidate-score">
+                      <strong>{Math.round(Number(entry.artifact_score || 0) * 100)}%</strong>
+                      <span>{titleCase(entry.status)}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">No recent readiness candidates yet.</div>
+            )}
+          </Panel>
+
           <Panel title="E2E Readiness" compact>
             {e2eReadiness ? (
               <div className="readiness-stack">
@@ -834,6 +935,59 @@ function App() {
                   <div className="readiness-actions">
                     {e2eReadiness.next_actions.slice(0, 4).map((action) => (
                       <div key={action} className="readiness-action">{action}</div>
+                    ))}
+                  </div>
+                ) : null}
+                <div className="graph-export-actions">
+                  <button
+                    type="button"
+                    className="memory-update-btn"
+                    onClick={materializeE2eReadiness}
+                    disabled={materializingE2eReadiness}
+                  >
+                    {materializingE2eReadiness ? 'Writing report' : 'Materialize readiness'}
+                  </button>
+                  {materializedE2eReadiness ? (
+                    <span>{materializedE2eReadiness.json_artifact}</span>
+                  ) : null}
+                </div>
+                <div className="graph-export-actions">
+                  <button
+                    type="button"
+                    className="memory-update-btn"
+                    onClick={materializeE2eManifest}
+                    disabled={materializingE2eManifest}
+                  >
+                    {materializingE2eManifest ? 'Writing manifest' : 'Materialize manifest'}
+                  </button>
+                  {materializedE2eManifest ? (
+                    <span>{materializedE2eManifest.json_artifact}</span>
+                  ) : null}
+                </div>
+                <div className="graph-export-actions">
+                  <button
+                    type="button"
+                    className="memory-update-btn"
+                    onClick={materializeE2eBundle}
+                    disabled={materializingE2eBundle}
+                  >
+                    {materializingE2eBundle ? 'Writing bundle' : 'Materialize bundle'}
+                  </button>
+                  {materializedE2eBundle ? (
+                    <span>{materializedE2eBundle.json_artifact}</span>
+                  ) : null}
+                </div>
+                {materializedE2eBundle?.bundle_artifacts?.length ? (
+                  <div className="bundle-artifact-links">
+                    {materializedE2eBundle.bundle_artifacts.map((artifact, index) => (
+                      <a
+                        key={artifact}
+                        href={`${API_ORIGIN}${materializedE2eBundle.bundle_artifact_urls?.[index] || `/api/runs/${activeRunId}/artifacts/${artifact}`}`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        {artifact}
+                      </a>
                     ))}
                   </div>
                 ) : null}
@@ -1399,6 +1553,55 @@ function App() {
           border-color: rgba(194, 163, 114, 0.3);
         }
 
+        .candidate-stack {
+          display: flex;
+          flex-direction: column;
+          gap: 0.55rem;
+        }
+
+        .candidate-row {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          gap: 0.75rem;
+          align-items: start;
+          width: 100%;
+          border: 1px solid rgba(255, 255, 255, 0.06);
+          background: rgba(255, 255, 255, 0.03);
+          color: var(--text-primary);
+          border-radius: 10px;
+          padding: 0.65rem 0.72rem;
+          text-align: left;
+          cursor: pointer;
+        }
+
+        .candidate-row.active,
+        .candidate-row:hover {
+          border-color: rgba(194, 163, 114, 0.34);
+          background: rgba(194, 163, 114, 0.08);
+        }
+
+        .candidate-row strong {
+          display: block;
+          font-size: 0.82rem;
+        }
+
+        .candidate-row span,
+        .candidate-row p,
+        .candidate-score span {
+          color: var(--text-secondary);
+          font-size: 0.72rem;
+          line-height: 1.35;
+        }
+
+        .candidate-row p {
+          margin: 0.25rem 0 0;
+        }
+
+        .candidate-score {
+          text-align: right;
+          white-space: nowrap;
+        }
+
         .readiness-stack {
           display: flex;
           flex-direction: column;
@@ -1548,6 +1751,49 @@ function App() {
           color: var(--text-primary);
           font-size: 0.8rem;
           text-align: right;
+        }
+
+        .graph-export-actions {
+          display: flex;
+          align-items: center;
+          gap: 0.55rem;
+          margin-top: 0.65rem;
+          min-width: 0;
+        }
+
+        .graph-export-actions span {
+          min-width: 0;
+          color: var(--text-secondary);
+          font-size: 0.74rem;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .bundle-artifact-links {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 0.4rem;
+          margin-top: 0.55rem;
+        }
+
+        .bundle-artifact-links a {
+          max-width: 100%;
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          border-radius: 6px;
+          padding: 0.28rem 0.45rem;
+          color: var(--text-secondary);
+          background: rgba(255, 255, 255, 0.035);
+          font-size: 0.7rem;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          text-decoration: none;
+        }
+
+        .bundle-artifact-links a:hover {
+          border-color: rgba(194, 163, 114, 0.34);
+          color: var(--text-primary);
         }
 
         .agent-state-head {
