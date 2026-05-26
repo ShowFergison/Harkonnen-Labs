@@ -10,14 +10,16 @@
 servers:
 
   filesystem:
-    package: "@modelcontextprotocol/server-filesystem"
-    command: npx
+    package: "harkonnen-self-server"
+    command: cargo
     args:
-      - "-y"
-      - "@modelcontextprotocol/server-filesystem"
-      - "./products"
-      - "./factory/workspaces"
-      - "./factory/artifacts"
+      - "run"
+      - "--quiet"
+      - "--"
+      - "mcp"
+      - "serve"
+      - "--transport"
+      - "stdio"
     tool_aliases:
       - filesystem_read
       - workspace_write
@@ -26,15 +28,20 @@ servers:
     platforms: [linux, windows, darwin]
     requires_env: []
     notes: >
-      Core server. Needed by almost every agent for read access.
-      Pass additional allowed paths as extra args.
+      Core Rust-native Harkonnen self-server. Needed by almost every agent for
+      read access without requiring Node.js local helper processes.
 
   memory:
-    package: "@modelcontextprotocol/server-memory"
-    command: npx
+    package: "harkonnen-self-server"
+    command: cargo
     args:
-      - "-y"
-      - "@modelcontextprotocol/server-memory"
+      - "run"
+      - "--quiet"
+      - "--"
+      - "mcp"
+      - "serve"
+      - "--transport"
+      - "stdio"
     tool_aliases:
       - memory_store
       - metadata_query
@@ -46,17 +53,21 @@ servers:
         Path to a JSON file for cross-session persistence.
         e.g. ./factory/memory/store.json
     notes: >
-      Replaces AnythingLLM on work-windows and ci setups.
-      Without MEMORY_FILE_PATH, entities reset on server restart.
-      factory/memory/index.json is always the authoritative source of truth.
+      Uses Harkonnen's Rust-native MCP self-server and configured semantic
+      memory backend. factory/memory/index.json remains the file-backed source
+      of truth when OB1 is unavailable.
 
   sqlite:
-    package: "@modelcontextprotocol/server-sqlite"
-    command: npx
+    package: "harkonnen-self-server"
+    command: cargo
     args:
-      - "-y"
-      - "@modelcontextprotocol/server-sqlite"
-      - "./factory/state.db"
+      - "run"
+      - "--quiet"
+      - "--"
+      - "mcp"
+      - "serve"
+      - "--transport"
+      - "stdio"
     tool_aliases:
       - metadata_query
       - db_read
@@ -64,8 +75,8 @@ servers:
     platforms: [linux, windows, darwin]
     requires_env: []
     notes: >
-      Read-only agent access to run history, spec metadata, and status.
-      Rust db layer handles all writes; this MCP server is query-only for agents.
+      Agent access to run history, spec metadata, and status through the
+      Rust-native self-server. Rust db layer handles all writes.
 
   github:
     package: "@modelcontextprotocol/server-github"

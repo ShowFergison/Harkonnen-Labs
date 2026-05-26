@@ -16,6 +16,7 @@ pub mod coobie_palace;
 pub mod db;
 pub mod embeddings;
 pub mod frames;
+pub mod gaia;
 pub mod helmet;
 pub mod hook;
 pub mod livecodebench;

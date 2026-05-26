@@ -674,6 +674,8 @@ This pattern is derived from Letta's `AgentState` model (which records LLM confi
 
 **Pack Board agent-state surface shipped 2026-05-12:** The Pack Board side rail now renders canonical agent state from `GET /api/agent-state`: resolved provider/model, last active run, stop reason, behavior-contract hash, and latest briefing block refs per role. API route regression tests now cover list/get success and 404 behavior: `api::tests::agent_state_routes_return_canonical_rows` and `api::tests::agent_state_route_returns_404_for_unknown_agent` — green.
 
+**Pre-Phase 6 gate closure shipped 2026-05-22:** The remaining Phase 5b mechanical gates are now explicit in code/config: `build_targeted_briefing()` is the only orchestrator briefing projection helper, the complete COOBIE_SPEC memory module namespace exists under `src/memory/`, Harkonnen-owned filesystem/memory/sqlite MCP helper templates now point at `cargo run -- mcp serve --transport stdio` instead of `npx`, and `GET /api/context-utilization/baseline` reports the 10-run context-utilization baseline sample/completeness state. Regression tests: `orchestrator::tests::build_targeted_briefing_filters_scout_and_sable_context`, `orchestrator::tests::named_briefing_blocks_group_memory_checks_and_scope_filters`, and `api::tests::context_utilization_baseline_reports_sample_completeness` — green.
+
 ---
 
 **Benchmark gate:**
@@ -780,7 +782,12 @@ TypeDB 3.x changes the implementation assumptions: the old JVM burden objection 
 **E2E evidence bundle materialization shipped 2026-05-14:** `POST /api/runs/{id}/e2e-evidence-bundle/materialize` now writes the readiness report, evidence manifest, and bundle summary in one operator action (`e2e_evidence_bundle.{json,md}` plus the component artifacts), then registers the whole handoff set on `blackboard.artifact_refs`. The Pack Board readiness panel exposes the bundle action so the full-flow proof can be captured without clicking each materializer separately. Regression test: `api::tests::materialize_e2e_evidence_bundle_writes_full_handoff_set` — green.
 
 **E2E bundle download links shipped 2026-05-14:** The evidence bundle response and `e2e_evidence_bundle.json/.md` now include download URLs for each component artifact, and the Pack Board renders those links after bundle materialization. This makes the generated handoff immediately inspectable from the operator surface instead of requiring a manual artifact lookup.
-- **GAIA Level 3 adapter** — maps GAIA's multi-step tool-use tasks to Harkonnen's factory run format; routes sub-tasks to the appropriate Labrador rather than a single generalist. Requires the TypeDB query surface to be live.
+
+**Pack Board evidence refresh shipped 2026-05-14:** Materializing causal exports or E2E readiness artifacts now refreshes run state, readiness, and the cross-run readiness index immediately while preserving the materialized-result banner across polling. Evidence Board artifact refs are now clickable through the existing artifact route, so newly registered bundle artifacts can be opened directly from the persistent evidence list.
+
+**Existing E2E bundle hydration shipped 2026-05-14:** `GET /api/runs/{id}/e2e-evidence-bundle` now reads a previously materialized bundle artifact, backfills download metadata for older bundle JSON, and lets the Pack Board show saved bundle links on run load rather than only immediately after materialization. Regression test: `api::tests::get_e2e_evidence_bundle_reads_existing_handoff_artifact` — green.
+
+**GAIA Level 3 adapter scaffold shipped 2026-05-14:** A native `gaia_level3` benchmark builtin now consumes local GAIA-style JSONL fixtures, records exact-match task accuracy, preserves tool-step provenance, summarizes Labrador role-routing counts, and writes `gaia_level3_summary.json` / `gaia_level3_report.md`. The default benchmark manifest includes a `gaia_level3` suite with a bundled smoke fixture, and benchmark report rendering now surfaces GAIA task, multi-role, tool-step, and role-routing metrics. Regression tests: `gaia::tests::routed_roles_merge_required_roles_and_tool_steps`, `gaia::tests::render_step_stdout_includes_metrics_and_artifacts`, and `benchmark::tests::render_report_markdown_includes_gaia_metrics` — green. Remaining live-harness work: replace fixture-supplied `predicted_answer` with real Harkonnen task execution and tool mediation.
 - **AgentBench adapters** — OS, database, and web environments, each mapped to a Labrador role.
 
 **Benchmark gate:**

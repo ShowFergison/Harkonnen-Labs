@@ -163,9 +163,9 @@ agents:
         path: factory/memory/index.json
         always_available: true
       mcp_memory:
-        server: "@modelcontextprotocol/server-memory"
+        server: "harkonnen-self-server"
         all_setups: true
-        note: Set MEMORY_FILE_PATH for cross-session persistence
+        note: Rust-native MCP memory surface backed by file memory plus configured OB1
       anythingllm:
         home_linux_only: true
         script: scripts/coobie-seed-anythingllm.sh

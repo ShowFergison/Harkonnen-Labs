@@ -410,31 +410,25 @@ function App() {
       setCausalFailureHistory(null);
       setCausalFailureExport(null);
       setE2eReadiness(null);
-      setMaterializedE2eReadiness(null);
-      setMaterializedE2eManifest(null);
-      setMaterializedE2eBundle(null);
-      setMaterializedCausalExport(null);
       return undefined;
     }
 
     let cancelled = false;
     const loadCausalGraphRunData = async () => {
       try {
-        const [projection, history, replayExport, readiness] = await Promise.allSettled([
+        const [projection, history, replayExport, readiness, evidenceBundle] = await Promise.allSettled([
           fetchJson(`${API_BASE}/runs/${activeRunId}/causal-graph-projection`),
           fetchJson(`${API_BASE}/runs/${activeRunId}/causal-failure-history`),
           fetchJson(`${API_BASE}/runs/${activeRunId}/causal-failure-history/export`),
           fetchJson(`${API_BASE}/runs/${activeRunId}/e2e-readiness`),
+          fetchJson(`${API_BASE}/runs/${activeRunId}/e2e-evidence-bundle`),
         ]);
         if (!cancelled) {
           setCausalGraphProjection(projection.status === 'fulfilled' ? projection.value : null);
           setCausalFailureHistory(history.status === 'fulfilled' ? history.value : null);
           setCausalFailureExport(replayExport.status === 'fulfilled' ? replayExport.value : null);
           setE2eReadiness(readiness.status === 'fulfilled' ? readiness.value : null);
-          setMaterializedE2eReadiness(null);
-          setMaterializedE2eManifest(null);
-          setMaterializedE2eBundle(null);
-          setMaterializedCausalExport(null);
+          setMaterializedE2eBundle(evidenceBundle.status === 'fulfilled' ? evidenceBundle.value : null);
         }
       } catch {
         if (!cancelled) {
@@ -442,8 +436,6 @@ function App() {
           setCausalFailureHistory(null);
           setCausalFailureExport(null);
           setE2eReadiness(null);
-          setMaterializedE2eReadiness(null);
-          setMaterializedE2eManifest(null);
           setMaterializedE2eBundle(null);
         }
       }
@@ -457,6 +449,33 @@ function App() {
     };
   }, [activeRunId]);
 
+  useEffect(() => {
+    setMaterializedE2eReadiness(null);
+    setMaterializedE2eManifest(null);
+    setMaterializedE2eBundle(null);
+    setMaterializedCausalExport(null);
+  }, [activeRunId]);
+
+  const refreshEvidenceSurfaces = async () => {
+    if (!activeRunId) {
+      return;
+    }
+    const [state, readiness, readinessIndex] = await Promise.allSettled([
+      fetchJson(`${API_BASE}/runs/${activeRunId}/state`),
+      fetchJson(`${API_BASE}/runs/${activeRunId}/e2e-readiness`),
+      fetchJson(`${API_BASE}/e2e-readiness`),
+    ]);
+    if (state.status === 'fulfilled') {
+      setRunState(state.value);
+    }
+    if (readiness.status === 'fulfilled') {
+      setE2eReadiness(readiness.value);
+    }
+    if (readinessIndex.status === 'fulfilled') {
+      setE2eReadinessIndex(readinessIndex.value);
+    }
+  };
+
   const materializeCausalExport = async () => {
     if (!activeRunId) {
       return;
@@ -465,6 +484,7 @@ function App() {
     try {
       const response = await postJson(`${API_BASE}/runs/${activeRunId}/causal-failure-history/export/materialize`, {});
       setMaterializedCausalExport(response);
+      await refreshEvidenceSurfaces();
       setError('');
     } catch (materializeError) {
       setError(materializeError.message);
@@ -481,6 +501,7 @@ function App() {
     try {
       const response = await postJson(`${API_BASE}/runs/${activeRunId}/e2e-readiness/materialize`, {});
       setMaterializedE2eReadiness(response);
+      await refreshEvidenceSurfaces();
       setError('');
     } catch (materializeError) {
       setError(materializeError.message);
@@ -497,6 +518,7 @@ function App() {
     try {
       const response = await postJson(`${API_BASE}/runs/${activeRunId}/e2e-evidence-manifest/materialize`, {});
       setMaterializedE2eManifest(response);
+      await refreshEvidenceSurfaces();
       setError('');
     } catch (materializeError) {
       setError(materializeError.message);
@@ -513,6 +535,7 @@ function App() {
     try {
       const response = await postJson(`${API_BASE}/runs/${activeRunId}/e2e-evidence-bundle/materialize`, {});
       setMaterializedE2eBundle(response);
+      await refreshEvidenceSurfaces();
       setError('');
     } catch (materializeError) {
       setError(materializeError.message);
@@ -974,7 +997,7 @@ function App() {
                     {materializingE2eBundle ? 'Writing bundle' : 'Materialize bundle'}
                   </button>
                   {materializedE2eBundle ? (
-                    <span>{materializedE2eBundle.json_artifact}</span>
+                    <span>{materializedE2eBundle.json_artifact || 'e2e_evidence_bundle.json'}</span>
                   ) : null}
                 </div>
                 {materializedE2eBundle?.bundle_artifacts?.length ? (
@@ -1117,7 +1140,15 @@ function App() {
                 <div className="empty-state">No artifact refs yet.</div>
               ) : (
                 blackboard.artifact_refs.map((artifact) => (
-                  <div key={artifact} className="list-item tight">{artifact}</div>
+                  <a
+                    key={artifact}
+                    className="list-item tight artifact-link"
+                    href={`${API_ORIGIN}/api/runs/${activeRunId}/artifacts/${artifact}`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {artifact}
+                  </a>
                 ))
               )}
             </div>
@@ -1904,6 +1935,20 @@ function App() {
           padding: 0.6rem 0.75rem;
           font-family: var(--font-mono);
           font-size: 0.8rem;
+        }
+
+        .artifact-link {
+          display: block;
+          color: var(--text-secondary);
+          overflow: hidden;
+          text-decoration: none;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .artifact-link:hover {
+          border-color: rgba(194, 163, 114, 0.34);
+          color: var(--text-primary);
         }
 
         .list-item-title {

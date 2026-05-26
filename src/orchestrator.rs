@@ -2421,9 +2421,18 @@ impl AppContext {
         // Emit pre-run prediction — the explicit error signal that closes the learning loop.
         self.try_record_calvin_prediction(run_id, &spec_obj.id, &briefing)
             .await;
-        let scout_briefing = build_scoped_briefing(&briefing, BriefingScope::ScoutPreflight);
-        let mason_briefing = build_scoped_briefing(&briefing, BriefingScope::MasonPreflight);
-        let sable_briefing = build_scoped_briefing(&briefing, BriefingScope::SablePreflight);
+        let scout_briefing = build_targeted_briefing(
+            &briefing,
+            &context_target_for_scope(BriefingScope::ScoutPreflight, &spec_obj.title),
+        );
+        let mason_briefing = build_targeted_briefing(
+            &briefing,
+            &context_target_for_scope(BriefingScope::MasonPreflight, &spec_obj.title),
+        );
+        let sable_briefing = build_targeted_briefing(
+            &briefing,
+            &context_target_for_scope(BriefingScope::SablePreflight, &spec_obj.title),
+        );
         let evidence_match_report = self
             .build_evidence_match_report(spec_obj, target_source, &briefing)
             .await?;
@@ -13738,7 +13747,10 @@ Return JSON only.",
             .load_run_briefing(run_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("coobie_briefing.json missing for run {run_id}"))?;
-        let mason_briefing = build_scoped_briefing(&briefing, BriefingScope::MasonPreflight);
+        let mason_briefing = build_targeted_briefing(
+            &briefing,
+            &context_target_for_scope(BriefingScope::MasonPreflight, &spec_obj.title),
+        );
         let intent_path = run_dir.join("intent.json");
         let intent_raw = tokio::fs::read_to_string(&intent_path)
             .await
@@ -14216,7 +14228,10 @@ Return JSON only.",
         validation: &ValidationSummary,
     ) -> Result<()> {
         let profiles = agents::load_profiles(&self.paths.factory.join("agents").join("profiles"))?;
-        let sable_briefing = build_scoped_briefing(briefing, BriefingScope::SablePreflight);
+        let sable_briefing = build_targeted_briefing(
+            briefing,
+            &context_target_for_scope(BriefingScope::SablePreflight, &spec_obj.title),
+        );
         let mut agent_executions =
             read_optional_json_file::<Vec<AgentExecution>>(&run_dir.join("agent_executions.json"))?
                 .unwrap_or_default();
@@ -27271,9 +27286,52 @@ fn filter_repo_local_entries_for_scope(
     )
 }
 
-fn build_scoped_briefing(base: &CoobieBriefing, scope: BriefingScope) -> CoobieBriefing {
+fn context_target_for_scope(scope: BriefingScope, task_description: &str) -> ContextTarget {
+    let (token_budget, min_hits, required_sections) = match scope {
+        BriefingScope::ScoutPreflight => (
+            700,
+            3,
+            vec![
+                ContextSection::ProjectInterview,
+                ContextSection::OperatorModel,
+            ],
+        ),
+        BriefingScope::MasonPreflight => (
+            900,
+            4,
+            vec![
+                ContextSection::ProjectInterview,
+                ContextSection::OperatorModel,
+            ],
+        ),
+        BriefingScope::SablePreflight => (500, 2, Vec::new()),
+        BriefingScope::CoobiePreflight => (
+            900,
+            4,
+            vec![
+                ContextSection::ProjectInterview,
+                ContextSection::OperatorModel,
+                ContextSection::SoulIdentity,
+            ],
+        ),
+        _ => (700, 2, Vec::new()),
+    };
+
+    ContextTarget {
+        scope,
+        task_description: task_description.to_string(),
+        token_budget,
+        min_hits,
+        required_sections,
+    }
+}
+
+fn build_targeted_briefing(base: &CoobieBriefing, target: &ContextTarget) -> CoobieBriefing {
+    let scope = target.scope;
     let mut scoped = base.clone();
     scoped.briefing_scope = Some(scope);
+    scoped.briefing_task_description = target.task_description.clone();
+    scoped.target_token_budget = target.token_budget;
     scoped.memory_hits = filter_memory_hits_for_scope(&base.memory_hits, scope, 8);
     scoped.core_memory_hits = filter_memory_hits_for_scope(&base.core_memory_hits, scope, 4);
     scoped.project_memory_hits = filter_memory_hits_for_scope(&base.project_memory_hits, scope, 4);
@@ -31699,7 +31757,7 @@ mod tests {
     }
 
     #[test]
-    fn build_scoped_briefing_filters_scout_and_sable_context() {
+    fn build_targeted_briefing_filters_scout_and_sable_context() {
         let mut briefing = sample_briefing();
         briefing.memory_hits = vec![
             "Spec history: prior auth flow ambiguity".to_string(),
@@ -31734,8 +31792,14 @@ mod tests {
         briefing.recommended_guardrails = vec!["Guardrail".to_string()];
         briefing.required_checks = vec!["Check".to_string()];
 
-        let scout = build_scoped_briefing(&briefing, BriefingScope::ScoutPreflight);
-        let sable = build_scoped_briefing(&briefing, BriefingScope::SablePreflight);
+        let scout = build_targeted_briefing(
+            &briefing,
+            &context_target_for_scope(BriefingScope::ScoutPreflight, "sample"),
+        );
+        let sable = build_targeted_briefing(
+            &briefing,
+            &context_target_for_scope(BriefingScope::SablePreflight, "sample"),
+        );
 
         assert_eq!(scout.briefing_scope, Some(BriefingScope::ScoutPreflight));
         assert!(scout
@@ -31790,7 +31854,10 @@ mod tests {
             .expect("open checks block");
         assert!(checks.content.contains("Run the auth regression suite"));
 
-        let scout = build_scoped_briefing(&briefing, BriefingScope::ScoutPreflight);
+        let scout = build_targeted_briefing(
+            &briefing,
+            &context_target_for_scope(BriefingScope::ScoutPreflight, "sample"),
+        );
         let scout_recalled = scout
             .briefing_blocks
             .iter()

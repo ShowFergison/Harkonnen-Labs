@@ -546,6 +546,38 @@ suites:
         env:
           LCB_MODE: "direct"
 
+  - id: "gaia_level3"
+    title: "Harkonnen on GAIA Level 3"
+    subsystem: "factory"
+    category: "multi_step_tool_use"
+    tier: "target"
+    description: >-
+      Adapter-ready GAIA Level 3 benchmark lane for multi-step tool-use tasks.
+      The native runner consumes local GAIA-style JSONL fixtures, records exact
+      answer accuracy, preserves tool-step provenance, and summarizes Labrador
+      role routing so the later live tool harness has a stable artifact contract.
+    benchmark_url: "https://huggingface.co/gaia-benchmark"
+    baseline_reference: >-
+      First local baseline uses fixture-supplied predictions and route metadata.
+      A later live run should replace predicted answers with real Harkonnen task
+      execution while preserving the same summary schema.
+    setup_notes:
+      - "Set GAIA_DATASET to a local GAIA-style JSONL file, or use the bundled smoke fixture at factory/benchmarks/fixtures/gaia-level3-smoke.jsonl."
+      - "Optional envs: GAIA_LIMIT (smoke run size), GAIA_OUTPUT (artifact dir), GAIA_MIN_ACCURACY (pass threshold)."
+      - "Dataset rows should include task_id, level, question, expected_answer, optional predicted_answer, required_roles, and tool_steps."
+    tags:
+      - "external"
+      - "gaia"
+      - "tool_use"
+      - "multi_agent"
+      - "scout"
+      - "piper"
+      - "coobie"
+    steps:
+      - id: "gaia_level3_adapter"
+        label: "GAIA Level 3 adapter"
+        builtin: "gaia_level3"
+
   - id: "mason_swebench_verified"
     title: "Mason/Piper/Bramble on SWE-bench Verified"
     subsystem: "code_loop"

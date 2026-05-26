@@ -10,7 +10,7 @@ use tokio::process::Command;
 use crate::{
     aider_polyglot, cladder,
     config::Paths,
-    frames, helmet, livecodebench, locomo, longmemeval,
+    frames, gaia, helmet, livecodebench, locomo, longmemeval,
     models::{BenchmarkStakeholderAlignmentSnapshot, PhaseAttributionRecord},
     scenario_delta, spec_adherence, streamingqa, twin_fidelity,
 };
@@ -581,7 +581,9 @@ fn render_correct_answer_section(suite: &BenchmarkSuiteResult) -> Option<Vec<Str
 
 fn render_suite_metrics_section(suite: &BenchmarkSuiteResult) -> Option<Vec<String>> {
     let json = load_suite_summary_json(suite)?;
-    render_question_metrics_section(&json).or_else(|| render_livecodebench_metrics_section(&json))
+    render_question_metrics_section(&json)
+        .or_else(|| render_livecodebench_metrics_section(&json))
+        .or_else(|| render_gaia_metrics_section(&json))
 }
 
 fn render_question_metrics_section(json: &serde_json::Value) -> Option<Vec<String>> {
@@ -675,6 +677,56 @@ fn render_livecodebench_metrics_section(json: &serde_json::Value) -> Option<Vec<
         &mut lines,
     );
     append_named_rate_breakdown(metrics, "by_platform", "### Platform Breakdown", &mut lines);
+
+    Some(lines)
+}
+
+fn render_gaia_metrics_section(json: &serde_json::Value) -> Option<Vec<String>> {
+    if json.get("schema").and_then(|value| value.as_str()) != Some("harkonnen.gaia_level3.v1") {
+        return None;
+    }
+    let metrics = json.get("metrics")?;
+    let total_tasks = metrics.get("total_tasks")?.as_u64()?;
+    let correct_tasks = metrics.get("correct_tasks")?.as_u64()?;
+    let exact_match_accuracy = metrics.get("exact_match_accuracy")?.as_f64()?;
+    let level_3_tasks = metrics
+        .get("level_3_tasks")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let multi_role_tasks = metrics
+        .get("multi_role_tasks")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let tool_step_count = metrics
+        .get("tool_step_count")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+
+    let mut lines = vec![
+        "### Observed Metrics".to_string(),
+        String::new(),
+        format!("- Tasks: {}", total_tasks),
+        format!("- Correct: {}/{}", correct_tasks, total_tasks),
+        format!("- Exact match: {:.4}", exact_match_accuracy),
+        format!("- Level 3 tasks: {}", level_3_tasks),
+        format!("- Multi-role tasks: {}", multi_role_tasks),
+        format!("- Tool steps: {}", tool_step_count),
+    ];
+
+    if let Some(roles) = metrics
+        .get("routed_role_counts")
+        .and_then(|value| value.as_object())
+        .filter(|roles| !roles.is_empty())
+    {
+        lines.push(String::new());
+        lines.push("### Role Routing".to_string());
+        lines.push(String::new());
+        for (role, count) in roles {
+            if let Some(count) = count.as_u64() {
+                lines.push(format!("- {role}: {count}"));
+            }
+        }
+    }
 
     Some(lines)
 }
@@ -1149,6 +1201,24 @@ async fn run_builtin_step(
                 )
             }
             livecodebench::LcbSuiteOutcome::Skipped(reason) => (
+                BenchmarkStatus::Skipped,
+                String::new(),
+                String::new(),
+                Some(reason),
+            ),
+        },
+        "gaia_level3" | "gaia" => match gaia::run_with_overrides(paths, &step.env).await? {
+            gaia::GaiaSuiteOutcome::Completed(output) => {
+                let status = gaia::status_for_output(&output);
+                let reason = gaia::reason_for_output(&output);
+                (
+                    status,
+                    gaia::render_step_stdout(&output),
+                    String::new(),
+                    reason,
+                )
+            }
+            gaia::GaiaSuiteOutcome::Skipped(reason) => (
                 BenchmarkStatus::Skipped,
                 String::new(),
                 String::new(),
@@ -1777,6 +1847,93 @@ mod tests {
         assert!(markdown.contains("- easy: 2/2 (1.0000)"));
         assert!(markdown.contains("### Platform Breakdown"));
         assert!(markdown.contains("- codeforces: 0/1 (0.0000)"));
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn render_report_markdown_includes_gaia_metrics() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "harkonnen-benchmark-gaia-{}",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let summary_path = temp_dir.join("gaia_level3_summary.json");
+        fs::write(
+            &summary_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": "harkonnen.gaia_level3.v1",
+                "metrics": {
+                    "total_tasks": 2,
+                    "correct_tasks": 2,
+                    "exact_match_accuracy": 1.0,
+                    "level_3_tasks": 2,
+                    "multi_role_tasks": 2,
+                    "tool_step_count": 7,
+                    "routed_role_counts": {
+                        "scout": 2,
+                        "piper": 2,
+                        "coobie": 1
+                    }
+                },
+                "results": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = BenchmarkRunReport {
+            version: 1,
+            generated_at: Utc::now(),
+            manifest_path: "factory/benchmarks/suites.yaml".to_string(),
+            repo_root: "/tmp/harkonnen".to_string(),
+            selected_suites: vec!["gaia_level3".to_string()],
+            summary: BenchmarkRunSummary {
+                total: 1,
+                passed: 1,
+                failed: 0,
+                skipped: 0,
+            },
+            stakeholder_alignment: None,
+            suites: vec![BenchmarkSuiteResult {
+                id: "gaia_level3".to_string(),
+                title: "Harkonnen on GAIA Level 3".to_string(),
+                subsystem: "factory".to_string(),
+                category: "multi_step_tool_use".to_string(),
+                tier: "target".to_string(),
+                description: "GAIA smoke".to_string(),
+                benchmark_url: None,
+                leaderboard_url: None,
+                baseline_reference: None,
+                setup_notes: Vec::new(),
+                required_env: Vec::new(),
+                tags: Vec::new(),
+                status: BenchmarkStatus::Passed,
+                duration_ms: 1,
+                reason: None,
+                steps: vec![BenchmarkStepResult {
+                    id: "gaia_level3_adapter".to_string(),
+                    label: "GAIA Level 3 adapter".to_string(),
+                    status: BenchmarkStatus::Passed,
+                    program: "builtin".to_string(),
+                    args: Vec::new(),
+                    cwd: temp_dir.display().to_string(),
+                    duration_ms: 1,
+                    exit_code: None,
+                    stdout: format!("Summary JSON: {}", summary_path.display()),
+                    stderr: String::new(),
+                    reason: None,
+                }],
+            }],
+        };
+
+        let markdown = render_report_markdown(&report);
+        assert!(markdown.contains("### Observed Metrics"));
+        assert!(markdown.contains("- Tasks: 2"));
+        assert!(markdown.contains("- Exact match: 1.0000"));
+        assert!(markdown.contains("- Multi-role tasks: 2"));
+        assert!(markdown.contains("### Role Routing"));
+        assert!(markdown.contains("- piper: 2"));
 
         fs::remove_dir_all(temp_dir).unwrap();
     }

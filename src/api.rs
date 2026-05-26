@@ -857,6 +857,10 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route("/api/runs/:id/health", get(get_run_health))
         .route("/api/runs/:id/e2e-readiness", get(get_run_e2e_readiness))
         .route(
+            "/api/runs/:id/e2e-evidence-bundle",
+            get(get_run_e2e_evidence_bundle),
+        )
+        .route(
             "/api/runs/:id/e2e-readiness/materialize",
             post(post_materialize_e2e_readiness),
         )
@@ -924,6 +928,10 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route(
             "/api/runs/:id/context-utilization",
             get(get_context_utilization),
+        )
+        .route(
+            "/api/context-utilization/baseline",
+            get(get_context_utilization_baseline),
         )
         .route("/api/chat", post(post_chat))
         .route("/api/coobie/query", post(post_coobie_query))
@@ -1315,6 +1323,17 @@ async fn get_run_e2e_readiness(
     match build_run_e2e_readiness(&app, &id).await {
         Ok(Some(readiness)) => (StatusCode::OK, Json(readiness)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_run_e2e_evidence_bundle(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match read_e2e_evidence_bundle(&app, &id).await {
+        Ok(Some(bundle)) => (StatusCode::OK, Json(bundle)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "E2E evidence bundle not found").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
@@ -2075,86 +2094,138 @@ async fn get_context_utilization(
     Path(id): Path<String>,
     State(app): State<AppContext>,
 ) -> impl IntoResponse {
-    match app.get_run(&id).await {
-        Ok(Some(_)) => {
-            let phase_attributions = match app.list_phase_attributions_for_run(&id).await {
-                Ok(records) => records,
-                Err(err) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-                }
-            };
-            let pull_records = match app.list_context_pull_records(&id).await {
-                Ok(records) => records,
-                Err(err) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-                }
-            };
-            let briefing_hits_provided: usize = phase_attributions
-                .iter()
-                .map(|record| record.briefing_hits_provided)
-                .sum();
-            let briefing_tokens_used: u32 = phase_attributions
-                .iter()
-                .map(|record| record.briefing_tokens_used)
-                .sum();
-            let pull_tokens_returned: u32 = pull_records
-                .iter()
-                .map(|record| record.tokens_returned)
-                .sum();
-            let triggered_pulls = pull_records
-                .iter()
-                .filter(|record| record.trigger.is_some())
-                .count();
-            let unexpected_discovery_pulls = pull_records
-                .iter()
-                .filter(|record| record.trigger.as_deref() == Some("unexpected_discovery"))
-                .count();
-            let utilized_briefing_hits = phase_attributions
-                .iter()
-                .filter(|record| {
-                    record
-                        .memory_hits
-                        .iter()
-                        .any(|hit| context_hit_referenced_by_pull(hit, &pull_records))
-                })
-                .count();
-            let utilization_rate = if phase_attributions.is_empty() {
-                0.0
-            } else {
-                utilized_briefing_hits as f64 / phase_attributions.len() as f64
-            };
-            let utilization_status = if phase_attributions.is_empty() {
-                "no_briefing"
-            } else if utilization_rate < 0.2 {
-                "low"
-            } else {
-                "healthy"
-            };
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "run_id": id,
-                    "summary": {
-                        "phase_attribution_count": phase_attributions.len(),
-                        "briefing_hits_provided": briefing_hits_provided,
-                        "briefing_tokens_used": briefing_tokens_used,
-                        "mid_task_pull_count": pull_records.len(),
-                        "mid_task_pull_tokens": pull_tokens_returned,
-                        "triggered_pull_count": triggered_pulls,
-                        "unexpected_discovery_pull_count": unexpected_discovery_pulls,
-                        "utilized_briefing_hits": utilized_briefing_hits,
-                        "utilization_rate": utilization_rate,
-                        "utilization_status": utilization_status,
-                    },
-                    "phase_attributions": phase_attributions,
-                    "pull_records": pull_records,
-                })),
-            )
-                .into_response()
-        }
+    match build_context_utilization_report(&app, &id).await {
+        Ok(Some(report)) => (StatusCode::OK, Json(report)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
+}
+
+async fn get_context_utilization_baseline(State(app): State<AppContext>) -> impl IntoResponse {
+    match build_context_utilization_baseline(&app, 10).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+async fn build_context_utilization_report(
+    app: &AppContext,
+    id: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    if app.get_run(id).await?.is_none() {
+        return Ok(None);
+    }
+    let phase_attributions = app.list_phase_attributions_for_run(id).await?;
+    let pull_records = app.list_context_pull_records(id).await?;
+    let briefing_hits_provided: usize = phase_attributions
+        .iter()
+        .map(|record| record.briefing_hits_provided)
+        .sum();
+    let briefing_tokens_used: u32 = phase_attributions
+        .iter()
+        .map(|record| record.briefing_tokens_used)
+        .sum();
+    let pull_tokens_returned: u32 = pull_records
+        .iter()
+        .map(|record| record.tokens_returned)
+        .sum();
+    let triggered_pulls = pull_records
+        .iter()
+        .filter(|record| record.trigger.is_some())
+        .count();
+    let unexpected_discovery_pulls = pull_records
+        .iter()
+        .filter(|record| record.trigger.as_deref() == Some("unexpected_discovery"))
+        .count();
+    let utilized_briefing_hits = phase_attributions
+        .iter()
+        .filter(|record| {
+            record
+                .memory_hits
+                .iter()
+                .any(|hit| context_hit_referenced_by_pull(hit, &pull_records))
+        })
+        .count();
+    let utilization_rate = if phase_attributions.is_empty() {
+        0.0
+    } else {
+        utilized_briefing_hits as f64 / phase_attributions.len() as f64
+    };
+    let utilization_status = if phase_attributions.is_empty() {
+        "no_briefing"
+    } else if utilization_rate < 0.2 {
+        "low"
+    } else {
+        "healthy"
+    };
+
+    Ok(Some(serde_json::json!({
+        "run_id": id,
+        "summary": {
+            "phase_attribution_count": phase_attributions.len(),
+            "briefing_hits_provided": briefing_hits_provided,
+            "briefing_tokens_used": briefing_tokens_used,
+            "mid_task_pull_count": pull_records.len(),
+            "mid_task_pull_tokens": pull_tokens_returned,
+            "triggered_pull_count": triggered_pulls,
+            "unexpected_discovery_pull_count": unexpected_discovery_pulls,
+            "utilized_briefing_hits": utilized_briefing_hits,
+            "utilization_rate": utilization_rate,
+            "utilization_status": utilization_status,
+        },
+        "phase_attributions": phase_attributions,
+        "pull_records": pull_records,
+    })))
+}
+
+async fn build_context_utilization_baseline(
+    app: &AppContext,
+    target_runs: usize,
+) -> anyhow::Result<serde_json::Value> {
+    let runs = app.list_runs(target_runs as i64).await?;
+    let mut entries = Vec::new();
+    let mut rates = Vec::new();
+    for run in runs {
+        let Some(report) = build_context_utilization_report(app, &run.run_id).await? else {
+            continue;
+        };
+        let summary = report
+            .get("summary")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(rate) = summary
+            .get("utilization_rate")
+            .and_then(serde_json::Value::as_f64)
+        {
+            rates.push(rate);
+        }
+        entries.push(serde_json::json!({
+            "run_id": run.run_id,
+            "spec_id": run.spec_id,
+            "status": summary.get("utilization_status").cloned().unwrap_or_else(|| serde_json::json!("unknown")),
+            "utilization_rate": summary.get("utilization_rate").cloned().unwrap_or_else(|| serde_json::json!(0.0)),
+            "phase_attribution_count": summary.get("phase_attribution_count").cloned().unwrap_or_else(|| serde_json::json!(0)),
+            "mid_task_pull_count": summary.get("mid_task_pull_count").cloned().unwrap_or_else(|| serde_json::json!(0)),
+            "updated_at": run.updated_at,
+        }));
+    }
+    let sample_count = entries.len();
+    let average_utilization_rate = if rates.is_empty() {
+        0.0
+    } else {
+        rates.iter().sum::<f64>() / rates.len() as f64
+    };
+    let minimum_utilization_rate = rates.iter().copied().reduce(f64::min).unwrap_or_default();
+
+    Ok(serde_json::json!({
+        "schema": "harkonnen.context_utilization_baseline.v1",
+        "target_run_count": target_runs,
+        "sample_count": sample_count,
+        "baseline_complete": sample_count >= target_runs,
+        "average_utilization_rate": average_utilization_rate,
+        "minimum_utilization_rate": minimum_utilization_rate,
+        "entries": entries,
+    }))
 }
 
 fn context_hit_referenced_by_pull(hit: &str, pulls: &[crate::models::ContextPullRecord]) -> bool {
@@ -5930,6 +6001,53 @@ fn render_e2e_evidence_bundle_markdown(bundle: &serde_json::Value) -> String {
     lines.join("\n")
 }
 
+async fn read_e2e_evidence_bundle(
+    app: &AppContext,
+    run_id: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    if app.get_run(run_id).await?.is_none() {
+        return Ok(None);
+    }
+    let bundle_path = app
+        .paths
+        .workspaces
+        .join(run_id)
+        .join("run")
+        .join("e2e_evidence_bundle.json");
+    let Some(mut bundle) = read_optional_json::<serde_json::Value>(&bundle_path).await? else {
+        return Ok(None);
+    };
+    ensure_e2e_bundle_download_metadata(run_id, &mut bundle);
+    Ok(Some(bundle))
+}
+
+fn ensure_e2e_bundle_download_metadata(run_id: &str, bundle: &mut serde_json::Value) {
+    let artifacts = bundle_artifacts_from_bundle(bundle);
+    if !bundle
+        .get("bundle_entries")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| entries.len() == artifacts.len())
+    {
+        bundle["bundle_entries"] = serde_json::Value::Array(
+            artifacts
+                .iter()
+                .map(|artifact| {
+                    serde_json::json!({
+                        "artifact": artifact,
+                        "download_url": format!("/api/runs/{run_id}/artifacts/{artifact}"),
+                    })
+                })
+                .collect(),
+        );
+    }
+    bundle["bundle_artifact_urls"] = serde_json::Value::Array(
+        bundle_artifact_urls_from_bundle(bundle)
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect(),
+    );
+}
+
 async fn read_optional_json<T: DeserializeOwned>(path: &FsPath) -> anyhow::Result<Option<T>> {
     if !path.exists() {
         return Ok(None);
@@ -8178,11 +8296,11 @@ async fn get_server_status(State(app): State<AppContext>) -> impl IntoResponse {
 mod tests {
     use super::{
         briefing_scope_artifact, execute_coobie_query, get_agent_state, get_causal_graph_status,
-        get_e2e_readiness_index, get_run_causal_failure_history,
+        get_context_utilization_baseline, get_e2e_readiness_index, get_run_causal_failure_history,
         get_run_causal_failure_history_export, get_run_causal_graph_projection,
-        get_run_e2e_readiness, list_agent_state, post_materialize_causal_failure_history_export,
-        post_materialize_e2e_evidence_bundle, post_materialize_e2e_evidence_manifest,
-        post_materialize_e2e_readiness,
+        get_run_e2e_evidence_bundle, get_run_e2e_readiness, list_agent_state,
+        post_materialize_causal_failure_history_export, post_materialize_e2e_evidence_bundle,
+        post_materialize_e2e_evidence_manifest, post_materialize_e2e_readiness,
     };
     use crate::{
         config::Paths,
@@ -9235,5 +9353,81 @@ personality_file: ../personality/labrador.md
             .artifact_refs
             .iter()
             .any(|artifact| artifact == "e2e_evidence_manifest.json"));
+    }
+
+    #[tokio::test]
+    async fn get_e2e_evidence_bundle_reads_existing_handoff_artifact() {
+        let (_dir, app) = test_app().await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        )
+        .bind("run-e2e-bundle-read")
+        .bind("spec-e2e-bundle-read")
+        .bind("product")
+        .bind("completed")
+        .bind(&now)
+        .execute(&app.pool)
+        .await
+        .expect("insert run");
+        let run_dir = app.paths.workspaces.join("run-e2e-bundle-read").join("run");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        std::fs::write(
+            run_dir.join("e2e_evidence_bundle.json"),
+            serde_json::json!({
+                "schema": "harkonnen.e2e_evidence_bundle.v1",
+                "run_id": "run-e2e-bundle-read",
+                "bundle_artifacts": ["e2e_evidence_bundle.json", "e2e_evidence_bundle.md"],
+            })
+            .to_string(),
+        )
+        .expect("bundle");
+
+        let response =
+            get_run_e2e_evidence_bundle(Path("run-e2e-bundle-read".to_string()), State(app))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["schema"], "harkonnen.e2e_evidence_bundle.v1");
+        assert!(body["bundle_entries"]
+            .as_array()
+            .expect("bundle entries")
+            .iter()
+            .any(|entry| entry["download_url"]
+                == "/api/runs/run-e2e-bundle-read/artifacts/e2e_evidence_bundle.json"));
+        assert!(body["bundle_artifact_urls"]
+            .as_array()
+            .expect("bundle artifact urls")
+            .iter()
+            .any(|url| url == "/api/runs/run-e2e-bundle-read/artifacts/e2e_evidence_bundle.md"));
+    }
+
+    #[tokio::test]
+    async fn context_utilization_baseline_reports_sample_completeness() {
+        let (_dir, app) = test_app().await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        )
+        .bind("run-context-baseline")
+        .bind("spec-context-baseline")
+        .bind("product")
+        .bind("completed")
+        .bind(&now)
+        .execute(&app.pool)
+        .await
+        .expect("insert run");
+
+        let response = get_context_utilization_baseline(State(app))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["schema"], "harkonnen.context_utilization_baseline.v1");
+        assert_eq!(body["target_run_count"], 10);
+        assert_eq!(body["sample_count"], 1);
+        assert_eq!(body["baseline_complete"], false);
+        assert_eq!(body["entries"][0]["run_id"], "run-context-baseline");
     }
 }

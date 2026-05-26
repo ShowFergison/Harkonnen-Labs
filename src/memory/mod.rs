@@ -10,10 +10,19 @@ use uuid::Uuid;
 
 use crate::setup::{command_available, SetupConfig};
 
+pub mod blackboard;
 pub mod briefing;
+pub mod causal;
+pub mod consolidation;
 pub mod context_budget;
+pub mod episodic;
+pub mod extraction;
+pub mod retrieval;
 pub mod semantic;
+#[cfg(feature = "local-embeddings")]
+pub mod semantic_local;
 pub mod semantic_openbrain;
+pub mod working;
 
 pub use briefing::{BriefingBlock, BriefingScope, ContextSection, ContextTarget};
 pub use context_budget::{estimate_briefing_tokens, text_within_token_budget};
@@ -239,7 +248,7 @@ impl MemoryStore {
         }
 
         println!("MCP memory backend:");
-        println!("  Start: npx -y @modelcontextprotocol/server-memory");
+        println!("  Start: cargo run -- mcp serve --transport stdio");
         println!("  Seed:  ./scripts/coobie-seed-mcp.sh  (prints entity payloads)");
         println!();
         println!(
@@ -2830,12 +2839,12 @@ Change the default provider by editing `[providers] default = "gemini"` in the a
 ## Work Windows — No Docker Needed
 
 AnythingLLM and OpenClaw are replaced by:
-- @modelcontextprotocol/server-memory  (Coobie's memory/RAG)
-- @modelcontextprotocol/server-filesystem (file access for all agents)
+- Harkonnen's Rust-native MCP self-server (`cargo run -- mcp serve --transport stdio`)
+- OB1-backed semantic memory through Harkonnen's `SemanticMemory` abstraction
 - Claude's 200K context (large-context retrieval without chunking)
 - Claude Code's native MCP support
 
-Prerequisites: Node.js, Rust/cargo, ANTHROPIC_API_KEY.
+Prerequisites: Rust/cargo, ANTHROPIC_API_KEY.
 
 Bootstrap:
     .\scripts\bootstrap-windows.ps1
@@ -2860,20 +2869,19 @@ Each server declares tool_aliases that match the allowed_tools entries in agent 
 ## Available Servers
 
 ### filesystem
-Package: @modelcontextprotocol/server-filesystem
+Package: harkonnen-self-server
 Tool aliases: filesystem_read, workspace_write, artifact_writer
 Purpose: Read/write access to ./products, ./factory/workspaces, ./factory/artifacts
 Platform: all
 
 ### memory
-Package: @modelcontextprotocol/server-memory
+Package: harkonnen-self-server
 Tool aliases: memory_store, metadata_query
-Purpose: Persistent key-value memory for Coobie. Replaces AnythingLLM on work-windows.
+Purpose: Coobie memory retrieval and writes through file-backed memory plus configured OB1.
 Platform: all
-Note: Set MEMORY_FILE_PATH=./factory/memory/store.json for cross-session persistence.
 
 ### sqlite
-Package: @modelcontextprotocol/server-sqlite
+Package: harkonnen-self-server
 Tool aliases: metadata_query, db_read
 Purpose: Agent-level read access to factory/state.db (run metadata, history)
 Platform: all

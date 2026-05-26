@@ -4,12 +4,15 @@ description: >
   Backs memory_store and metadata_query tool aliases for Coobie while keeping
   recall available across Claude, ChatGPT, Codex, Cursor, and Twilight-connected
   agents.
-command: npx
+command: cargo
 args:
-  - "-y"
-  - "supergateway"
-  - "--streamableHttp"
-  - "${OPEN_BRAIN_MCP_URL}"
+  - "run"
+  - "--quiet"
+  - "--"
+  - "mcp"
+  - "serve"
+  - "--transport"
+  - "stdio"
 tool_aliases:
   - memory_store
   - metadata_query
@@ -18,6 +21,6 @@ platforms:
   - windows
   - darwin
 notes: >
-  Requires Node.js and OPEN_BRAIN_MCP_URL set to the OB1 MCP connection URL.
-  OB1 stores thoughts in its shared database with vector search, so Harkonnen
-  no longer needs the ORT-backed local fastembed path by default.
+  Served by Harkonnen's Rust-native MCP self-server. OB1 remains the default
+  long-term semantic backend when configured, but the local helper surface no
+  longer requires a Node.js supergateway.
