@@ -37,4 +37,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3"
+typedb-driver = "3.12"
 uuid = { version = "1", features = ["v4"] }
