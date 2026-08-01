@@ -255,10 +255,28 @@ pub struct TypeDbCausalGraphStore {
     config: CausalGraphConfig,
 }
 
+/// Bounds the *unary* RPCs the typedb-driver issues while connecting
+/// (connection open, `databases_contains`, `databases_create`, transaction
+/// open). Per the driver's own doc comment on `DriverOptions::request_timeout`,
+/// this does NOT bound operations inside an open transaction (queries,
+/// commits) — that's why `build_store()` additionally wraps the whole
+/// `connect()` call in an outer `tokio::time::timeout` using this same
+/// duration as its budget.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Cheap read query used to detect whether a database that already exists
+/// actually has the Coobie semantic schema deployed to it. If `connect()`
+/// created the database but a subsequent failure (e.g. a timeout) killed the
+/// process before the schema transaction committed, the database would be
+/// left permanently schemaless — every future `connect()` would see
+/// `dbs.contains() == true` and skip deployment forever. This query detects
+/// that condition so deployment can be retried.
+const SCHEMA_PRESENCE_CHECK_TQL: &str = "match $e sub episode; select $e; limit 1;";
+
 impl TypeDbCausalGraphStore {
     pub async fn connect(config: CausalGraphConfig) -> Result<Self> {
         let credentials = Credentials::new("admin", "password");
-        let options = DriverOptions::new(DriverTlsConfig::disabled());
+        let options = DriverOptions::new(DriverTlsConfig::disabled()).request_timeout(CONNECT_TIMEOUT);
         let addresses = Addresses::try_from_address_str(&config.url)
             .with_context(|| format!("parsing TypeDB address '{}'", config.url))?;
         let driver = TypeDBDriver::new(addresses, credentials, options)
@@ -266,15 +284,31 @@ impl TypeDbCausalGraphStore {
             .with_context(|| format!("connecting to TypeDB at {}", config.url))?;
 
         let dbs = driver.databases();
-        if !dbs
+        let already_existed = dbs
             .contains(&config.database)
             .await
-            .with_context(|| format!("checking TypeDB database '{}'", config.database))?
-        {
+            .with_context(|| format!("checking TypeDB database '{}'", config.database))?;
+
+        if !already_existed {
             dbs.create(&config.database)
                 .await
                 .with_context(|| format!("creating TypeDB database '{}'", config.database))?;
             tracing::info!("Created TypeDB database '{}'", config.database);
+        }
+
+        // Deploy the schema if the database is new, OR if it already existed
+        // but is missing the schema (self-repair for a prior partial failure,
+        // e.g. create() succeeded but the schema transaction was interrupted
+        // by a timeout before it could commit).
+        let needs_schema = !already_existed || !Self::schema_is_present(&driver, &config.database).await?;
+
+        if needs_schema {
+            if already_existed {
+                tracing::warn!(
+                    "TypeDB database '{}' exists but is missing the Coobie semantic schema; repairing",
+                    config.database
+                );
+            }
 
             let tx = driver
                 .transaction(&config.database, TransactionType::Schema)
@@ -286,6 +320,44 @@ impl TypeDbCausalGraphStore {
         }
 
         Ok(Self { driver, config })
+    }
+
+    /// Runs a cheap read query for a known schema type and returns whether it
+    /// resolved. Used both for the initial "was schema deployment interrupted"
+    /// check and would be reused by any future health-check tooling.
+    ///
+    /// Empirically verified against live TypeDB 3.12.1: querying a `sub`
+    /// relationship against a type that doesn't exist (i.e. schema not
+    /// deployed) does NOT return an empty answer — it errors at query
+    /// analysis time (`[INF2] Type label 'episode' not found`). So a query
+    /// error here is treated as "schema absent" (returns `Ok(false)`) rather
+    /// than propagated, which is what drives the self-repair path in
+    /// `connect()`. If the error instead reflects a genuine connectivity
+    /// problem, the subsequent schema (re)deploy attempt will fail loudly and
+    /// `connect()` will return that error, which is the correct fallback
+    /// behavior either way.
+    async fn schema_is_present(driver: &TypeDBDriver, database: &str) -> Result<bool> {
+        let tx = driver
+            .transaction(database, TransactionType::Read)
+            .await
+            .context("opening TypeDB read transaction for schema presence check")?;
+        let answer = match tx.query(SCHEMA_PRESENCE_CHECK_TQL).await {
+            Ok(answer) => answer,
+            Err(err) => {
+                tracing::debug!(
+                    "TypeDB schema presence check query failed on database '{database}' \
+                     (treating as schema absent): {err:#}"
+                );
+                return Ok(false);
+            }
+        };
+        let mut rows = answer.into_rows();
+        let mut found = false;
+        while let Some(row_result) = rows.next().await {
+            row_result.context("reading schema presence check row")?;
+            found = true;
+        }
+        Ok(found)
     }
 }
 
@@ -306,7 +378,9 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
             database: self.config.database.clone(),
             query: query.question,
             hits: Vec::new(),
-            note: None,
+            note: Some(
+                "TypeDB connected; typed query path not yet implemented (Task 3 placeholder)".to_string(),
+            ),
         })
     }
 }
@@ -315,11 +389,26 @@ pub async fn build_store(config: CausalGraphConfig) -> std::sync::Arc<dyn Causal
     if !config.enabled {
         return std::sync::Arc::new(NoopCausalGraphStore::new(config));
     }
-    match TypeDbCausalGraphStore::connect(config.clone()).await {
-        Ok(store) => std::sync::Arc::new(store),
-        Err(err) => {
+    // `TypeDbCausalGraphStore::connect()` sets `DriverOptions::request_timeout`,
+    // but per the driver's own docs that only bounds unary RPCs (connection
+    // open, database checks, transaction open) — NOT operations inside an
+    // open transaction (schema query, commit), which simply `.await` the next
+    // stream item with no timeout at all. A blackholed host (packets dropped,
+    // no RST) can therefore hang `connect()` indefinitely even with
+    // `request_timeout` set. Wrap the whole call in an outer timeout so
+    // `build_store()` keeps its "never fail or hang startup" guarantee.
+    match tokio::time::timeout(CONNECT_TIMEOUT, TypeDbCausalGraphStore::connect(config.clone())).await {
+        Ok(Ok(store)) => std::sync::Arc::new(store),
+        Ok(Err(err)) => {
             tracing::warn!(
                 "TypeDB causal graph unavailable ({err:#}); falling back to SQLite/memory retrieval"
+            );
+            std::sync::Arc::new(NoopCausalGraphStore::new(config))
+        }
+        Err(_) => {
+            tracing::warn!(
+                "TypeDB causal graph connect timed out after {}s; falling back to SQLite/memory retrieval",
+                CONNECT_TIMEOUT.as_secs()
             );
             std::sync::Arc::new(NoopCausalGraphStore::new(config))
         }
@@ -379,5 +468,112 @@ mod tests {
         assert_eq!(result.status, CausalGraphStatus::Unavailable);
         assert_eq!(result.backend, CausalGraphBackend::TypeDb3);
         assert!(result.hits.is_empty());
+    }
+
+    /// CRITICAL regression test: `build_store()` must never hang forever when
+    /// the configured TypeDB host is unreachable in a way that produces no
+    /// response at all (as opposed to an immediate connection refusal).
+    /// `10.255.255.1` is an RFC1918-adjacent non-routable address that
+    /// reliably blackholes traffic (packets dropped, no RST, no ICMP
+    /// unreachable) rather than refusing the connection outright — this is
+    /// exactly the failure mode `request_timeout` alone cannot bound, since
+    /// per the driver's docs that timeout doesn't cover in-transaction
+    /// operations. Does not require a live TypeDB instance; runs in the
+    /// normal suite.
+    #[tokio::test]
+    async fn build_store_falls_back_to_noop_on_blackholed_host() {
+        let config = CausalGraphConfig {
+            backend: CausalGraphBackend::TypeDb3,
+            enabled: true,
+            url: "10.255.255.1:1729".to_string(),
+            database: "harkonnen_semantic_blackhole_test".to_string(),
+            schema_path: "factory/coobie_semantic/typedb/schema.tql".to_string(),
+            reasoning_mode: "function_backed".to_string(),
+        };
+
+        let started = std::time::Instant::now();
+        let store = build_store(config).await;
+        let elapsed = started.elapsed();
+
+        let result = store
+            .query(CausalGraphQuery {
+                question: "what caused recent failures?".to_string(),
+                run_id: None,
+                spec_id: None,
+                limit: 5,
+            })
+            .await
+            .expect("query");
+
+        assert_eq!(result.status, CausalGraphStatus::Unavailable);
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "build_store() against a blackholed host took {elapsed:?}, expected well under 30s"
+        );
+    }
+
+    /// IMPORTANT-1 regression test: a database that exists but is missing the
+    /// Coobie semantic schema (simulating a prior partial failure — e.g.
+    /// `dbs.create()` succeeded but the schema transaction never committed)
+    /// must be self-repaired by `connect()`, not silently accepted as
+    /// "already provisioned". Constructs that exact state directly via the
+    /// raw driver (create the database, deliberately skip schema deployment),
+    /// then calls `TypeDbCausalGraphStore::connect()` against it and confirms
+    /// the schema is present afterward.
+    #[tokio::test]
+    #[ignore = "requires a live TypeDB instance: docker compose -f docker-compose.calvin.yml up -d typedb"]
+    async fn connect_repairs_database_left_without_schema() {
+        let db_name = "harkonnen_semantic_repair_check";
+
+        // Set up the broken state directly against the raw driver, bypassing
+        // TypeDbCausalGraphStore::connect() entirely so no schema is deployed.
+        {
+            let credentials = Credentials::new("admin", "password");
+            let options = DriverOptions::new(DriverTlsConfig::disabled());
+            let addresses = Addresses::try_from_address_str("localhost:1729").expect("parse address");
+            let driver = TypeDBDriver::new(addresses, credentials, options)
+                .await
+                .expect("connect to local TypeDB");
+            let dbs = driver.databases();
+            if dbs.contains(db_name).await.expect("check exists") {
+                dbs.get(db_name).await.expect("get").delete().await.expect("delete stale test database");
+            }
+            dbs.create(db_name).await.expect("create database without schema");
+
+            // Confirm the broken state is real before testing the repair.
+            let present = TypeDbCausalGraphStore::schema_is_present(&driver, db_name)
+                .await
+                .expect("schema presence check");
+            assert!(!present, "test setup invariant: database should have no schema yet");
+        }
+
+        let config = CausalGraphConfig {
+            backend: CausalGraphBackend::TypeDb3,
+            enabled: true,
+            url: "localhost:1729".to_string(),
+            database: db_name.to_string(),
+            schema_path: "factory/coobie_semantic/typedb/schema.tql".to_string(),
+            reasoning_mode: "function_backed".to_string(),
+        };
+
+        let store = TypeDbCausalGraphStore::connect(config)
+            .await
+            .expect("connect() should repair the missing schema, not error");
+
+        let repaired = TypeDbCausalGraphStore::schema_is_present(&store.driver, db_name)
+            .await
+            .expect("schema presence check after repair");
+        assert!(repaired, "connect() should have deployed the schema to the pre-existing, schemaless database");
+
+        // Clean up the test database.
+        store
+            .driver
+            .databases()
+            .get(db_name)
+            .await
+            .expect("get for cleanup")
+            .delete()
+            .await
+            .expect("cleanup");
     }
 }
