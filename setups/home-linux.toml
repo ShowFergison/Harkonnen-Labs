@@ -21,6 +21,34 @@ enabled      = true
 usage_rights = "standard"
 surface      = "claude-code"
 
+# ── Claude tiers ──────────────────────────────────────────────────────────────
+# One named provider per capability tier, so agent routing below can pin
+# roles to the tier that fits (Opus for judgment, Haiku for mechanical work).
+
+[providers.claude-opus]
+type         = "anthropic"
+model        = "claude-opus-4-6"
+api_key_env  = "ANTHROPIC_API_KEY"
+enabled      = true
+usage_rights = "standard"
+surface      = "claude-code"
+
+[providers.claude-sonnet]
+type         = "anthropic"
+model        = "claude-sonnet-4-6"
+api_key_env  = "ANTHROPIC_API_KEY"
+enabled      = true
+usage_rights = "standard"
+surface      = "claude-code"
+
+[providers.claude-haiku]
+type         = "anthropic"
+model        = "claude-haiku-4-5-20251001"
+api_key_env  = "ANTHROPIC_API_KEY"
+enabled      = true
+usage_rights = "standard"
+surface      = "claude-code"
+
 # Gemini remains configured for later reuse, but default routing is temporarily moved off it while the local quota window is exhausted.
 # Gemini quota is constrained on this machine until the reset window passes.
 
@@ -50,9 +78,15 @@ schema_path = "factory/coobie_semantic/typedb/schema.tql"
 reasoning_mode = "function_backed"
 
 [routing.agents]
-coobie = "claude"
-mason  = "claude"
-# scout, sable, keeper, bramble, piper, ash, and flint all resolve to Claude in this setup
+scout   = "claude-opus"
+sable   = "claude-opus"
+coobie  = "claude-sonnet"
+mason   = "claude-sonnet"
+bramble = "claude-sonnet"
+keeper  = "claude-sonnet"
+piper   = "claude-haiku"
+ash     = "claude-haiku"
+flint   = "claude-haiku"
 
 [[mcp.servers]]
 name         = "filesystem"
