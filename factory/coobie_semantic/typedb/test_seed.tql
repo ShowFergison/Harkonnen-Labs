@@ -1,0 +1,33 @@
+# Throwaway fixture data for the Phase 6 live-query integration test
+# (tests/typedb_causal_graph.rs).
+#
+# NOT part of the production write-back path. This is hand-written test-only
+# data: it exists solely to prove that `TypeDbCausalGraphStore::query()`
+# (src/causal_graph.rs) returns a real, typed answer to Coobie's causal
+# question ("what caused recent failures on this spec?") against a real
+# TypeDB instance. Nothing in the production code path reads this file.
+#
+# Shaped to satisfy every clause of the live query in src/causal_graph.rs:
+#   $episode isa episode, has run-id "<run_id>";
+#   $outcome isa outcome, has status "failed";
+#   (episode-context: $episode, outcome: $outcome) isa produced-outcome;
+#   $failure isa failure-mode, has label $flabel, has summary $fsummary;
+#   (failure: $failure, outcome: $outcome) isa classifies-failure;
+#   (cause: $cause, effect: $episode, link: $link) isa causally-connects;
+#   $link isa causal-link, has relation-kind $rel, has confidence $conf;
+#
+# Two candidate causes feed one failed effect episode, so the test can also
+# assert confidence-descending sort order (proven working by Task 4).
+
+insert
+  $ep1 isa episode, has episode-id "seed-ep-1", has run-id "seed-run-1", has spec-id "seed-spec", has phase "implementation";
+  $ep2 isa episode, has episode-id "seed-ep-2", has run-id "seed-run-1", has spec-id "seed-spec", has phase "implementation";
+  $ep3 isa episode, has episode-id "seed-ep-3", has run-id "seed-run-1", has spec-id "seed-spec", has phase "validation";
+  $outcome isa outcome, has outcome-id "seed-outcome-1", has status "failed", has summary "validation failed: assertion mismatch", has confidence 0.9;
+  (episode-context: $ep3, outcome: $outcome) isa produced-outcome;
+  $failure isa failure-mode, has failure-mode-id "seed-fm-1", has label "WrongAnswer", has summary "Test asserted the wrong value";
+  (failure: $failure, outcome: $outcome) isa classifies-failure;
+  $link1 isa causal-link, has causal-link-id "seed-link-1", has relation-kind "phase_sequence", has pearl-level "Associational", has epistemic-warrant "Associational", has warrant-gap false, has confidence 0.85, has structural-spec-json "{}";
+  (cause: $ep1, effect: $ep3, link: $link1) isa causally-connects;
+  $link2 isa causal-link, has causal-link-id "seed-link-2", has relation-kind "resource_contention", has pearl-level "Associational", has epistemic-warrant "Associational", has warrant-gap false, has confidence 0.4, has structural-spec-json "{}";
+  (cause: $ep2, effect: $ep3, link: $link2) isa causally-connects;
