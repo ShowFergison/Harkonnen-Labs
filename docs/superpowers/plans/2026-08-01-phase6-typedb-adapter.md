@@ -6,7 +6,9 @@
 
 **Architecture:** A new `TypeDbCausalGraphStore` implements the existing `CausalGraphStore` trait (`src/causal_graph.rs`) using the official `typedb-driver` crate, following the exact connection/transaction/query patterns already proven in `calvin/src/archive.rs`. A new `build_store()` factory picks this store when `[typedb].enabled = true` and the connection succeeds, otherwise falls back to `NoopCausalGraphStore` — startup never fails because TypeDB is down. Scope is query-only; no write-back.
 
-**Tech Stack:** Rust, `typedb-driver = "3.8.4-rc0"`, `futures = "0.3"`, TypeDB 3.x via the `typedb` service already defined in `docker-compose.calvin.yml`, tokio async.
+**Tech Stack:** Rust, `typedb-driver = "3.12"` (main crate — see version note below), `futures = "0.3"`, TypeDB 3.x via the `typedb` service already defined in `docker-compose.calvin.yml`, tokio async.
+
+**Version note (discovered during Task 1, resolved 2026-08-01):** the plan originally assumed `typedb-driver = "3.8.4-rc0"` to match `calvin/Cargo.toml`. Task 1's implementer found that version is yanked from crates.io (unreachable for any fresh dependency resolution) and that the locally running TypeDB container is actually 3.12.1. Decision: the main crate uses `typedb-driver = "3.12"` (matches the real server); `calvin/Cargo.toml` stays on `3.8.4-rc0`, untouched — calvin-server is out of this plan's scope and keeps running on its own already-cached pin. The connection-setup API changed between these versions (`DriverOptions::new` now takes a `DriverTlsConfig` instead of `(bool, Option<_>)`; `TypeDBDriver::new` now takes an `Addresses` instead of a bare `&str`). The transaction/query/row-reading API (`transaction()`, `tx.query(...).await`, `tx.commit().await`, `answer.into_rows()`, `row.get(name)`, `concept.try_get_string()`, `concept.try_get_double()`) is unchanged between the two versions — confirmed directly against the 3.12.1 source. Every code block below already reflects the 3.12 connection API.
 
 ## Global Constraints
 
@@ -19,41 +21,32 @@
 
 ---
 
-### Task 1: Bring up TypeDB and prove basic connectivity
+### Task 1: Bring up TypeDB and prove basic connectivity — COMPLETE
+
+**Status:** Done (commits `c3ea803`, plus a follow-up fix reverting the out-of-scope `calvin/Cargo.toml` change). Kept below for reference; do not re-dispatch.
 
 **Files:**
 - Test: `tests/typedb_connectivity.rs` (new)
 
 **Interfaces:**
-- Consumes: `typedb_driver::{Credentials, DriverOptions, TypeDBDriver}` (from the new `typedb-driver` dependency, added in this task)
+- Consumes: `typedb_driver::{Addresses, Credentials, DriverOptions, DriverTlsConfig, TypeDBDriver}` (from the new `typedb-driver` dependency, added in this task)
 - Produces: nothing consumed by later tasks directly — this is a standalone connectivity proof. Later tasks re-implement the same connect logic inside `src/causal_graph.rs` (Task 3), not by calling into this test file.
 
-- [ ] **Step 1: Add `typedb-driver` and `futures` to the main crate's dependencies**
-
-Edit `Cargo.toml`, in the `[dependencies]` block, add (matching the exact versions already resolved via `calvin/Cargo.toml` so `Cargo.lock` doesn't need new resolution):
-
-```toml
-typedb-driver = "3.8.4-rc0"
-futures = "0.3"
-```
-
-- [ ] **Step 2: Bring up the TypeDB service**
-
-Run: `docker compose -f docker-compose.calvin.yml up -d typedb`
-Expected: container starts; `docker compose -f docker-compose.calvin.yml ps typedb` shows state `running (healthy)` within ~30s (the compose file's healthcheck probes TCP port 1729).
-
-- [ ] **Step 3: Write the connectivity test**
+**What actually shipped** (`typedb-driver = "3.12"`, main crate only — see the version note above the task list):
 
 ```rust
 // tests/typedb_connectivity.rs
-use typedb_driver::{Credentials, DriverOptions, TypeDBDriver};
+use typedb_driver::{Addresses, Credentials, DriverTlsConfig, DriverOptions, TypeDBDriver};
 
 #[tokio::test]
 #[ignore = "requires a live TypeDB instance: docker compose -f docker-compose.calvin.yml up -d typedb"]
 async fn connects_to_local_typedb() {
     let credentials = Credentials::new("admin", "password");
-    let options = DriverOptions::new(false, None).expect("driver options");
-    let driver = TypeDBDriver::new("localhost:1729", credentials, options)
+    let tls_config = DriverTlsConfig::disabled();
+    let options = DriverOptions::new(tls_config);
+    let addresses = Addresses::try_from_address_str("localhost:1729").expect("parse address");
+
+    let driver = TypeDBDriver::new(addresses, credentials, options)
         .await
         .expect("connect to local TypeDB");
 
@@ -66,17 +59,7 @@ async fn connects_to_local_typedb() {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes against the live container**
-
-Run: `cargo test --test typedb_connectivity -- --ignored`
-Expected: `test connects_to_local_typedb ... ok`
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add Cargo.toml Cargo.lock tests/typedb_connectivity.rs
-git commit -m "Add typedb-driver dependency and prove local TypeDB connectivity"
-```
+Test result: `test connects_to_local_typedb ... ok`.
 
 ---
 
@@ -87,7 +70,7 @@ git commit -m "Add typedb-driver dependency and prove local TypeDB connectivity"
 - Test: `tests/typedb_schema_deploy.rs` (new)
 
 **Interfaces:**
-- Consumes: `typedb_driver::{Credentials, DriverOptions, TransactionType, TypeDBDriver}`
+- Consumes: `typedb_driver::{Addresses, Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDBDriver}`
 - Produces: a schema that later tasks (3, 4, 5) can rely on being deployable and having the exact entity/relation/attribute names listed below.
 
 **Why this task exists:** `factory/coobie_semantic/typedb/schema.tql` currently defines entities and relations (`episode`, `outcome`, `failure-mode`, `causal-link`, `produced-outcome`, `classifies-failure`, `causally-connects`, etc.) but never declares which entities `plays` which relation roles. TypeDB requires explicit `plays` declarations — without them, the schema will not deploy. This has never been tested against a live instance before, so this task is the first real proof it works.
@@ -182,7 +165,7 @@ This makes the following assumption explicit (call it out in the commit message 
 ```rust
 // tests/typedb_schema_deploy.rs
 use futures::StreamExt;
-use typedb_driver::{Credentials, DriverOptions, TransactionType, TypeDBDriver};
+use typedb_driver::{Addresses, Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDBDriver};
 
 const SCHEMA_TQL: &str = include_str!("../factory/coobie_semantic/typedb/schema.tql");
 
@@ -190,8 +173,9 @@ const SCHEMA_TQL: &str = include_str!("../factory/coobie_semantic/typedb/schema.
 #[ignore = "requires a live TypeDB instance: docker compose -f docker-compose.calvin.yml up -d typedb"]
 async fn schema_deploys_without_error() {
     let credentials = Credentials::new("admin", "password");
-    let options = DriverOptions::new(false, None).expect("driver options");
-    let driver = TypeDBDriver::new("localhost:1729", credentials, options)
+    let options = DriverOptions::new(DriverTlsConfig::disabled());
+    let addresses = Addresses::try_from_address_str("localhost:1729").expect("parse address");
+    let driver = TypeDBDriver::new(addresses, credentials, options)
         .await
         .expect("connect to local TypeDB");
 
@@ -260,8 +244,9 @@ git commit -m "Fix TypeDB schema plays declarations and prove it deploys"
 Add to the top of `src/causal_graph.rs` (after the existing `use` lines):
 
 ```rust
+use anyhow::Context;
 use futures::StreamExt;
-use typedb_driver::{Credentials, DriverOptions, TransactionType, TypeDBDriver};
+use typedb_driver::{Addresses, Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDBDriver};
 ```
 
 Add after `NoopCausalGraphStore`'s `impl CausalGraphStore for NoopCausalGraphStore` block (end of current file, before the `#[cfg(test)]` module):
@@ -278,33 +263,30 @@ pub struct TypeDbCausalGraphStore {
 impl TypeDbCausalGraphStore {
     pub async fn connect(config: CausalGraphConfig) -> Result<Self> {
         let credentials = Credentials::new("admin", "password");
-        let options = DriverOptions::new(false, None)
-            .map_err(|err| anyhow::anyhow!("building TypeDB driver options: {err}"))?;
-        let driver = TypeDBDriver::new(&config.url, credentials, options)
+        let options = DriverOptions::new(DriverTlsConfig::disabled());
+        let addresses = Addresses::try_from_address_str(&config.url)
+            .with_context(|| format!("parsing TypeDB address '{}'", config.url))?;
+        let driver = TypeDBDriver::new(addresses, credentials, options)
             .await
-            .map_err(|err| anyhow::anyhow!("connecting to TypeDB at {}: {err}", config.url))?;
+            .with_context(|| format!("connecting to TypeDB at {}", config.url))?;
 
         let dbs = driver.databases();
         if !dbs
             .contains(&config.database)
             .await
-            .map_err(|err| anyhow::anyhow!("checking TypeDB database '{}': {err}", config.database))?
+            .with_context(|| format!("checking TypeDB database '{}'", config.database))?
         {
             dbs.create(&config.database)
                 .await
-                .map_err(|err| anyhow::anyhow!("creating TypeDB database '{}': {err}", config.database))?;
+                .with_context(|| format!("creating TypeDB database '{}'", config.database))?;
             tracing::info!("Created TypeDB database '{}'", config.database);
 
             let tx = driver
                 .transaction(&config.database, TransactionType::Schema)
                 .await
-                .map_err(|err| anyhow::anyhow!("opening TypeDB schema transaction: {err}"))?;
-            tx.query(SCHEMA_TQL)
-                .await
-                .map_err(|err| anyhow::anyhow!("deploying TypeDB schema: {err}"))?;
-            tx.commit()
-                .await
-                .map_err(|err| anyhow::anyhow!("committing TypeDB schema: {err}"))?;
+                .context("opening TypeDB schema transaction")?;
+            tx.query(SCHEMA_TQL).await.context("deploying TypeDB schema")?;
+            tx.commit().await.context("committing TypeDB schema")?;
             tracing::info!("Deployed Coobie semantic schema to database '{}'", config.database);
         }
 
@@ -425,7 +407,7 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
             .driver
             .transaction(&self.config.database, TransactionType::Read)
             .await
-            .map_err(|err| anyhow::anyhow!("opening TypeDB read transaction: {err}"))?;
+            .context("opening TypeDB read transaction")?;
 
         let limit = query.limit.max(1);
         let tql = format!(
@@ -443,15 +425,12 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
                limit {limit};"#
         );
 
-        let answer = tx
-            .query(&tql)
-            .await
-            .map_err(|err| anyhow::anyhow!("running causal graph query: {err}"))?;
+        let answer = tx.query(&tql).await.context("running causal graph query")?;
 
         let mut hits = Vec::new();
         let mut rows = answer.into_rows();
         while let Some(row_result) = rows.next().await {
-            let row = row_result.map_err(|err| anyhow::anyhow!("reading causal graph row: {err}"))?;
+            let row = row_result.context("reading causal graph row")?;
             let label = row
                 .get("flabel")
                 .ok()
@@ -503,7 +482,7 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
 }
 ```
 
-**Note on `try_get_double`:** confirm this exact method name against the `typedb-driver` 3.8.4-rc0 `Concept` API when implementing (`try_get_string` is confirmed in use at `calvin/src/archive.rs:418`; the double/float accessor name should be checked the same way — search the crate's docs.rs page or `cargo doc --open -p typedb-driver` if `try_get_double` doesn't compile, and use whatever the crate actually exposes for a `double`-typed attribute).
+**Note on `try_get_double`:** confirmed directly against the installed `typedb-driver` 3.12.1 source (`concept/mod.rs`) — `Concept::try_get_string(&self) -> Option<&str>` and `Concept::try_get_double(&self) -> Option<f64>` both exist with these exact names and signatures, unchanged from the row-reading API `calvin/src/archive.rs` already uses. No further verification needed for this step.
 
 - [ ] **Step 2: Compile-check**
 
@@ -577,8 +556,10 @@ async fn typed_query_returns_seeded_causal_hit() {
     // Seed via a raw write transaction against the same database the store just created.
     // (Uses typedb_driver directly since seeding is test-only, not part of the store's API.)
     let credentials = typedb_driver::Credentials::new("admin", "password");
-    let options = typedb_driver::DriverOptions::new(false, None).expect("driver options");
-    let driver = typedb_driver::TypeDBDriver::new("localhost:1729", credentials, options)
+    let options = typedb_driver::DriverOptions::new(typedb_driver::DriverTlsConfig::disabled());
+    let addresses =
+        typedb_driver::Addresses::try_from_address_str("localhost:1729").expect("parse address");
+    let driver = typedb_driver::TypeDBDriver::new(addresses, credentials, options)
         .await
         .expect("connect for seeding");
     let tx = driver
