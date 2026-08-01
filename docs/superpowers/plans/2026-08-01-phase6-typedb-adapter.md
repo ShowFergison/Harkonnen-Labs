@@ -10,6 +10,13 @@
 
 **Version note (discovered during Task 1, resolved 2026-08-01):** the plan originally assumed `typedb-driver = "3.8.4-rc0"` to match `calvin/Cargo.toml`. Two facts discovered during Task 1 forced a change. First, the locally running TypeDB container is 3.12.1, and driver 3.8.4-rc0 cannot talk to it — the driver speaks wire protocol 7.1 while the 3.12.1 server speaks 8.2. (Note: 3.8.4-rc0 is *not* yanked from crates.io; it installs fine, it simply cannot negotiate with this server.) Second, Cargo resolves `typedb-driver` to a single shared version across this workspace, so the main crate and `calvin-server` cannot sit on different versions. Decision (approved by the human partner): the whole workspace moves to `typedb-driver = "3.12"`, and `calvin/src/archive.rs`'s `connect()` was migrated to the 3.12 API as part of Task 1. The connection-setup API changed between these versions (`DriverOptions::new` now takes a `DriverTlsConfig` instead of `(bool, Option<_>)`; `TypeDBDriver::new` now takes an `Addresses` instead of a bare `&str`). The transaction/query/row-reading API (`transaction()`, `tx.query(...).await`, `tx.commit().await`, `answer.into_rows()`, `row.get(name)`, `concept.try_get_string()`, `concept.try_get_double()`) is unchanged between the two versions — confirmed directly against the 3.12.1 source. Every code block below already reflects the 3.12 connection API.
 
+**Schema note (discovered during Task 2, resolved 2026-08-01):** `factory/coobie_semantic/typedb/schema.tql` had never been applied to a live server and turned out to be written in TypeDB **2.x** syntax. Two things changed when it was made to actually deploy against TypeDB 3.12.1:
+
+1. **Kind-first declaration syntax.** TypeDB 3.x wants `attribute foo, value string;` / `relation foo, relates bar;` / `entity foo, owns bar, plays rel:role;` — not the 2.x `foo sub attribute` form. The file was also reordered (attributes → relations → entities) because forward references do not resolve within a single `define` query.
+2. **`relation` is a reserved TypeQL keyword**, so the `causal-link` entity's `relation` attribute is now named **`relation-kind`**. Tasks 4 and 5's code blocks below already use the new name.
+
+Everything else in the contract is unchanged and verified against the deployed schema: `causally-connects` still relates two `episode`s via roles `cause` / `effect` plus a `causal-link` via role `link`, and all other entity/relation/role/attribute names match the original scaffold.
+
 ## Global Constraints
 
 - Read/query path only — do not implement write-back (promoted lessons/causal-links → TypeDB). That is a separate future pass.
@@ -419,7 +426,7 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
                 (failure: $failure, outcome: $outcome) isa classifies-failure;
                 $cause isa episode;
                 (cause: $cause, effect: $episode, link: $link) isa causally-connects;
-                $link isa causal-link, has relation $rel, has confidence $conf;
+                $link isa causal-link, has relation-kind $rel, has confidence $conf;
                select $flabel, $fsummary, $rel, $conf;
                sort $conf desc;
                limit {limit};"#
@@ -522,7 +529,7 @@ insert
   (episode-context: $ep2, outcome: $outcome) isa produced-outcome;
   $failure isa failure-mode, has failure-mode-id "seed-fm-1", has label "WrongAnswer", has summary "Test asserted the wrong value";
   (failure: $failure, outcome: $outcome) isa classifies-failure;
-  $link isa causal-link, has causal-link-id "seed-link-1", has relation "phase_sequence", has pearl-level "Associational", has epistemic-warrant "Associational", has warrant-gap false, has confidence 0.85, has structural-spec-json "{}";
+  $link isa causal-link, has causal-link-id "seed-link-1", has relation-kind "phase_sequence", has pearl-level "Associational", has epistemic-warrant "Associational", has warrant-gap false, has confidence 0.85, has structural-spec-json "{}";
   (cause: $ep1, effect: $ep2, link: $link) isa causally-connects;
 ```
 
