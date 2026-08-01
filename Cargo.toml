@@ -33,9 +33,9 @@ futures = "0.3"
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+typedb-driver = "3.12"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3"
-typedb-driver = "3.12"
 uuid = { version = "1", features = ["v4"] }

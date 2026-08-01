@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, `typedb-driver = "3.12"` (main crate — see version note below), `futures = "0.3"`, TypeDB 3.x via the `typedb` service already defined in `docker-compose.calvin.yml`, tokio async.
 
-**Version note (discovered during Task 1, resolved 2026-08-01):** the plan originally assumed `typedb-driver = "3.8.4-rc0"` to match `calvin/Cargo.toml`. Task 1's implementer found that version is yanked from crates.io (unreachable for any fresh dependency resolution) and that the locally running TypeDB container is actually 3.12.1. Decision: the main crate uses `typedb-driver = "3.12"` (matches the real server); `calvin/Cargo.toml` stays on `3.8.4-rc0`, untouched — calvin-server is out of this plan's scope and keeps running on its own already-cached pin. The connection-setup API changed between these versions (`DriverOptions::new` now takes a `DriverTlsConfig` instead of `(bool, Option<_>)`; `TypeDBDriver::new` now takes an `Addresses` instead of a bare `&str`). The transaction/query/row-reading API (`transaction()`, `tx.query(...).await`, `tx.commit().await`, `answer.into_rows()`, `row.get(name)`, `concept.try_get_string()`, `concept.try_get_double()`) is unchanged between the two versions — confirmed directly against the 3.12.1 source. Every code block below already reflects the 3.12 connection API.
+**Version note (discovered during Task 1, resolved 2026-08-01):** the plan originally assumed `typedb-driver = "3.8.4-rc0"` to match `calvin/Cargo.toml`. Two facts discovered during Task 1 forced a change. First, the locally running TypeDB container is 3.12.1, and driver 3.8.4-rc0 cannot talk to it — the driver speaks wire protocol 7.1 while the 3.12.1 server speaks 8.2. (Note: 3.8.4-rc0 is *not* yanked from crates.io; it installs fine, it simply cannot negotiate with this server.) Second, Cargo resolves `typedb-driver` to a single shared version across this workspace, so the main crate and `calvin-server` cannot sit on different versions. Decision (approved by the human partner): the whole workspace moves to `typedb-driver = "3.12"`, and `calvin/src/archive.rs`'s `connect()` was migrated to the 3.12 API as part of Task 1. The connection-setup API changed between these versions (`DriverOptions::new` now takes a `DriverTlsConfig` instead of `(bool, Option<_>)`; `TypeDBDriver::new` now takes an `Addresses` instead of a bare `&str`). The transaction/query/row-reading API (`transaction()`, `tx.query(...).await`, `tx.commit().await`, `answer.into_rows()`, `row.get(name)`, `concept.try_get_string()`, `concept.try_get_double()`) is unchanged between the two versions — confirmed directly against the 3.12.1 source. Every code block below already reflects the 3.12 connection API.
 
 ## Global Constraints
 
@@ -23,7 +23,7 @@
 
 ### Task 1: Bring up TypeDB and prove basic connectivity — COMPLETE
 
-**Status:** Done (commits `c3ea803`, plus a follow-up fix reverting the out-of-scope `calvin/Cargo.toml` change). Kept below for reference; do not re-dispatch.
+**Status:** Done (commits `c3ea803`, `2c8ac39`, `4029b35`, plus review fixes). The whole workspace — including `calvin-server` — now uses `typedb-driver = "3.12"`; see the Version note above. Kept below for reference; do not re-dispatch.
 
 **Files:**
 - Test: `tests/typedb_connectivity.rs` (new)
