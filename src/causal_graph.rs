@@ -378,13 +378,17 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
     /// `causally-connects` relation.
     async fn query(&self, query: CausalGraphQuery) -> Result<CausalGraphQueryResult> {
         let Some(run_id) = query.run_id.clone() else {
+            let mut note = "typed causal graph query requires a run_id scope".to_string();
+            if query.spec_id.is_some() {
+                note.push_str("; spec_id filter is not applied by this query");
+            }
             return Ok(CausalGraphQueryResult {
                 status: CausalGraphStatus::Ready,
                 backend: self.config.backend.clone(),
                 database: self.config.database.clone(),
                 query: query.question,
                 hits: Vec::new(),
-                note: Some("typed causal graph query requires a run_id scope".to_string()),
+                note: Some(note),
             });
         };
 
@@ -416,30 +420,42 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
         let mut rows = answer.into_rows();
         while let Some(row_result) = rows.next().await {
             let row = row_result.context("reading causal graph row")?;
+            // Every one of these columns is bound by a match constraint in the
+            // TQL above (`has label $flabel, has summary $fsummary, has
+            // relation-kind $rel, has confidence $conf`), so TypeDB guarantees
+            // any row it returns has all four present with the expected
+            // value type. A decode failure here therefore always indicates a
+            // real bug (schema/query drift or a driver behavior change), never
+            // legitimately-absent data — propagate instead of silently
+            // substituting a default, which would fabricate a plausible-
+            // looking but fake hit.
             let label = row
                 .get("flabel")
-                .ok()
-                .flatten()
-                .and_then(|concept| concept.try_get_string().map(str::to_string))
-                .unwrap_or_default();
+                .context("reading flabel column")?
+                .context("flabel not bound in result row")?
+                .try_get_string()
+                .context("flabel was not a string")?
+                .to_string();
             let summary = row
                 .get("fsummary")
-                .ok()
-                .flatten()
-                .and_then(|concept| concept.try_get_string().map(str::to_string))
-                .unwrap_or_default();
+                .context("reading fsummary column")?
+                .context("fsummary not bound in result row")?
+                .try_get_string()
+                .context("fsummary was not a string")?
+                .to_string();
             let relation = row
                 .get("rel")
-                .ok()
-                .flatten()
-                .and_then(|concept| concept.try_get_string().map(str::to_string))
-                .unwrap_or_default();
+                .context("reading rel column")?
+                .context("rel not bound in result row")?
+                .try_get_string()
+                .context("rel was not a string")?
+                .to_string();
             let confidence = row
                 .get("conf")
-                .ok()
-                .flatten()
-                .and_then(|concept| concept.try_get_double())
-                .unwrap_or(0.0);
+                .context("reading conf column")?
+                .context("conf not bound in result row")?
+                .try_get_double()
+                .context("conf was not a double")?;
 
             hits.push(CausalGraphHit {
                 label,
@@ -449,11 +465,15 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
             });
         }
 
-        let note = if hits.is_empty() {
-            Some(format!("no typed causal graph hits found for run {run_id}"))
+        let mut note = if hits.is_empty() {
+            format!("no typed causal graph hits found for run {run_id}")
         } else {
-            Some(format!("typed causal graph returned {} hit(s)", hits.len()))
+            format!("typed causal graph returned {} hit(s)", hits.len())
         };
+        if query.spec_id.is_some() {
+            note.push_str("; spec_id filter is not applied by this query");
+        }
+        let note = Some(note);
 
         Ok(CausalGraphQueryResult {
             status: CausalGraphStatus::Ready,
@@ -499,6 +519,38 @@ pub async fn build_store(config: CausalGraphConfig) -> std::sync::Arc<dyn Causal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// IMPORTANT-3 regression test: pins the exact output of `escape_tql` for
+    /// a crafted quote-breakout attempt. Without this, a future refactor of
+    /// the two chained `.replace()` calls (e.g. simplifying or reordering
+    /// them) could silently reintroduce TQL injection with nothing failing.
+    #[test]
+    fn escape_tql_escapes_quote_breakout_attempt() {
+        let input = r#"x"; match $e isa episode; select $e; #"#;
+        let escaped = escape_tql(input);
+        assert_eq!(escaped, r#"x\"; match $e isa episode; select $e; #"#);
+        assert!(
+            !escaped.contains("x\";"),
+            "escaped output must not contain the raw quote-semicolon breakout sequence"
+        );
+    }
+
+    /// IMPORTANT-3 regression test: a lone backslash must be doubled.
+    #[test]
+    fn escape_tql_doubles_lone_backslash() {
+        assert_eq!(escape_tql(r#"a\b"#), r#"a\\b"#);
+    }
+
+    /// IMPORTANT-3 regression test: this is the case that proves escape
+    /// *order* is correct. Backslashes must be escaped before quotes — if
+    /// quotes were escaped first, the backslash the quote-escape inserts
+    /// would itself get doubled by a subsequent backslash pass, producing the
+    /// wrong output. `escape_tql` must produce exactly `a\\\"b`: the original
+    /// backslash doubled to `\\`, followed by the quote escaped to `\"`.
+    #[test]
+    fn escape_tql_orders_backslash_escape_before_quote_escape() {
+        assert_eq!(escape_tql(r#"a\"b"#), r#"a\\\"b"#);
+    }
 
     #[tokio::test]
     async fn build_store_returns_noop_when_disabled() {
