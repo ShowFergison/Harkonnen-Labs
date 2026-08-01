@@ -1,7 +1,13 @@
+use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+// Not yet used in this task; Task 4's query() implementation will iterate
+// TypeDB's answer stream with it.
+#[allow(unused_imports)]
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use typedb_driver::{Addresses, Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDBDriver};
 
 use crate::setup::TypeDbConfig;
 
@@ -238,9 +244,116 @@ impl CausalGraphStore for NoopCausalGraphStore {
     }
 }
 
+const SCHEMA_TQL: &str = include_str!("../factory/coobie_semantic/typedb/schema.tql");
+
+#[derive(Debug)]
+pub struct TypeDbCausalGraphStore {
+    // Not yet read; Task 4's real query() implementation uses it to open
+    // read transactions. The placeholder query() in this task doesn't.
+    #[allow(dead_code)]
+    driver: TypeDBDriver,
+    config: CausalGraphConfig,
+}
+
+impl TypeDbCausalGraphStore {
+    pub async fn connect(config: CausalGraphConfig) -> Result<Self> {
+        let credentials = Credentials::new("admin", "password");
+        let options = DriverOptions::new(DriverTlsConfig::disabled());
+        let addresses = Addresses::try_from_address_str(&config.url)
+            .with_context(|| format!("parsing TypeDB address '{}'", config.url))?;
+        let driver = TypeDBDriver::new(addresses, credentials, options)
+            .await
+            .with_context(|| format!("connecting to TypeDB at {}", config.url))?;
+
+        let dbs = driver.databases();
+        if !dbs
+            .contains(&config.database)
+            .await
+            .with_context(|| format!("checking TypeDB database '{}'", config.database))?
+        {
+            dbs.create(&config.database)
+                .await
+                .with_context(|| format!("creating TypeDB database '{}'", config.database))?;
+            tracing::info!("Created TypeDB database '{}'", config.database);
+
+            let tx = driver
+                .transaction(&config.database, TransactionType::Schema)
+                .await
+                .context("opening TypeDB schema transaction")?;
+            tx.query(SCHEMA_TQL).await.context("deploying TypeDB schema")?;
+            tx.commit().await.context("committing TypeDB schema")?;
+            tracing::info!("Deployed Coobie semantic schema to database '{}'", config.database);
+        }
+
+        Ok(Self { driver, config })
+    }
+}
+
+#[async_trait]
+impl CausalGraphStore for TypeDbCausalGraphStore {
+    fn config(&self) -> &CausalGraphConfig {
+        &self.config
+    }
+
+    // Placeholder implementation. Task 4 replaces this with the real TypeQL
+    // query path (fetch/match against the Coobie semantic schema). This
+    // exists only so `TypeDbCausalGraphStore` satisfies `CausalGraphStore`
+    // and can be coerced to `Arc<dyn CausalGraphStore>` by `build_store()`.
+    async fn query(&self, query: CausalGraphQuery) -> Result<CausalGraphQueryResult> {
+        Ok(CausalGraphQueryResult {
+            status: CausalGraphStatus::Ready,
+            backend: self.config.backend.clone(),
+            database: self.config.database.clone(),
+            query: query.question,
+            hits: Vec::new(),
+            note: None,
+        })
+    }
+}
+
+pub async fn build_store(config: CausalGraphConfig) -> std::sync::Arc<dyn CausalGraphStore> {
+    if !config.enabled {
+        return std::sync::Arc::new(NoopCausalGraphStore::new(config));
+    }
+    match TypeDbCausalGraphStore::connect(config.clone()).await {
+        Ok(store) => std::sync::Arc::new(store),
+        Err(err) => {
+            tracing::warn!(
+                "TypeDB causal graph unavailable ({err:#}); falling back to SQLite/memory retrieval"
+            );
+            std::sync::Arc::new(NoopCausalGraphStore::new(config))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn build_store_returns_noop_when_disabled() {
+        let config = CausalGraphConfig {
+            backend: CausalGraphBackend::Disabled,
+            enabled: false,
+            url: "localhost:1729".to_string(),
+            database: "harkonnen_semantic".to_string(),
+            schema_path: "factory/coobie_semantic/typedb/schema.tql".to_string(),
+            reasoning_mode: "function_backed".to_string(),
+        };
+
+        let store = build_store(config).await;
+        let result = store
+            .query(CausalGraphQuery {
+                question: "what caused recent failures?".to_string(),
+                run_id: None,
+                spec_id: None,
+                limit: 5,
+            })
+            .await
+            .expect("query");
+
+        assert_eq!(result.status, CausalGraphStatus::Disabled);
+    }
 
     #[tokio::test]
     async fn noop_graph_reports_unavailable_when_typedb_configured() {
