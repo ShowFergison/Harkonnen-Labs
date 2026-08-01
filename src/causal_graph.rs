@@ -2,9 +2,6 @@ use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-// Not yet used in this task; Task 4's query() implementation will iterate
-// TypeDB's answer stream with it.
-#[allow(unused_imports)]
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use typedb_driver::{Addresses, Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDBDriver};
@@ -246,11 +243,19 @@ impl CausalGraphStore for NoopCausalGraphStore {
 
 const SCHEMA_TQL: &str = include_str!("../factory/coobie_semantic/typedb/schema.tql");
 
+/// Escapes a string for safe interpolation inside a TQL string literal.
+/// `run_id` (and other query inputs) can originate from user-facing API
+/// input (see `answer_general_coobie_query` in `src/api.rs`), so it must not
+/// be spliced into `format!`-built TQL unescaped — an unescaped `"` would
+/// close the string literal early and let the rest of the value be
+/// interpreted as TQL. Mirrors the private `escape_tql` helper already used
+/// for the same reason in `calvin/src/archive.rs`.
+fn escape_tql(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 #[derive(Debug)]
 pub struct TypeDbCausalGraphStore {
-    // Not yet read; Task 4's real query() implementation uses it to open
-    // read transactions. The placeholder query() in this task doesn't.
-    #[allow(dead_code)]
     driver: TypeDBDriver,
     config: CausalGraphConfig,
 }
@@ -367,20 +372,96 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
         &self.config
     }
 
-    // Placeholder implementation. Task 4 replaces this with the real TypeQL
-    // query path (fetch/match against the Coobie semantic schema). This
-    // exists only so `TypeDbCausalGraphStore` satisfies `CausalGraphStore`
-    // and can be coerced to `Arc<dyn CausalGraphStore>` by `build_store()`.
+    /// Answers "what caused the failures on this run" by joining, per failed
+    /// episode outcome on `run_id`: its classified failure mode, and any
+    /// causal link where that episode is the effect end of a
+    /// `causally-connects` relation.
     async fn query(&self, query: CausalGraphQuery) -> Result<CausalGraphQueryResult> {
+        let Some(run_id) = query.run_id.clone() else {
+            return Ok(CausalGraphQueryResult {
+                status: CausalGraphStatus::Ready,
+                backend: self.config.backend.clone(),
+                database: self.config.database.clone(),
+                query: query.question,
+                hits: Vec::new(),
+                note: Some("typed causal graph query requires a run_id scope".to_string()),
+            });
+        };
+
+        let tx = self
+            .driver
+            .transaction(&self.config.database, TransactionType::Read)
+            .await
+            .context("opening TypeDB read transaction")?;
+
+        let limit = query.limit.max(1);
+        let run_id_escaped = escape_tql(&run_id);
+        let tql = format!(
+            r#"match
+                $episode isa episode, has run-id "{run_id_escaped}";
+                $outcome isa outcome, has status "failed";
+                (episode-context: $episode, outcome: $outcome) isa produced-outcome;
+                $failure isa failure-mode, has label $flabel, has summary $fsummary;
+                (failure: $failure, outcome: $outcome) isa classifies-failure;
+                (cause: $cause, effect: $episode, link: $link) isa causally-connects;
+                $link isa causal-link, has relation-kind $rel, has confidence $conf;
+               select $flabel, $fsummary, $rel, $conf;
+               sort $conf desc;
+               limit {limit};"#
+        );
+
+        let answer = tx.query(&tql).await.context("running causal graph query")?;
+
+        let mut hits = Vec::new();
+        let mut rows = answer.into_rows();
+        while let Some(row_result) = rows.next().await {
+            let row = row_result.context("reading causal graph row")?;
+            let label = row
+                .get("flabel")
+                .ok()
+                .flatten()
+                .and_then(|concept| concept.try_get_string().map(str::to_string))
+                .unwrap_or_default();
+            let summary = row
+                .get("fsummary")
+                .ok()
+                .flatten()
+                .and_then(|concept| concept.try_get_string().map(str::to_string))
+                .unwrap_or_default();
+            let relation = row
+                .get("rel")
+                .ok()
+                .flatten()
+                .and_then(|concept| concept.try_get_string().map(str::to_string))
+                .unwrap_or_default();
+            let confidence = row
+                .get("conf")
+                .ok()
+                .flatten()
+                .and_then(|concept| concept.try_get_double())
+                .unwrap_or(0.0);
+
+            hits.push(CausalGraphHit {
+                label,
+                summary: format!("{summary} (causal link: {relation})"),
+                evidence_refs: vec![format!("run:{run_id}")],
+                confidence,
+            });
+        }
+
+        let note = if hits.is_empty() {
+            Some(format!("no typed causal graph hits found for run {run_id}"))
+        } else {
+            Some(format!("typed causal graph returned {} hit(s)", hits.len()))
+        };
+
         Ok(CausalGraphQueryResult {
             status: CausalGraphStatus::Ready,
             backend: self.config.backend.clone(),
             database: self.config.database.clone(),
             query: query.question,
-            hits: Vec::new(),
-            note: Some(
-                "TypeDB connected; typed query path not yet implemented (Task 3 placeholder)".to_string(),
-            ),
+            hits,
+            note,
         })
     }
 }
