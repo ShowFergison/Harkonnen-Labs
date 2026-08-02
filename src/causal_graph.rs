@@ -197,6 +197,13 @@ impl From<&CausalGraphProjectionRecord> for CausalGraphProjectionSummary {
 pub trait CausalGraphStore: Send + Sync + std::fmt::Debug {
     fn config(&self) -> &CausalGraphConfig;
     async fn query(&self, query: CausalGraphQuery) -> Result<CausalGraphQueryResult>;
+    /// Reports whether the backing store is reachable *right now*. Unlike
+    /// `query()` with `run_id: None` (which for `TypeDbCausalGraphStore`
+    /// short-circuits before ever touching the network), this must perform a
+    /// real, bounded round-trip against the live store so callers such as a
+    /// status endpoint can distinguish "was reachable at startup" from "is
+    /// reachable this instant".
+    async fn ping(&self) -> CausalGraphStatus;
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +246,14 @@ impl CausalGraphStore for NoopCausalGraphStore {
             note,
         })
     }
+
+    async fn ping(&self) -> CausalGraphStatus {
+        if self.config.enabled {
+            CausalGraphStatus::Unavailable
+        } else {
+            CausalGraphStatus::Disabled
+        }
+    }
 }
 
 const SCHEMA_TQL: &str = include_str!("../factory/coobie_semantic/typedb/schema.tql");
@@ -256,7 +271,10 @@ fn escape_tql(s: &str) -> String {
 
 #[derive(Debug)]
 pub struct TypeDbCausalGraphStore {
-    driver: TypeDBDriver,
+    // `Arc`-wrapped (rather than owned `TypeDBDriver`) so `ping()` can clone
+    // a handle into a detached `tokio::spawn`'d task — see the comment on
+    // `ping()` for why that indirection is load-bearing, not decorative.
+    driver: std::sync::Arc<TypeDBDriver>,
     config: CausalGraphConfig,
 }
 
@@ -268,6 +286,14 @@ pub struct TypeDbCausalGraphStore {
 /// `connect()` call in an outer `tokio::time::timeout` using this same
 /// duration as its budget.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bounds `TypeDbCausalGraphStore::ping()` — a liveness check meant to be
+/// polled by a status endpoint, not a one-time startup connect. 10s
+/// (`CONNECT_TIMEOUT`) is far too long for that use case (an operator
+/// dashboard polling `/api/causal-graph/status` would hang or appear
+/// unresponsive waiting on a dead backend), so `ping()` gets its own, much
+/// shorter budget.
+const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Cheap read query used to detect whether a database that already exists
 /// actually has the Coobie semantic schema deployed to it. If `connect()`
@@ -324,7 +350,10 @@ impl TypeDbCausalGraphStore {
             tracing::info!("Deployed Coobie semantic schema to database '{}'", config.database);
         }
 
-        Ok(Self { driver, config })
+        Ok(Self {
+            driver: std::sync::Arc::new(driver),
+            config,
+        })
     }
 
     /// Runs a cheap read query for a known schema type and returns whether it
@@ -483,6 +512,97 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
             hits,
             note,
         })
+    }
+
+    /// Real, bounded liveness check: opens a fresh read transaction and runs
+    /// the same cheap presence-check query (`SCHEMA_PRESENCE_CHECK_TQL`) used
+    /// by `connect()`'s self-repair logic, rather than inventing a new query
+    /// string — it's already known-cheap (`limit 1`) and known-safe. Deliberately
+    /// does NOT call the `schema_is_present` helper: that helper treats a
+    /// query error as "schema absent" and swallows it into `Ok(false)`, which
+    /// is correct for its own self-repair use case but wrong here — a query
+    /// error during a liveness ping must be reported as `Unavailable`, not
+    /// papered over.
+    ///
+    /// ## Why this runs the probe on a detached `tokio::spawn`'d task
+    ///
+    /// A plain `tokio::time::timeout(PING_TIMEOUT, probe).await` around the
+    /// driver call is *not* sufficient to bound this call's latency, despite
+    /// looking correct. Verified empirically against `typedb-driver` 3.12.1:
+    /// when a previously-live connection goes away (the exact "TypeDB died
+    /// mid-session" scenario this method exists to detect), the driver's
+    /// reconnect path (`ServerManager::seek_primary_replica_in` in
+    /// `connection/server/server_manager.rs`) retries via
+    /// `wait_for_primary_replica_selection`, which calls `std::thread::sleep`
+    /// — a genuine OS-level blocking sleep, not `tokio::time::sleep` — for a
+    /// hardcoded 2 seconds (the crate's own source has a `// FIXME: blocking
+    /// sleep! Can't do agnostic async sleep.` comment on that exact line). A
+    /// blocking sleep inside a poll() call cannot be preempted by
+    /// `tokio::time::timeout`: the executor can't run the timer check until
+    /// the blocking call returns control, so the *caller's* observed latency
+    /// ends up governed by the driver's internal ~2s retry, not our 750ms
+    /// budget. Isolating the probe in its own spawned task sidesteps this:
+    /// the spawned task can still be monopolizing a worker thread when our
+    /// timeout fires, but our `rx.await` here is on a *different* task and
+    /// gets to run on another worker thread, so `tokio::time::timeout`
+    /// reliably bounds what the caller sees. The spawned task itself is left
+    /// to finish on its own (its result is simply discarded via the dropped
+    /// sender) — a short-lived orphaned task, not a leak, since the driver
+    /// call terminates on its own within a few seconds either way.
+    ///
+    /// Bounded by `PING_TIMEOUT` (750ms) as observed by the caller, much
+    /// shorter than `CONNECT_TIMEOUT` (10s), since this is meant to be
+    /// polled by a status endpoint, not run once at startup. Never panics
+    /// and never propagates an error — any timeout, transaction error, or
+    /// query error collapses to `Unavailable`, matching the "never fail or
+    /// hang" contract this store already keeps elsewhere (`build_store`'s
+    /// connect-timeout fallback).
+    async fn ping(&self) -> CausalGraphStatus {
+        let driver = std::sync::Arc::clone(&self.driver);
+        let database = self.config.database.clone();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result: Result<()> = async {
+                let transaction = driver
+                    .transaction(&database, TransactionType::Read)
+                    .await
+                    .context("opening TypeDB read transaction for liveness ping")?;
+                let answer = transaction
+                    .query(SCHEMA_PRESENCE_CHECK_TQL)
+                    .await
+                    .context("running TypeDB liveness ping query")?;
+                let mut rows = answer.into_rows();
+                while let Some(row_result) = rows.next().await {
+                    row_result.context("reading liveness ping row")?;
+                }
+                Ok(())
+            }
+            .await;
+            // The receiver may already be gone if the timeout below already
+            // fired; a failed send here just means nobody's listening
+            // anymore, which is fine — there's nothing to report it to.
+            let _ = tx.send(result);
+        });
+
+        match tokio::time::timeout(PING_TIMEOUT, rx).await {
+            Ok(Ok(Ok(()))) => CausalGraphStatus::Ready,
+            Ok(Ok(Err(err))) => {
+                tracing::debug!("TypeDB causal graph ping failed: {err:#}");
+                CausalGraphStatus::Unavailable
+            }
+            Ok(Err(_recv_error)) => {
+                tracing::debug!("TypeDB causal graph ping task ended without a result");
+                CausalGraphStatus::Unavailable
+            }
+            Err(_elapsed) => {
+                tracing::debug!(
+                    "TypeDB causal graph ping exceeded {}ms budget",
+                    PING_TIMEOUT.as_millis()
+                );
+                CausalGraphStatus::Unavailable
+            }
+        }
     }
 }
 
