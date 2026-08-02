@@ -148,6 +148,21 @@ async fn typed_query_returns_seeded_causal_hits() {
         "note should report 2 hits, got: {note}"
     );
 
+    // The seed also contains two decoy causal chains that are otherwise
+    // complete/valid but must be excluded by the query's scoping filters:
+    // one tagged with a different run-id ("seed-run-other"), one within
+    // "seed-run-1" but with a non-"failed" outcome status. Both decoys carry
+    // confidence > 0.85 (higher than the real top hit) specifically so that
+    // if either scoping filter ever stopped being applied, the decoy would
+    // sort to position 0 and fail the exact-value assertions above outright.
+    // This assertion additionally names the cause directly if a decoy ever
+    // does leak through.
+    assert!(
+        !result.hits.iter().any(|h| h.label.starts_with("Decoy")),
+        "query returned decoy data — a scoping filter (run-id or status=\"failed\") is not being applied: {:?}",
+        result.hits
+    );
+
     // Clean up so the database doesn't linger between runs (belt-and-braces
     // alongside the pre-cleanup above, which is what actually guarantees
     // re-runnability).
