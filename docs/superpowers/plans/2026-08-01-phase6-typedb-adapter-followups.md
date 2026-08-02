@@ -116,3 +116,33 @@ recorded here because the working ledger they came from is git-ignored scratch.
     to mark delivered items inline. The read/query adapter is done; write-back
     (promoted lessons and causal links → TypeDB) remains explicitly open, as
     do the GAIA Level 3 live harness and the AgentBench adapters.
+
+## Tool gateway
+
+Recorded 2026-08-02. Not part of the Phase 6 work — surfaced while running the
+factory end-to-end against a real browser-JS target on this branch. Kept here
+because this is where this branch's deferred items live.
+
+17. **`node` is missing from the auto-approved host-command list.**
+    `assess_host_command_surface` (`src/orchestrator.rs:29093`, list at `:29097`)
+    treats
+    `cargo | go | python | python3 | pytest | make | npm | pnpm | yarn` as
+    low-risk local build/test tooling with `approval_required: false`, and
+    everything else as `risk: high` / `approval_required: true` on the grounds
+    that it "executes an external process outside the model context".
+
+    `node` is absent, so a spec whose `test_commands` use `node --check` or
+    `node script.js` opens an approval blocker, while the same project's
+    `npm run test` — which merely shells out to `node` — auto-approves. The
+    distinction is not about risk; `npm` is the strictly larger surface, since
+    it can also install and execute dependency code. It reads like an omission
+    from the list rather than a deliberate exclusion.
+
+    This bites any project without a `package.json`. A plain browser-JS or
+    static project has no npm entry point, so `node` is its *only* way to run
+    a syntax check or a test, and every such command lands in the gateway.
+
+    Fix is a one-word addition to the array, but confirm the intent first: if
+    the list is meant to be "tools that cannot execute arbitrary user code",
+    then `npm`, `make`, and `python3` do not belong on it either, and the
+    right change is to rethink the classification rather than extend the list.
