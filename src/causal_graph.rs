@@ -272,10 +272,22 @@ fn escape_tql(s: &str) -> String {
 #[derive(Debug)]
 pub struct TypeDbCausalGraphStore {
     // `Arc`-wrapped (rather than owned `TypeDBDriver`) so `ping()` can clone
-    // a handle into a detached `tokio::spawn`'d task — see the comment on
+    // a handle into a detached `spawn_blocking` task — see the comment on
     // `ping()` for why that indirection is load-bearing, not decorative.
     driver: std::sync::Arc<TypeDBDriver>,
     config: CausalGraphConfig,
+    /// Single-flight guard *and* short-TTL result cache for `ping()`, in one
+    /// primitive. Held across the probe's `.await`, so:
+    ///   * only one probe is ever in flight at a time (concurrent callers
+    ///     queue on the mutex instead of each spawning their own probe), and
+    ///   * a caller that queued behind an in-flight probe finds that probe's
+    ///     freshly-stored result on acquiring the lock and returns it without
+    ///     probing again (that's the "share the in-flight result" half).
+    ///
+    /// A `tokio::sync::Mutex` rather than `std::sync::Mutex` specifically
+    /// because it must be held across an `.await`; it is also FIFO-fair, so
+    /// no caller can be starved by a hot polling loop.
+    ping_cache: tokio::sync::Mutex<Option<(std::time::Instant, CausalGraphStatus)>>,
 }
 
 /// Bounds the *unary* RPCs the typedb-driver issues while connecting
@@ -294,6 +306,15 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// unresponsive waiting on a dead backend), so `ping()` gets its own, much
 /// shorter budget.
 const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// How long a `ping()` result stays reusable before the next call probes the
+/// live store again. Deliberately short: it exists only to collapse a burst of
+/// dashboard polls into a single probe (see `ping_cache`), not to memoize
+/// liveness. At 1s, a recovery of a previously-down TypeDB is reflected within
+/// one second of the first poll after recovery — indistinguishable from live
+/// for an operator dashboard — while sustained polling of a *down* TypeDB
+/// produces at most one blocking probe per second instead of one per request.
+const PING_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Cheap read query used to detect whether a database that already exists
 /// actually has the Coobie semantic schema deployed to it. If `connect()`
@@ -353,6 +374,7 @@ impl TypeDbCausalGraphStore {
         Ok(Self {
             driver: std::sync::Arc::new(driver),
             config,
+            ping_cache: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -514,7 +536,42 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
         })
     }
 
-    /// Real, bounded liveness check: opens a fresh read transaction and runs
+    /// Real, bounded liveness check, de-duplicated across concurrent callers.
+    ///
+    /// The actual network probe lives in `probe_liveness()`; this method owns
+    /// the single-flight/TTL policy that keeps a polling dashboard from
+    /// launching one probe per request. Holding `ping_cache` across the probe
+    /// gives both halves at once: the first caller through the door probes
+    /// while everyone else queues on the mutex, and each queued caller then
+    /// finds the just-stored result fresh and returns it without probing.
+    /// Sustained polling of a down TypeDB therefore costs at most one probe
+    /// per `PING_CACHE_TTL` (1s), no matter the request rate — which is what
+    /// keeps abandoned probes from accumulating in the first place.
+    ///
+    /// The staleness this admits is bounded by `PING_CACHE_TTL` and is one
+    /// second in either direction (a TypeDB that just died can read `ready`
+    /// for up to 1s; one that just recovered can read `unavailable` for up to
+    /// 1s), which is well inside the polling interval of any human-facing
+    /// status view.
+    ///
+    /// Never panics and never propagates: `probe_liveness()` already collapses
+    /// every failure mode to `Unavailable`, and `tokio::sync::Mutex` has no
+    /// poisoning, so there is no error path to leak out of here either.
+    async fn ping(&self) -> CausalGraphStatus {
+        let mut cache = self.ping_cache.lock().await;
+        if let Some((probed_at, status)) = cache.as_ref() {
+            if probed_at.elapsed() < PING_CACHE_TTL {
+                return status.clone();
+            }
+        }
+        let status = self.probe_liveness().await;
+        *cache = Some((std::time::Instant::now(), status.clone()));
+        status
+    }
+}
+
+impl TypeDbCausalGraphStore {
+    /// The network half of `ping()`: opens a fresh read transaction and runs
     /// the same cheap presence-check query (`SCHEMA_PRESENCE_CHECK_TQL`) used
     /// by `connect()`'s self-repair logic, rather than inventing a new query
     /// string — it's already known-cheap (`limit 1`) and known-safe. Deliberately
@@ -524,7 +581,7 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
     /// error during a liveness ping must be reported as `Unavailable`, not
     /// papered over.
     ///
-    /// ## Why this runs the probe on a detached `tokio::spawn`'d task
+    /// ## Why this runs the probe on a `spawn_blocking` task
     ///
     /// A plain `tokio::time::timeout(PING_TIMEOUT, probe).await` around the
     /// driver call is *not* sufficient to bound this call's latency, despite
@@ -532,23 +589,46 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
     /// when a previously-live connection goes away (the exact "TypeDB died
     /// mid-session" scenario this method exists to detect), the driver's
     /// reconnect path (`ServerManager::seek_primary_replica_in` in
-    /// `connection/server/server_manager.rs`) retries via
+    /// `connection/server/server_manager.rs`, and likewise
+    /// `connection/network/transmitter/transaction.rs`) retries via
     /// `wait_for_primary_replica_selection`, which calls `std::thread::sleep`
     /// — a genuine OS-level blocking sleep, not `tokio::time::sleep` — for a
     /// hardcoded 2 seconds (the crate's own source has a `// FIXME: blocking
     /// sleep! Can't do agnostic async sleep.` comment on that exact line). A
-    /// blocking sleep inside a poll() call cannot be preempted by
+    /// blocking sleep inside a `poll()` call cannot be preempted by
     /// `tokio::time::timeout`: the executor can't run the timer check until
     /// the blocking call returns control, so the *caller's* observed latency
     /// ends up governed by the driver's internal ~2s retry, not our 750ms
-    /// budget. Isolating the probe in its own spawned task sidesteps this:
-    /// the spawned task can still be monopolizing a worker thread when our
-    /// timeout fires, but our `rx.await` here is on a *different* task and
-    /// gets to run on another worker thread, so `tokio::time::timeout`
-    /// reliably bounds what the caller sees. The spawned task itself is left
-    /// to finish on its own (its result is simply discarded via the dropped
-    /// sender) — a short-lived orphaned task, not a leak, since the driver
-    /// call terminates on its own within a few seconds either way.
+    /// budget. The probe therefore has to run somewhere else, and be raced
+    /// against the timeout from a task that is still schedulable.
+    ///
+    /// It specifically must NOT be a plain `tokio::spawn`. That schedules onto
+    /// the runtime's *core worker* pool, which under `#[tokio::main]`'s
+    /// multi-threaded runtime is fixed at `num_cpus` and does not grow. Each
+    /// timed-out ping abandons a probe that is still parked inside the
+    /// driver's blocking sleep, and a core worker parked in synchronous code
+    /// cannot run *any* other task. Under exactly the workload this endpoint
+    /// exists for — a dashboard polling while TypeDB is down — those orphans
+    /// accumulate, and once they reach the worker-pool size the whole
+    /// application stalls, including the very `timeout`/join futures this
+    /// method depends on to bound itself. A partial degradation would become a
+    /// full-service hang.
+    ///
+    /// `tokio::task::spawn_blocking` uses the runtime's separate blocking
+    /// pool, which is dynamically sized (512 threads by default) and is *for*
+    /// code that blocks, so a parked probe can never starve the async
+    /// runtime. The driver call is `async`, so the closure drives it with
+    /// `Handle::block_on`. That placement is the safe one and the only one:
+    /// `Handle::block_on` panics on a core worker thread, but blocking-pool
+    /// threads are not an async execution context, so `block_on` is permitted
+    /// there. The handle is captured *before* entering the closure
+    /// (`Handle::current()` needs the async context that `ping()` itself
+    /// runs in), and `block_on` is called nowhere else in this file.
+    ///
+    /// Abandoned probes are still possible (a `spawn_blocking` task cannot be
+    /// cancelled), but they are now (a) harmless — they occupy a blocking
+    /// thread, not a worker — and (b) rare, because the single-flight cache
+    /// above admits at most one probe per `PING_CACHE_TTL`.
     ///
     /// Bounded by `PING_TIMEOUT` (750ms) as observed by the caller, much
     /// shorter than `CONNECT_TIMEOUT` (10s), since this is meant to be
@@ -557,13 +637,20 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
     /// query error collapses to `Unavailable`, matching the "never fail or
     /// hang" contract this store already keeps elsewhere (`build_store`'s
     /// connect-timeout fallback).
-    async fn ping(&self) -> CausalGraphStatus {
+    async fn probe_liveness(&self) -> CausalGraphStatus {
         let driver = std::sync::Arc::clone(&self.driver);
         let database = self.config.database.clone();
+        // Captured here, in async context, because `Handle::current()` is only
+        // valid inside the runtime; the closure below runs on a blocking-pool
+        // thread and uses this handle to drive the async driver call.
+        let handle = tokio::runtime::Handle::current();
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result: Result<()> = async {
+        let probe = tokio::task::spawn_blocking(move || {
+            // SAFETY-OF-PLACEMENT: this `block_on` executes only on a
+            // blocking-pool thread (inside `spawn_blocking`), never on a core
+            // worker, so it cannot panic with "Cannot block the current
+            // thread from within a runtime" and cannot deadlock the executor.
+            handle.block_on(async move {
                 let transaction = driver
                     .transaction(&database, TransactionType::Read)
                     .await
@@ -576,28 +663,33 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
                 while let Some(row_result) = rows.next().await {
                     row_result.context("reading liveness ping row")?;
                 }
-                Ok(())
-            }
-            .await;
-            // The receiver may already be gone if the timeout below already
-            // fired; a failed send here just means nobody's listening
-            // anymore, which is fine — there's nothing to report it to.
-            let _ = tx.send(result);
+                Ok::<(), anyhow::Error>(())
+            })
         });
 
-        match tokio::time::timeout(PING_TIMEOUT, rx).await {
+        // Racing the `JoinHandle` itself (rather than a oneshot) means a
+        // timeout simply drops the handle, detaching the blocking task to
+        // finish and be discarded on its own — and it lets a genuine panic be
+        // told apart from an ordinary lost race, below.
+        match tokio::time::timeout(PING_TIMEOUT, probe).await {
             Ok(Ok(Ok(()))) => CausalGraphStatus::Ready,
             Ok(Ok(Err(err))) => {
                 tracing::debug!("TypeDB causal graph ping failed: {err:#}");
                 CausalGraphStatus::Unavailable
             }
-            Ok(Err(_recv_error)) => {
-                tracing::debug!("TypeDB causal graph ping task ended without a result");
+            Ok(Err(join_error)) if join_error.is_panic() => {
+                // A real bug in the probe, not a race loss — worth a louder
+                // level and a distinct message than the timeout path.
+                tracing::warn!("TypeDB causal graph ping task panicked: {join_error}");
+                CausalGraphStatus::Unavailable
+            }
+            Ok(Err(join_error)) => {
+                tracing::debug!("TypeDB causal graph ping task was cancelled: {join_error}");
                 CausalGraphStatus::Unavailable
             }
             Err(_elapsed) => {
                 tracing::debug!(
-                    "TypeDB causal graph ping exceeded {}ms budget",
+                    "TypeDB causal graph ping exceeded {}ms budget; abandoning probe on the blocking pool",
                     PING_TIMEOUT.as_millis()
                 );
                 CausalGraphStatus::Unavailable
