@@ -71,7 +71,7 @@ surface      = "vscode"
 # base_url     = "http://localhost:11434"
 
 [typedb]
-enabled = false
+enabled = true
 url = "localhost:1729"
 database = "harkonnen_semantic"
 schema_path = "factory/coobie_semantic/typedb/schema.tql"
