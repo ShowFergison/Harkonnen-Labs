@@ -8461,9 +8461,10 @@ personality_file: ../personality/labrador.md
             paths.setup.sub_agents.clone(),
             paths.setup.clone(),
         );
-        let causal_graph = Arc::new(crate::causal_graph::NoopCausalGraphStore::new(
+        let causal_graph = crate::causal_graph::build_store(
             crate::causal_graph::CausalGraphConfig::from(&paths.setup.typedb),
-        ));
+        )
+        .await;
         let app = AppContext {
             paths,
             pool,
