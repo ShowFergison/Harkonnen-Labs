@@ -1047,9 +1047,16 @@ mod tests {
             .expect("query");
 
         assert_eq!(result.status, CausalGraphStatus::Unavailable);
+        // Budget tracks CONNECT_TIMEOUT rather than a free-floating constant:
+        // the bound this test defends *is* CONNECT_TIMEOUT, so a change to it
+        // should move the assertion automatically. The 5s margin covers the
+        // outer timeout firing and the fallback to Noop. The previous bound
+        // was a flat 30s against a 10s timeout — a 3x margin that would still
+        // have passed if the real elapsed time regressed to 25s.
+        let budget = CONNECT_TIMEOUT + std::time::Duration::from_secs(5);
         assert!(
-            elapsed < std::time::Duration::from_secs(30),
-            "build_store() against a blackholed host took {elapsed:?}, expected well under 30s"
+            elapsed < budget,
+            "build_store() against a blackholed host took {elapsed:?}, expected under {budget:?} (CONNECT_TIMEOUT + 5s)"
         );
     }
 

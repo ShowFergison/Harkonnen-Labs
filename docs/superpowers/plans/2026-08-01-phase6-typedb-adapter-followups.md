@@ -63,9 +63,11 @@ recorded here because the working ledger they came from is git-ignored scratch.
    because it reuses the production 10s `CONNECT_TIMEOUT`. A shorter
    test-only constant would reclaim that.
 
-9. **Loose assertion:** the blackhole test asserts `elapsed < 30s` against a
+9. ~~**Loose assertion:** the blackhole test asserts `elapsed < 30s` against a
    10s timeout — a 3× margin that would not catch a regression to 25s.
-   Tighten to ~15s.
+   Tighten to ~15s.~~ **Done** — the bound is now derived as
+   `CONNECT_TIMEOUT + 5s` rather than a literal, so it tracks the constant it
+   exists to defend. Measured elapsed is 10.00s, leaving 5s of headroom.
 
 10. **e2e nits:** `result.database` / `result.backend` assertions are
     tautological (echoed from the config the test itself built), and
@@ -73,8 +75,13 @@ recorded here because the working ledger they came from is git-ignored scratch.
     (hit count, labels, confidences, sort order, decoy exclusion) are sound
     and were mutation-verified.
 
-11. **`tests/typedb_connectivity.rs`** — import not rustfmt-sorted; the test
-    leaves its `harkonnen_connectivity_check` database behind.
+11. ~~**`tests/typedb_connectivity.rs`** — import not rustfmt-sorted; the test
+    leaves its `harkonnen_connectivity_check` database behind.~~ **Done** —
+    the import was sorted by the `cargo fmt` pass in `f0c8be3`; the test now
+    drops any stale database before creating its own and deletes it at the
+    end, asserting the removal. Note the sibling test in
+    `tests/typedb_schema_deploy.rs` still leaves `harkonnen_schema_deploy_check`
+    behind — same flaw, not covered by this item.
 
 ## Configuration / deployment
 
