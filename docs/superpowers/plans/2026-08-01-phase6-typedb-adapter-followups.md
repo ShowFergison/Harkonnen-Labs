@@ -79,9 +79,9 @@ recorded here because the working ledger they came from is git-ignored scratch.
     leaves its `harkonnen_connectivity_check` database behind.~~ **Done** —
     the import was sorted by the `cargo fmt` pass in `f0c8be3`; the test now
     drops any stale database before creating its own and deletes it at the
-    end, asserting the removal. Note the sibling test in
-    `tests/typedb_schema_deploy.rs` still leaves `harkonnen_schema_deploy_check`
-    behind — same flaw, not covered by this item.
+    end, asserting the removal. The sibling test in
+    `tests/typedb_schema_deploy.rs` had the same flaw and was given the same
+    treatment, though it was never named by this item.
 
 ## Configuration / deployment
 

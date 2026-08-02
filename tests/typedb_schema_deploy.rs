@@ -54,4 +54,25 @@ async fn schema_deploys_without_error() {
         found,
         "causally-connects relation type should exist after schema deploy"
     );
+
+    // Release the read transaction before dropping the database — an open
+    // transaction still holds it.
+    drop(rows);
+    drop(read_tx);
+
+    // Don't leave the database behind on what is a shared local server. The
+    // delete-stale-first block above covers the one case this cannot: a panic
+    // between there and here.
+    dbs.get(db_name)
+        .await
+        .expect("get database for cleanup")
+        .delete()
+        .await
+        .expect("delete test database");
+    assert!(
+        !dbs.contains(db_name)
+            .await
+            .expect("verify database removed"),
+        "schema deploy test left {db_name} behind"
+    );
 }
