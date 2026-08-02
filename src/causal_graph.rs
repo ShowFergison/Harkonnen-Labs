@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use typedb_driver::{Addresses, Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDBDriver};
+use typedb_driver::{
+    Addresses, Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDBDriver,
+};
 
 use crate::setup::TypeDbConfig;
 
@@ -381,7 +383,8 @@ const SCHEMA_PRESENCE_CHECK_TQL: &str = "match $e sub episode; select $e; limit 
 impl TypeDbCausalGraphStore {
     pub async fn connect(config: CausalGraphConfig) -> Result<Self> {
         let credentials = Credentials::new("admin", "password");
-        let options = DriverOptions::new(DriverTlsConfig::disabled()).request_timeout(CONNECT_TIMEOUT);
+        let options =
+            DriverOptions::new(DriverTlsConfig::disabled()).request_timeout(CONNECT_TIMEOUT);
         let addresses = Addresses::try_from_address_str(&config.url)
             .with_context(|| format!("parsing TypeDB address '{}'", config.url))?;
         let driver = TypeDBDriver::new(addresses, credentials, options)
@@ -405,7 +408,8 @@ impl TypeDbCausalGraphStore {
         // but is missing the schema (self-repair for a prior partial failure,
         // e.g. create() succeeded but the schema transaction was interrupted
         // by a timeout before it could commit).
-        let needs_schema = !already_existed || !Self::schema_is_present(&driver, &config.database).await?;
+        let needs_schema =
+            !already_existed || !Self::schema_is_present(&driver, &config.database).await?;
 
         if needs_schema {
             if already_existed {
@@ -419,9 +423,14 @@ impl TypeDbCausalGraphStore {
                 .transaction(&config.database, TransactionType::Schema)
                 .await
                 .context("opening TypeDB schema transaction")?;
-            tx.query(SCHEMA_TQL).await.context("deploying TypeDB schema")?;
+            tx.query(SCHEMA_TQL)
+                .await
+                .context("deploying TypeDB schema")?;
             tx.commit().await.context("committing TypeDB schema")?;
-            tracing::info!("Deployed Coobie semantic schema to database '{}'", config.database);
+            tracing::info!(
+                "Deployed Coobie semantic schema to database '{}'",
+                config.database
+            );
         }
 
         Ok(Self {
@@ -648,7 +657,9 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
             Ok(Err(join_error)) if join_error.is_panic() => {
                 // A real bug in the query task, not a race loss — worth a
                 // louder level and a distinct message than the timeout path.
-                tracing::warn!("TypeDB causal graph query task panicked for run {run_id}: {join_error}");
+                tracing::warn!(
+                    "TypeDB causal graph query task panicked for run {run_id}: {join_error}"
+                );
                 return Ok(unavailable_query_result(
                     &self.config,
                     query.question,
@@ -656,11 +667,15 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
                 ));
             }
             Ok(Err(join_error)) => {
-                tracing::warn!("TypeDB causal graph query task was cancelled for run {run_id}: {join_error}");
+                tracing::warn!(
+                    "TypeDB causal graph query task was cancelled for run {run_id}: {join_error}"
+                );
                 return Ok(unavailable_query_result(
                     &self.config,
                     query.question,
-                    format!("typed causal graph query failed: query task was cancelled: {join_error}"),
+                    format!(
+                        "typed causal graph query failed: query task was cancelled: {join_error}"
+                    ),
                 ));
             }
             Err(_elapsed) => {
@@ -886,7 +901,12 @@ pub async fn build_store(config: CausalGraphConfig) -> std::sync::Arc<dyn Causal
     // no RST) can therefore hang `connect()` indefinitely even with
     // `request_timeout` set. Wrap the whole call in an outer timeout so
     // `build_store()` keeps its "never fail or hang startup" guarantee.
-    match tokio::time::timeout(CONNECT_TIMEOUT, TypeDbCausalGraphStore::connect(config.clone())).await {
+    match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        TypeDbCausalGraphStore::connect(config.clone()),
+    )
+    .await
+    {
         Ok(Ok(store)) => std::sync::Arc::new(store),
         Ok(Err(err)) => {
             tracing::warn!(
@@ -1104,7 +1124,10 @@ mod tests {
         assert_eq!(result.backend, CausalGraphBackend::TypeDb3);
         assert_eq!(result.database, "harkonnen_semantic");
         assert_eq!(result.query, "what caused recent failures?");
-        assert!(result.hits.is_empty(), "a failed query must not fabricate hits");
+        assert!(
+            result.hits.is_empty(),
+            "a failed query must not fabricate hits"
+        );
         assert_eq!(
             result.note.as_deref(),
             Some("typed causal graph query failed: boom"),
@@ -1182,8 +1205,13 @@ mod tests {
         assert_eq!(result.backend, CausalGraphBackend::TypeDb3);
         assert_eq!(result.database, db_name);
         assert_eq!(result.query, "what caused recent failures on this run?");
-        assert!(result.hits.is_empty(), "a failed query must not fabricate hits");
-        let note = result.note.expect("failure note must be present for the Unavailable arm");
+        assert!(
+            result.hits.is_empty(),
+            "a failed query must not fabricate hits"
+        );
+        let note = result
+            .note
+            .expect("failure note must be present for the Unavailable arm");
         assert!(
             note.contains("typed causal graph query failed"),
             "note should be diagnostic, got: {note}"
@@ -1212,21 +1240,32 @@ mod tests {
         {
             let credentials = Credentials::new("admin", "password");
             let options = DriverOptions::new(DriverTlsConfig::disabled());
-            let addresses = Addresses::try_from_address_str("localhost:1729").expect("parse address");
+            let addresses =
+                Addresses::try_from_address_str("localhost:1729").expect("parse address");
             let driver = TypeDBDriver::new(addresses, credentials, options)
                 .await
                 .expect("connect to local TypeDB");
             let dbs = driver.databases();
             if dbs.contains(db_name).await.expect("check exists") {
-                dbs.get(db_name).await.expect("get").delete().await.expect("delete stale test database");
+                dbs.get(db_name)
+                    .await
+                    .expect("get")
+                    .delete()
+                    .await
+                    .expect("delete stale test database");
             }
-            dbs.create(db_name).await.expect("create database without schema");
+            dbs.create(db_name)
+                .await
+                .expect("create database without schema");
 
             // Confirm the broken state is real before testing the repair.
             let present = TypeDbCausalGraphStore::schema_is_present(&driver, db_name)
                 .await
                 .expect("schema presence check");
-            assert!(!present, "test setup invariant: database should have no schema yet");
+            assert!(
+                !present,
+                "test setup invariant: database should have no schema yet"
+            );
         }
 
         let config = CausalGraphConfig {
@@ -1245,7 +1284,10 @@ mod tests {
         let repaired = TypeDbCausalGraphStore::schema_is_present(&store.driver, db_name)
             .await
             .expect("schema presence check after repair");
-        assert!(repaired, "connect() should have deployed the schema to the pre-existing, schemaless database");
+        assert!(
+            repaired,
+            "connect() should have deployed the schema to the pre-existing, schemaless database"
+        );
 
         // Clean up the test database.
         store

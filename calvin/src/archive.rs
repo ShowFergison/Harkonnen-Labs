@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use typedb_driver::{Addresses, Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDBDriver};
+use typedb_driver::{
+    Addresses, Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDBDriver,
+};
 use uuid::Uuid;
 
 const SCHEMA_TQL: &str = include_str!("../../factory/calvin_archive/typedb/schema.tql");

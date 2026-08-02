@@ -11,7 +11,9 @@ use harkonnen_labs::causal_graph::{
     CausalGraphBackend, CausalGraphConfig, CausalGraphQuery, CausalGraphStatus, CausalGraphStore,
     TypeDbCausalGraphStore,
 };
-use typedb_driver::{Addresses, Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDBDriver};
+use typedb_driver::{
+    Addresses, Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDBDriver,
+};
 
 const SEED_TQL: &str = include_str!("../factory/coobie_semantic/typedb/test_seed.tql");
 const DB_NAME: &str = "harkonnen_e2e_query_check";
@@ -91,7 +93,12 @@ async fn typed_query_returns_seeded_causal_hits() {
     assert_eq!(result.status, CausalGraphStatus::Ready);
     assert_eq!(result.backend, CausalGraphBackend::TypeDb3);
     assert_eq!(result.database, DB_NAME);
-    assert_eq!(result.hits.len(), 2, "expected exactly 2 causal hits, got {:?}", result.hits);
+    assert_eq!(
+        result.hits.len(),
+        2,
+        "expected exactly 2 causal hits, got {:?}",
+        result.hits
+    );
 
     let first = &result.hits[0];
     let second = &result.hits[1];

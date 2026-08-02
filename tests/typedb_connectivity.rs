@@ -1,4 +1,4 @@
-use typedb_driver::{Addresses, Credentials, DriverTlsConfig, DriverOptions, TypeDBDriver};
+use typedb_driver::{Addresses, Credentials, DriverOptions, DriverTlsConfig, TypeDBDriver};
 
 #[tokio::test]
 #[ignore = "requires a live TypeDB instance: docker compose -f docker-compose.calvin.yml up -d typedb"]
@@ -17,5 +17,8 @@ async fn connects_to_local_typedb() {
     if !dbs.contains(db_name).await.expect("check database exists") {
         dbs.create(db_name).await.expect("create test database");
     }
-    assert!(dbs.contains(db_name).await.expect("verify database created"));
+    assert!(dbs
+        .contains(db_name)
+        .await
+        .expect("verify database created"));
 }

@@ -1,5 +1,7 @@
 use futures::StreamExt;
-use typedb_driver::{Addresses, Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDBDriver};
+use typedb_driver::{
+    Addresses, Credentials, DriverOptions, DriverTlsConfig, TransactionType, TypeDBDriver,
+};
 
 const SCHEMA_TQL: &str = include_str!("../factory/coobie_semantic/typedb/schema.tql");
 
@@ -16,7 +18,12 @@ async fn schema_deploys_without_error() {
     let db_name = "harkonnen_schema_deploy_check";
     let dbs = driver.databases();
     if dbs.contains(db_name).await.expect("check database exists") {
-        dbs.get(db_name).await.expect("get database").delete().await.expect("delete stale test database");
+        dbs.get(db_name)
+            .await
+            .expect("get database")
+            .delete()
+            .await
+            .expect("delete stale test database");
     }
     dbs.create(db_name).await.expect("create test database");
 
@@ -43,5 +50,8 @@ async fn schema_deploys_without_error() {
         row_result.expect("row");
         found = true;
     }
-    assert!(found, "causally-connects relation type should exist after schema deploy");
+    assert!(
+        found,
+        "causally-connects relation type should exist after schema deploy"
+    );
 }
