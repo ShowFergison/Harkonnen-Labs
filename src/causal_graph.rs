@@ -230,8 +230,13 @@ impl CausalGraphStore for NoopCausalGraphStore {
             CausalGraphStatus::Disabled
         };
         let note = if self.config.enabled {
+            // Reached only via `build_store()`'s connect-failure fallback: the
+            // live TypeDB adapter *is* wired in this build, so the note must
+            // describe the actual condition (configured but unreachable at
+            // startup), not a missing implementation. Operator-visible through
+            // `sources[].note` on causal queries.
             Some(
-                "TypeDB 3.x semantic graph is configured, but the live driver adapter is not wired in this build.".to_string(),
+                "TypeDB 3.x is configured but was unreachable at startup; SQLite projection ledger and memory retrieval remain authoritative.".to_string(),
             )
         } else {
             Some("TypeDB semantic graph is disabled; SQLite and memory retrieval remain authoritative.".to_string())
@@ -267,6 +272,31 @@ const SCHEMA_TQL: &str = include_str!("../factory/coobie_semantic/typedb/schema.
 /// for the same reason in `calvin/src/archive.rs`.
 fn escape_tql(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Builds the "the typed graph could not answer this one" result that every
+/// per-query failure path in `TypeDbCausalGraphStore::query()` collapses to.
+///
+/// Factored out so all four failure arms (timeout, task panic, task
+/// cancellation, driver/decode error) are provably identical apart from the
+/// `note` wording — the design spec's contract is that a per-query failure
+/// after a good connection is a *result*, never an `Err`, and having one
+/// constructor makes that hard to break by accident. `hits` is always empty:
+/// a failed query has no verified typed evidence, and callers fall back to the
+/// SQLite projection ledger they already gathered.
+fn unavailable_query_result(
+    config: &CausalGraphConfig,
+    question: String,
+    note: String,
+) -> CausalGraphQueryResult {
+    CausalGraphQueryResult {
+        status: CausalGraphStatus::Unavailable,
+        backend: config.backend.clone(),
+        database: config.database.clone(),
+        query: question,
+        hits: Vec::new(),
+        note: Some(note),
+    }
 }
 
 #[derive(Debug)]
@@ -306,6 +336,29 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// unresponsive waiting on a dead backend), so `ping()` gets its own, much
 /// shorter budget.
 const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Bounds `TypeDbCausalGraphStore::query()`, the production causal-question
+/// hot path (reached from `POST /api/coobie/query`, `/api/chat`, and
+/// `/api/agents/coobie/chat`). Sits deliberately between the other two
+/// budgets, because all three answer different questions:
+///
+///   * `CONNECT_TIMEOUT` (10s) is a one-time startup cost paid before the
+///     service is serving anything, so it can afford to be generous.
+///   * `PING_TIMEOUT` (750ms) is a liveness *signal* polled by a dashboard;
+///     it does no real work, so anything slower than "instant" is already the
+///     answer ("unavailable") and waiting longer buys nothing.
+///   * `QUERY_TIMEOUT` (3s) bounds an actual multi-relation TQL join with a
+///     sort, on behalf of a waiting HTTP request. It has to leave room for a
+///     genuinely-working-but-loaded TypeDB to answer (750ms would flap into
+///     spurious `Unavailable` under load and silently drop real causal hits),
+///     while still failing over to the SQLite projection ledger fast enough
+///     that a chat/query request degrades rather than appearing to hang.
+///
+/// Like `CONNECT_TIMEOUT`, this is enforced by an *outer*
+/// `tokio::time::timeout`, because `DriverOptions::request_timeout` does not
+/// bound operations inside an already-open transaction — which is exactly
+/// what this call is.
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How long a `ping()` result stays reusable before the next call probes the
 /// live store again. Deliberately short: it exists only to collapse a burst of
@@ -427,6 +480,47 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
     /// episode outcome on `run_id`: its classified failure mode, and any
     /// causal link where that episode is the effect end of a
     /// `causally-connects` relation.
+    ///
+    /// ## Failure contract: `Unavailable`, never `Err`
+    ///
+    /// Per the phase-6 design spec, "per-query failures after a good
+    /// connection return a `CausalGraphQueryResult` with `status: Unavailable`
+    /// and the error in `note`, rather than propagating an `Err` — callers
+    /// already expect a result object, not a fallible `Result`". This matters
+    /// concretely: the callers of this method (`answer_general_coobie_query`
+    /// → `execute_coobie_query`) have *already* gathered SQLite
+    /// projection-ledger hits by the time they consult the typed graph, and an
+    /// `Err` bubbling out of here turns the whole request into an HTTP 500,
+    /// throwing that good work away. `format_causal_graph_note` in
+    /// `src/api.rs` has an `Unavailable` arm that surfaces `result.note`
+    /// verbatim; that arm exists precisely for this path. Every failure below
+    /// — timeout, join/panic, transaction-open error, query error, row-decode
+    /// error — therefore collapses to `Ok(Unavailable)` with a diagnostic
+    /// note. The signature stays `Result` only because the trait is shared
+    /// with implementors that may legitimately fail.
+    ///
+    /// ## Why the driver work runs on `spawn_blocking`
+    ///
+    /// Identical reasoning to `probe_liveness()` (see its doc comment for the
+    /// full argument, which applies verbatim here): the typedb-driver's
+    /// reconnect path calls `std::thread::sleep` for ~2s when a
+    /// previously-live connection goes away, which `tokio::time::timeout`
+    /// cannot preempt, and which parks whichever thread is polling it. Awaited
+    /// directly — as this method used to do — that thread is a *core worker*
+    /// from the fixed-size (`num_cpus`) pool, borrowed from an axum request
+    /// handler. Concurrent causal questions against a dead TypeDB would park
+    /// one core worker each until the pool is exhausted and partial
+    /// degradation becomes a full-service hang. `spawn_blocking` moves the
+    /// work to the dynamically-sized blocking pool, where a parked probe is
+    /// harmless, and leaves the async side free to honor the outer timeout.
+    ///
+    /// `Handle::current()` is captured here, in async context, and
+    /// `Handle::block_on` appears *only* inside the `spawn_blocking` closure —
+    /// it panics if called on a core worker, but blocking-pool threads are not
+    /// an async execution context, so the placement is the safe one.
+    ///
+    /// Unlike `ping()`, this gets no cache and no single-flight: distinct
+    /// queries have distinct answers, so there is nothing to share.
     async fn query(&self, query: CausalGraphQuery) -> Result<CausalGraphQueryResult> {
         let Some(run_id) = query.run_id.clone() else {
             let mut note = "typed causal graph query requires a run_id scope".to_string();
@@ -442,12 +536,6 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
                 note: Some(note),
             });
         };
-
-        let tx = self
-            .driver
-            .transaction(&self.config.database, TransactionType::Read)
-            .await
-            .context("opening TypeDB read transaction")?;
 
         let limit = query.limit.max(1);
         let run_id_escaped = escape_tql(&run_id);
@@ -465,56 +553,131 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
                limit {limit};"#
         );
 
-        let answer = tx.query(&tql).await.context("running causal graph query")?;
+        let driver = std::sync::Arc::clone(&self.driver);
+        let database = self.config.database.clone();
+        let row_run_id = run_id.clone();
+        // Captured here, in async context, because `Handle::current()` is only
+        // valid inside the runtime; the closure below runs on a blocking-pool
+        // thread and uses this handle to drive the async driver calls.
+        let handle = tokio::runtime::Handle::current();
 
-        let mut hits = Vec::new();
-        let mut rows = answer.into_rows();
-        while let Some(row_result) = rows.next().await {
-            let row = row_result.context("reading causal graph row")?;
-            // Every one of these columns is bound by a match constraint in the
-            // TQL above (`has label $flabel, has summary $fsummary, has
-            // relation-kind $rel, has confidence $conf`), so TypeDB guarantees
-            // any row it returns has all four present with the expected
-            // value type. A decode failure here therefore always indicates a
-            // real bug (schema/query drift or a driver behavior change), never
-            // legitimately-absent data — propagate instead of silently
-            // substituting a default, which would fabricate a plausible-
-            // looking but fake hit.
-            let label = row
-                .get("flabel")
-                .context("reading flabel column")?
-                .context("flabel not bound in result row")?
-                .try_get_string()
-                .context("flabel was not a string")?
-                .to_string();
-            let summary = row
-                .get("fsummary")
-                .context("reading fsummary column")?
-                .context("fsummary not bound in result row")?
-                .try_get_string()
-                .context("fsummary was not a string")?
-                .to_string();
-            let relation = row
-                .get("rel")
-                .context("reading rel column")?
-                .context("rel not bound in result row")?
-                .try_get_string()
-                .context("rel was not a string")?
-                .to_string();
-            let confidence = row
-                .get("conf")
-                .context("reading conf column")?
-                .context("conf not bound in result row")?
-                .try_get_double()
-                .context("conf was not a double")?;
+        let work = tokio::task::spawn_blocking(move || {
+            // SAFETY-OF-PLACEMENT: this `block_on` executes only on a
+            // blocking-pool thread (inside `spawn_blocking`), never on a core
+            // worker, so it cannot panic with "Cannot block the current
+            // thread from within a runtime" and cannot deadlock the executor.
+            handle.block_on(async move {
+                let tx = driver
+                    .transaction(&database, TransactionType::Read)
+                    .await
+                    .context("opening TypeDB read transaction")?;
 
-            hits.push(CausalGraphHit {
-                label,
-                summary: format!("{summary} (causal link: {relation})"),
-                evidence_refs: vec![format!("run:{run_id}")],
-                confidence,
-            });
-        }
+                let answer = tx.query(&tql).await.context("running causal graph query")?;
+
+                let mut hits = Vec::new();
+                let mut rows = answer.into_rows();
+                while let Some(row_result) = rows.next().await {
+                    let row = row_result.context("reading causal graph row")?;
+                    // Every one of these columns is bound by a match constraint
+                    // in the TQL above (`has label $flabel, has summary
+                    // $fsummary, has relation-kind $rel, has confidence
+                    // $conf`), so TypeDB guarantees any row it returns has all
+                    // four present with the expected value type. A decode
+                    // failure here therefore always indicates a real bug
+                    // (schema/query drift or a driver behavior change), never
+                    // legitimately-absent data — surface it (as an
+                    // `Unavailable` result carrying this context, per the
+                    // failure contract on this method) instead of silently
+                    // substituting a default, which would fabricate a
+                    // plausible-looking but fake hit.
+                    let label = row
+                        .get("flabel")
+                        .context("reading flabel column")?
+                        .context("flabel not bound in result row")?
+                        .try_get_string()
+                        .context("flabel was not a string")?
+                        .to_string();
+                    let summary = row
+                        .get("fsummary")
+                        .context("reading fsummary column")?
+                        .context("fsummary not bound in result row")?
+                        .try_get_string()
+                        .context("fsummary was not a string")?
+                        .to_string();
+                    let relation = row
+                        .get("rel")
+                        .context("reading rel column")?
+                        .context("rel not bound in result row")?
+                        .try_get_string()
+                        .context("rel was not a string")?
+                        .to_string();
+                    let confidence = row
+                        .get("conf")
+                        .context("reading conf column")?
+                        .context("conf not bound in result row")?
+                        .try_get_double()
+                        .context("conf was not a double")?;
+
+                    hits.push(CausalGraphHit {
+                        label,
+                        summary: format!("{summary} (causal link: {relation})"),
+                        evidence_refs: vec![format!("run:{row_run_id}")],
+                        confidence,
+                    });
+                }
+
+                Ok::<Vec<CausalGraphHit>, anyhow::Error>(hits)
+            })
+        });
+
+        // Racing the `JoinHandle` itself (rather than a oneshot) means a
+        // timeout simply drops the handle, detaching the blocking task to
+        // finish and be discarded on its own — and it lets a genuine panic be
+        // told apart from an ordinary lost race, below. Every non-success arm
+        // returns `Ok(Unavailable)`; see the failure contract documented above.
+        let hits = match tokio::time::timeout(QUERY_TIMEOUT, work).await {
+            Ok(Ok(Ok(hits))) => hits,
+            Ok(Ok(Err(err))) => {
+                tracing::warn!("TypeDB causal graph query failed for run {run_id}: {err:#}");
+                return Ok(unavailable_query_result(
+                    &self.config,
+                    query.question,
+                    format!("typed causal graph query failed: {err:#}"),
+                ));
+            }
+            Ok(Err(join_error)) if join_error.is_panic() => {
+                // A real bug in the query task, not a race loss — worth a
+                // louder level and a distinct message than the timeout path.
+                tracing::warn!("TypeDB causal graph query task panicked for run {run_id}: {join_error}");
+                return Ok(unavailable_query_result(
+                    &self.config,
+                    query.question,
+                    format!("typed causal graph query failed: query task panicked: {join_error}"),
+                ));
+            }
+            Ok(Err(join_error)) => {
+                tracing::warn!("TypeDB causal graph query task was cancelled for run {run_id}: {join_error}");
+                return Ok(unavailable_query_result(
+                    &self.config,
+                    query.question,
+                    format!("typed causal graph query failed: query task was cancelled: {join_error}"),
+                ));
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    "TypeDB causal graph query for run {run_id} exceeded {}ms budget; abandoning it on the blocking pool",
+                    QUERY_TIMEOUT.as_millis()
+                );
+                return Ok(unavailable_query_result(
+                    &self.config,
+                    query.question,
+                    format!(
+                        "typed causal graph query failed: exceeded {}ms budget (TypeDB unreachable or unresponsive)",
+                        QUERY_TIMEOUT.as_millis()
+                    ),
+                ));
+            }
+        };
 
         let mut note = if hits.is_empty() {
             format!("no typed causal graph hits found for run {run_id}")
@@ -548,11 +711,24 @@ impl CausalGraphStore for TypeDbCausalGraphStore {
     /// per `PING_CACHE_TTL` (1s), no matter the request rate — which is what
     /// keeps abandoned probes from accumulating in the first place.
     ///
-    /// The staleness this admits is bounded by `PING_CACHE_TTL` and is one
-    /// second in either direction (a TypeDB that just died can read `ready`
-    /// for up to 1s; one that just recovered can read `unavailable` for up to
-    /// 1s), which is well inside the polling interval of any human-facing
-    /// status view.
+    /// The staleness this admits is bounded by `PING_CACHE_TTL +
+    /// PING_TIMEOUT` ≈ 1.75s, not by the TTL alone: a cached entry is served
+    /// until the TTL expires, and the caller that then finds it expired must
+    /// still wait out the probe it triggers (up to `PING_TIMEOUT`) before a
+    /// fresher answer exists. So a TypeDB that just died can read `ready`, and
+    /// one that just recovered can read `unavailable`, for up to ~1.75s in
+    /// either direction — still well inside the polling interval of any
+    /// human-facing status view.
+    ///
+    /// Note the *scope* of that liveness claim. `build_store()` chooses
+    /// between `NoopCausalGraphStore` and `TypeDbCausalGraphStore` exactly
+    /// once, at bootstrap, and that choice is permanent for the life of the
+    /// process. Freshness here therefore only tracks a TypeDB that was
+    /// reachable at startup and later changed state. If TypeDB was *down* at
+    /// startup, the store is a `NoopCausalGraphStore` forever: its `ping()`
+    /// returns `Unavailable` unconditionally, no TTL expiry will ever
+    /// re-attempt a connection, and the status stays `unavailable` until the
+    /// process is restarted — no matter how healthy TypeDB becomes.
     ///
     /// Never panics and never propagates: `probe_liveness()` already collapses
     /// every failure mode to `Unavailable`, and `tokio::sync::Mutex` has no
@@ -854,6 +1030,167 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(30),
             "build_store() against a blackholed host took {elapsed:?}, expected well under 30s"
+        );
+    }
+
+    /// CRITICAL regression test (part 1 of 2): documents *why* the
+    /// `Unavailable`-not-`Err` contract test below has to be a live test.
+    ///
+    /// The obvious unit test — build a `TypeDbCausalGraphStore` pointed at a
+    /// closed port and query it — is not constructible: `connect()` performs a
+    /// real driver handshake (`TypeDBDriver::new` →
+    /// `ServerManager::new(...).await?`) before it can hand back a store, and
+    /// there is no store without an `Arc<TypeDBDriver>` to put in it. This
+    /// test pins that fact so the reasoning stays checkable: a closed port
+    /// yields `Err` from `connect()`, fast, and therefore never yields a store
+    /// whose `query()` could be exercised. Making one constructible anyway
+    /// would mean making the driver field optional or mock-shaped in
+    /// production code purely for test convenience — a weakening, so it was
+    /// not done. Requires no live TypeDB.
+    #[tokio::test]
+    async fn connect_cannot_build_a_store_against_a_closed_port() {
+        let config = CausalGraphConfig {
+            backend: CausalGraphBackend::TypeDb3,
+            enabled: true,
+            url: "localhost:19999".to_string(),
+            database: "harkonnen_semantic_closed_port_test".to_string(),
+            schema_path: "factory/coobie_semantic/typedb/schema.tql".to_string(),
+            reasoning_mode: "function_backed".to_string(),
+        };
+
+        let started = std::time::Instant::now();
+        let outcome = TypeDbCausalGraphStore::connect(config).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_err(),
+            "connect() to a closed port must fail; if this ever starts succeeding, \
+             the Unavailable-not-Err contract test can and should be rewritten as a \
+             non-live unit test"
+        );
+        assert!(
+            elapsed < CONNECT_TIMEOUT,
+            "connect() to a closed port should fail fast (connection refused), took {elapsed:?}"
+        );
+    }
+
+    /// CRITICAL regression test (part 2 of 2, pure half): pins the shape of
+    /// the result every per-query failure path collapses to. The design spec
+    /// requires `status: Unavailable` with the error text in `note` and no
+    /// hits — never an `Err` — so that `format_causal_graph_note`'s
+    /// `Unavailable` arm in `src/api.rs` can surface it and the caller can
+    /// keep the SQLite projection-ledger hits it already gathered. Requires no
+    /// live TypeDB. (The routing half — that `query()` actually reaches this
+    /// constructor rather than propagating `?` — is covered by
+    /// `query_returns_unavailable_not_err_when_typedb_is_gone` below.)
+    #[test]
+    fn unavailable_query_result_has_the_spec_mandated_shape() {
+        let config = CausalGraphConfig {
+            backend: CausalGraphBackend::TypeDb3,
+            enabled: true,
+            url: "localhost:1729".to_string(),
+            database: "harkonnen_semantic".to_string(),
+            schema_path: "factory/coobie_semantic/typedb/schema.tql".to_string(),
+            reasoning_mode: "function_backed".to_string(),
+        };
+
+        let result = unavailable_query_result(
+            &config,
+            "what caused recent failures?".to_string(),
+            "typed causal graph query failed: boom".to_string(),
+        );
+
+        assert_eq!(result.status, CausalGraphStatus::Unavailable);
+        assert_eq!(result.backend, CausalGraphBackend::TypeDb3);
+        assert_eq!(result.database, "harkonnen_semantic");
+        assert_eq!(result.query, "what caused recent failures?");
+        assert!(result.hits.is_empty(), "a failed query must not fabricate hits");
+        assert_eq!(
+            result.note.as_deref(),
+            Some("typed causal graph query failed: boom"),
+            "the error text must reach the operator-visible note"
+        );
+    }
+
+    /// CRITICAL regression test (part 2 of 2, routing half): a `query()` with
+    /// `run_id: Some(..)` — i.e. one that reaches the transaction path rather
+    /// than the `run_id: None` short-circuit — must return
+    /// `Ok(status: Unavailable)` when the typed graph cannot answer, NOT an
+    /// `Err`. Before this fix, `?` on transaction-open / query / row decode
+    /// bubbled out through `answer_general_coobie_query` →
+    /// `execute_coobie_query` → HTTP 500, discarding SQLite projection-ledger
+    /// hits that had already been computed.
+    ///
+    /// Live-only by necessity, not by preference: see
+    /// `connect_cannot_build_a_store_against_a_closed_port` above — a store
+    /// cannot exist without a successful driver handshake, so the only way to
+    /// get a store whose backing graph is unusable is to connect to a real
+    /// TypeDB and then take the graph away. This does that by deleting the
+    /// database out from under the live store, which makes the *first* driver
+    /// call in `query()` (transaction open) fail — deterministically, in
+    /// milliseconds, and without stopping the container out from under the
+    /// other live tests in this suite.
+    #[tokio::test]
+    #[ignore = "requires a live TypeDB instance: docker compose -f docker-compose.calvin.yml up -d typedb"]
+    async fn query_returns_unavailable_not_err_when_typedb_is_gone() {
+        let db_name = "harkonnen_semantic_query_failure_check";
+
+        let config = CausalGraphConfig {
+            backend: CausalGraphBackend::TypeDb3,
+            enabled: true,
+            url: "localhost:1729".to_string(),
+            database: db_name.to_string(),
+            schema_path: "factory/coobie_semantic/typedb/schema.tql".to_string(),
+            reasoning_mode: "function_backed".to_string(),
+        };
+
+        let store = TypeDbCausalGraphStore::connect(config)
+            .await
+            .expect("connect and deploy schema");
+
+        // Take the graph away from the connected store. The driver handle
+        // stays valid; the database it points at no longer exists, so the
+        // transaction open inside query() fails.
+        store
+            .driver
+            .databases()
+            .get(db_name)
+            .await
+            .expect("get database")
+            .delete()
+            .await
+            .expect("delete database out from under the live store");
+
+        let started = std::time::Instant::now();
+        let result = store
+            .query(CausalGraphQuery {
+                question: "what caused recent failures on this run?".to_string(),
+                run_id: Some("seed-run-1".to_string()),
+                spec_id: None,
+                limit: 5,
+            })
+            .await
+            .expect("query() must return Ok(Unavailable), never Err — an Err here is an HTTP 500");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            result.status,
+            CausalGraphStatus::Unavailable,
+            "a per-query failure must be reported as Unavailable, got {:?}",
+            result.status
+        );
+        assert_eq!(result.backend, CausalGraphBackend::TypeDb3);
+        assert_eq!(result.database, db_name);
+        assert_eq!(result.query, "what caused recent failures on this run?");
+        assert!(result.hits.is_empty(), "a failed query must not fabricate hits");
+        let note = result.note.expect("failure note must be present for the Unavailable arm");
+        assert!(
+            note.contains("typed causal graph query failed"),
+            "note should be diagnostic, got: {note}"
+        );
+        assert!(
+            elapsed < QUERY_TIMEOUT,
+            "a driver-level failure should surface well inside QUERY_TIMEOUT, took {elapsed:?}"
         );
     }
 
