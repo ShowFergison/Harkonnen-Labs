@@ -78,10 +78,13 @@ recorded here because the working ledger they came from is git-ignored scratch.
 
 ## Configuration / deployment
 
-12. **`docker-compose.calvin.yml` pins `typedb/typedb:latest`** while the
+12. ~~**`docker-compose.calvin.yml` pins `typedb/typedb:latest`** while the
     driver is pinned to `3.12` and everything was validated against 3.12.1.
     A `latest` bump reproduces exactly the wire-protocol mismatch that cost
-    Task 1 three rounds. Pin to `typedb/typedb:3.12.1`.
+    Task 1 three rounds. Pin to `typedb/typedb:3.12.1`.~~ **Done** — pinned
+    to `typedb/typedb:3.12.1` in `docker-compose.calvin.yml` and in
+    `scripts/bootstrap-calvin-archive-typedb.sh`, which carried the same
+    unpinned `latest` and was missed when this item was written.
 
 13. **`harkonnen.toml` now sets `enabled = true` repo-wide**, so CI
     (`.github/workflows/benchmarks.yml`, which runs without
