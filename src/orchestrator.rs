@@ -5050,11 +5050,16 @@ annotations:
         self.write_json_file(&harkonnen_dir.join("project-manifest.json"), &manifest)
             .await?;
 
+        // Rewritten every run, like project-manifest.json above and the resume
+        // packet below. This file is derived entirely from the filesystem, so
+        // there is no operator content to preserve and a stale copy is simply
+        // wrong: it survives new directories, a newly added dependency
+        // manifest, and any improvement to the detector itself. The write-once
+        // treatment is reserved for the files an operator edits by hand
+        // (instructions.md, strategy-register.md, project-context.md).
         let project_scan_path = harkonnen_dir.join("project-scan.md");
-        if !project_scan_path.exists() {
-            let scan = render_project_scan_markdown(&manifest);
-            tokio::fs::write(&project_scan_path, scan).await?;
-        }
+        let scan = render_project_scan_markdown(&manifest);
+        tokio::fs::write(&project_scan_path, scan).await?;
 
         let instructions_md = harkonnen_dir.join("instructions.md");
         if !instructions_md.exists() {
@@ -24239,7 +24244,12 @@ fn build_project_scan_manifest(
     let detected_files = detect_project_files(&source_path);
     let detected_directories = detect_project_directories(&source_path);
     let likely_commands = detect_project_commands(&source_path);
-    let runtime_hints = detect_runtime_hints(&source_path, &detected_files, &detected_directories);
+    let runtime_hints = detect_runtime_hints(
+        &source_path,
+        &detected_files,
+        &detected_directories,
+        &likely_commands,
+    );
 
     ProjectScanManifest {
         generated_at: Utc::now().to_rfc3339(),
@@ -24255,40 +24265,101 @@ fn build_project_scan_manifest(
     }
 }
 
+/// Top-level file names that identify a project's shape. These now only
+/// *rank* a scan result — presence promotes an entry to the top of the list.
+/// They no longer decide what is visible: a repo whose files are all absent
+/// from this list (a vanilla-JS game, a static site) used to scan as empty.
+///
+/// `docs` deliberately does not appear here. It is a directory, and listing
+/// it in both this array and `SIGNIFICANT_DIRECTORIES` is what made a `docs/`
+/// directory show up under "Detected Files".
+const SIGNIFICANT_FILES: [&str; 9] = [
+    "Cargo.toml",
+    "package.json",
+    "pnpm-lock.yaml",
+    "package-lock.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "README.md",
+];
+
+/// Top-level directory names that identify a project's shape. Same ranking
+/// role as `SIGNIFICANT_FILES`.
+const SIGNIFICANT_DIRECTORIES: [&str; 12] = [
+    "src", "crates", "ui", "frontend", "backend", "apps", "services", "examples", "tests",
+    "scripts", "docs", "data",
+];
+
+/// Build output and vendored dependencies. Listing these is noise, and
+/// `node_modules` in particular says nothing about the project's own shape.
+const SCAN_SKIP_DIRECTORIES: [&str; 6] = [
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "vendor",
+    "coverage",
+];
+
+/// Upper bound on entries reported per category, so a flat repo with hundreds
+/// of top-level files cannot swamp the briefing.
+const SCAN_ENTRY_LIMIT: usize = 24;
+
+/// Read the top level of the project once, splitting entries into files and
+/// directories. Hidden entries are skipped — `.harkonnen` gets its own
+/// dedicated hint, and `.git` is covered by the git metadata capture.
+fn read_top_level_entries(source_path: &Path) -> (Vec<String>, Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(source_path) else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => {
+                if SCAN_SKIP_DIRECTORIES.contains(&name.as_str()) {
+                    continue;
+                }
+                directories.push(name);
+            }
+            Ok(file_type) if file_type.is_file() => files.push(name),
+            _ => {}
+        }
+    }
+
+    (files, directories)
+}
+
+/// Sort alphabetically, then stably promote recognized names to the front, so
+/// the ordering is deterministic and the high-signal entries lead.
+fn rank_scan_entries(mut entries: Vec<String>, significant: &[&str]) -> Vec<String> {
+    entries.sort();
+    entries.dedup();
+    entries.sort_by_key(|name| {
+        significant
+            .iter()
+            .position(|candidate| *candidate == name.as_str())
+            .unwrap_or(usize::MAX)
+    });
+    entries.truncate(SCAN_ENTRY_LIMIT);
+    entries
+}
+
 fn detect_project_files(source_path: &Path) -> Vec<String> {
-    let candidates = [
-        "Cargo.toml",
-        "package.json",
-        "pnpm-lock.yaml",
-        "package-lock.json",
-        "pyproject.toml",
-        "requirements.txt",
-        "docker-compose.yml",
-        "docker-compose.yaml",
-        "README.md",
-        "docs",
-    ];
-    candidates
-        .iter()
-        .filter_map(|candidate| {
-            let path = source_path.join(candidate);
-            path.exists().then(|| candidate.to_string())
-        })
-        .collect()
+    let (files, _) = read_top_level_entries(source_path);
+    rank_scan_entries(files, &SIGNIFICANT_FILES)
 }
 
 fn detect_project_directories(source_path: &Path) -> Vec<String> {
-    let candidates = [
-        "src", "crates", "ui", "frontend", "backend", "apps", "services", "examples", "tests",
-        "scripts", "docs", "data",
-    ];
-    candidates
-        .iter()
-        .filter_map(|candidate| {
-            let path = source_path.join(candidate);
-            path.is_dir().then(|| candidate.to_string())
-        })
-        .collect()
+    let (_, directories) = read_top_level_entries(source_path);
+    rank_scan_entries(directories, &SIGNIFICANT_DIRECTORIES)
 }
 
 fn detect_project_commands(source_path: &Path) -> Vec<String> {
@@ -24721,6 +24792,7 @@ fn detect_runtime_hints(
     source_path: &Path,
     detected_files: &[String],
     detected_directories: &[String],
+    likely_commands: &[String],
 ) -> Vec<String> {
     let mut hints = Vec::new();
     if detected_files.iter().any(|value| value == "Cargo.toml")
@@ -24741,6 +24813,37 @@ fn detect_runtime_hints(
     if source_path.join(".harkonnen").exists() {
         hints.push("Repo already contains Harkonnen-local continuity files.".to_string());
     }
+
+    // Say so when the layout was not recognized. Without this the scan reports
+    // whatever it found with no indication that nothing was *identified*, and
+    // planning proceeds on an unlabelled picture as if it were an understood
+    // one. An unrecognized project is a question for the operator, not a
+    // silent gap.
+    let recognized_marker = detected_files
+        .iter()
+        .any(|value| SIGNIFICANT_FILES.contains(&value.as_str()))
+        || detected_directories
+            .iter()
+            .any(|value| SIGNIFICANT_DIRECTORIES.contains(&value.as_str()));
+    if !recognized_marker {
+        hints.push(format!(
+            "No recognized project marker (dependency manifest, src/, tests/) at the top level. \
+             The scan lists {} file(s) and {} directory(ies) as found, but the project's shape \
+             has NOT been identified - treat the layout as unknown and confirm it with the operator.",
+            detected_files.len(),
+            detected_directories.len()
+        ));
+    }
+
+    if likely_commands.is_empty() {
+        hints.push(
+            "No build or test command could be inferred from the top-level layout. Do not assume \
+             the project is unbuildable or untestable - confirm with the operator how it is built, \
+             run and verified before planning around commands."
+                .to_string(),
+        );
+    }
+
     hints
 }
 
@@ -31350,6 +31453,101 @@ mod tests {
     use chrono::{Duration, TimeZone};
     use serde_json::{json, Value};
     use std::sync::Mutex;
+
+    /// Regression test for the project scan reporting almost nothing about a
+    /// real codebase. The old detector probed ~22 hardcoded names, so a
+    /// vanilla-JS game -- js/, css/, index.html, no dependency manifest --
+    /// scanned as just README.md, and its ~9700 lines of source were invisible
+    /// to the planning phases that consume this manifest.
+    #[test]
+    fn project_scan_sees_a_project_with_no_recognized_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("index.html"), "<html></html>").expect("write index");
+        std::fs::write(root.join("README.md"), "# game").expect("write readme");
+        std::fs::create_dir(root.join("js")).expect("create js");
+        std::fs::create_dir(root.join("css")).expect("create css");
+        std::fs::create_dir(root.join("docs")).expect("create docs");
+        std::fs::create_dir(root.join("node_modules")).expect("create node_modules");
+        std::fs::create_dir(root.join(".git")).expect("create .git");
+
+        let files = detect_project_files(root);
+        let directories = detect_project_directories(root);
+
+        assert!(
+            files.contains(&"index.html".to_string()),
+            "index.html should be visible even though it is not a recognized marker, got {files:?}"
+        );
+        assert!(
+            directories.contains(&"js".to_string()) && directories.contains(&"css".to_string()),
+            "source directories should be visible, got {directories:?}"
+        );
+
+        // docs/ is a directory. It used to appear in the file candidate list
+        // too, so it was reported under "Detected Files" as well.
+        assert!(
+            !files.contains(&"docs".to_string()),
+            "docs/ is a directory and must not be reported as a file, got {files:?}"
+        );
+        assert!(directories.contains(&"docs".to_string()));
+
+        // Build output and dotfiles are noise, not project shape.
+        assert!(!directories.contains(&"node_modules".to_string()));
+        assert!(!directories.contains(&".git".to_string()));
+
+        // Recognized names lead, so the briefing opens with the high-signal entry.
+        assert_eq!(files.first().map(String::as_str), Some("README.md"));
+    }
+
+    /// The scan must say when it did not recognize the project, rather than
+    /// reporting a thin result that reads like a complete one.
+    #[test]
+    fn runtime_hints_admit_when_the_layout_was_not_recognized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("index.html"), "<html></html>").expect("write index");
+        std::fs::create_dir(root.join("js")).expect("create js");
+
+        let files = detect_project_files(root);
+        let directories = detect_project_directories(root);
+        let commands = detect_project_commands(root);
+        let hints = detect_runtime_hints(root, &files, &directories, &commands);
+
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.contains("NOT been identified")),
+            "an unrecognized layout must be disclosed, got {hints:?}"
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.contains("No build or test command could be inferred")),
+            "an empty command list must be disclosed, got {hints:?}"
+        );
+    }
+
+    /// A recognized project must not trigger the disclosure hints, or they
+    /// become noise that operators learn to ignore.
+    #[test]
+    fn runtime_hints_stay_quiet_for_a_recognized_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("Cargo.toml"), "[package]").expect("write manifest");
+        std::fs::create_dir(root.join("src")).expect("create src");
+
+        let files = detect_project_files(root);
+        let directories = detect_project_directories(root);
+        let commands = detect_project_commands(root);
+        let hints = detect_runtime_hints(root, &files, &directories, &commands);
+
+        assert!(!hints
+            .iter()
+            .any(|hint| hint.contains("NOT been identified")));
+        assert!(!hints
+            .iter()
+            .any(|hint| hint.contains("No build or test command could be inferred")));
+    }
 
     type OpenBrainThoughts = Arc<Mutex<Vec<String>>>;
 
