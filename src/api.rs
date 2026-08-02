@@ -2464,15 +2464,47 @@ async fn get_causal_graph_status(State(app): State<AppContext>) -> impl IntoResp
             return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
     };
-    let status = if config.enabled {
-        CausalGraphStatus::Unavailable
-    } else {
-        CausalGraphStatus::Disabled
+    // Probe the live store instead of trusting static config. This
+    // deliberately uses `run_id: None`: for `TypeDbCausalGraphStore` that
+    // path short-circuits before opening any TypeDB transaction (see
+    // `TypeDbCausalGraphStore::query` in `src/causal_graph.rs`), so the
+    // probe is cheap and cannot hang the status endpoint. If TypeDB is
+    // unreachable, `build_store` will already have fallen back to
+    // `NoopCausalGraphStore`, which reports `Unavailable`/`Disabled` from
+    // config alone — so this probe never itself touches the network.
+    let probe = app
+        .causal_graph
+        .query(crate::causal_graph::CausalGraphQuery {
+            question: "causal graph status probe".to_string(),
+            run_id: None,
+            spec_id: None,
+            limit: 1,
+        })
+        .await;
+
+    let (status, probe_note) = match probe {
+        Ok(result) => (result.status, result.note),
+        Err(_) => (CausalGraphStatus::Unavailable, None),
     };
-    let note = if config.enabled {
-        Some("TypeDB 3.x is configured; run graphs are currently mirrored into the SQLite projection ledger until the live adapter is enabled.".to_string())
-    } else {
-        Some("TypeDB is disabled; run graphs are mirrored into the SQLite projection ledger for inspectability and replay.".to_string())
+
+    // Only trust the probe's own note for `Ready` — there it's genuine,
+    // query-specific diagnostic text from the live store (e.g. "requires a
+    // run_id scope"). For `Unavailable`/`Disabled` the probe note comes from
+    // `NoopCausalGraphStore`, whose wording predates the live adapter (it
+    // still says "not wired in this build", which is no longer true — it's
+    // wired but unreachable, or intentionally off) and would be misleading
+    // if surfaced verbatim here, so those branches always use the
+    // status-endpoint's own accurate text instead.
+    let note = match status {
+        CausalGraphStatus::Ready => Some(probe_note.unwrap_or_else(|| {
+            "TypeDB 3.x live adapter is connected and serving typed causal graph queries; the SQLite projection ledger continues to mirror runs for replay and inspection.".to_string()
+        })),
+        CausalGraphStatus::Unavailable => Some(
+            "TypeDB 3.x is configured but currently unreachable; falling back to the SQLite projection ledger and memory retrieval.".to_string()
+        ),
+        CausalGraphStatus::Disabled => Some(
+            "TypeDB is disabled; run graphs are mirrored into the SQLite projection ledger for inspectability and replay.".to_string()
+        ),
     };
 
     (
@@ -8607,6 +8639,64 @@ personality_file: ../personality/labrador.md
             updated_body["latest_projection"]["run_id"],
             "run-causal-projection"
         );
+    }
+
+    /// Fake store used only to prove `get_causal_graph_status` reflects the
+    /// live store's reported status rather than deriving it purely from
+    /// static config. Its `config().enabled` is deliberately `false` while
+    /// `query()` reports `Ready` — the opposite of what config alone would
+    /// imply — so this test fails under the old hardcoded
+    /// `config.enabled`-only branching and passes only once the handler
+    /// actually asks the store.
+    #[derive(Debug)]
+    struct FakeReadyCausalGraphStore {
+        config: crate::causal_graph::CausalGraphConfig,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::causal_graph::CausalGraphStore for FakeReadyCausalGraphStore {
+        fn config(&self) -> &crate::causal_graph::CausalGraphConfig {
+            &self.config
+        }
+
+        async fn query(
+            &self,
+            query: crate::causal_graph::CausalGraphQuery,
+        ) -> anyhow::Result<crate::causal_graph::CausalGraphQueryResult> {
+            Ok(crate::causal_graph::CausalGraphQueryResult {
+                status: crate::causal_graph::CausalGraphStatus::Ready,
+                backend: self.config.backend.clone(),
+                database: self.config.database.clone(),
+                query: query.question,
+                hits: Vec::new(),
+                note: Some("fake store is live".to_string()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn causal_graph_status_reflects_live_store_not_just_config() {
+        let (_dir, mut app) = test_app().await;
+        // Config says disabled, but the store behind it reports Ready. A
+        // status endpoint that only looked at `config.enabled` would report
+        // "disabled" here; the correct behavior is to trust the store.
+        let fake_config = crate::causal_graph::CausalGraphConfig {
+            backend: crate::causal_graph::CausalGraphBackend::TypeDb3,
+            enabled: false,
+            url: "localhost:1729".to_string(),
+            database: "harkonnen_semantic".to_string(),
+            schema_path: "factory/coobie_semantic/typedb/schema.tql".to_string(),
+            reasoning_mode: "function_backed".to_string(),
+        };
+        app.causal_graph = std::sync::Arc::new(FakeReadyCausalGraphStore {
+            config: fake_config,
+        });
+
+        let status_response = get_causal_graph_status(State(app)).await.into_response();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = response_json(status_response).await;
+        assert_eq!(status_body["status"], "ready");
+        assert_eq!(status_body["note"], "fake store is live");
     }
 
     #[tokio::test]
