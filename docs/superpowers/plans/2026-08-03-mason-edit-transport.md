@@ -14,7 +14,7 @@
 - Gate for every task: `cargo fmt --check`, `cargo check --workspace --all-targets`, `cargo test -q --workspace`. All must pass before commit.
 - **Three call sites, not one.** Every transport change applies to `mason_generate_and_apply_edits` (`src/orchestrator.rs:7896`), `mason_fix_from_build_failure` (`:8509`), and `mason_fix_from_validation_failure` (`:8607`).
 - **Never apply a mis-recovered proposal.** `validate_mason_edits` is the last line of defence before writing to the operator's files; every new parse path must route through it.
-- Existing behaviour must keep working at every step: the JSON path stays functional until Task 7 removes it.
+- Existing behaviour must keep working at every step. The legacy JSON path is never removed by this plan — it stays as the fallback in `parse_mason_edit_response`, so a model that ignores the new format, or a cached prompt from an older run, still produces a usable proposal. Removing it is a separate decision once telemetry shows nothing uses it.
 - No new third-party crates without checking `Cargo.toml` first — `serde_json`, `anyhow`, `tokio` are already present.
 - Model-facing instruction text and parser must always be changed in the same commit. A parser expecting a format the prompt never requested is the failure mode this whole plan exists to remove.
 
@@ -911,8 +911,15 @@ fn parse_mason_edit_response_with_staged(raw: &str, staged_product: &Path) -> Re
     }
 
     // Whole-file blocks may accompany patches — new files cannot be patched.
+    // Keep the envelope's summary and rationale: they are what the run report
+    // and the decision log show the operator, and dropping them would make a
+    // mixed patch/file response less legible than a pure one.
+    let mut summary = String::new();
+    let mut rationale = Vec::new();
     if let Ok(envelope) = crate::mason_transport::parse_fenced_edits(raw) {
-        let (_, _, files) = envelope.into_edits();
+        let (envelope_summary, envelope_rationale, files) = envelope.into_edits();
+        summary = envelope_summary;
+        rationale = envelope_rationale;
         for (path, content) in files {
             edits.push(MasonEdit {
                 path,
@@ -924,11 +931,7 @@ fn parse_mason_edit_response_with_staged(raw: &str, staged_product: &Path) -> Re
     }
 
     validate_mason_edits(&edits)?;
-    Ok(MasonEditProposal {
-        summary: String::new(),
-        rationale: Vec::new(),
-        edits,
-    })
+    Ok(MasonEditProposal { summary, rationale, edits })
 }
 ```
 
