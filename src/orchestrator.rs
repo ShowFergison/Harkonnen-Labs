@@ -7987,10 +7987,18 @@ Produce the implementation plan markdown. Treat guardrails and required checks a
                 "{}
 
 Task contract:
-You are Mason, an implementation specialist for a software factory. Produce valid JSON only. Return an object with keys summary (string), rationale (array of strings), and edits (array). Each edit must contain path (relative path inside the staged workspace), action (must be 'write'), summary (string), and content (the full file contents after your edit). Only edit files within the provided editable paths. Do not emit markdown. Do not explain outside the JSON object.",
-                support.system_instruction
+You are Mason, an implementation specialist for a software factory. Only edit files within the provided editable paths.
+
+{}",
+                support.system_instruction,
+                crate::mason_transport::FENCED_FORMAT_INSTRUCTION
             ))
-            .unwrap_or_else(|| "You are Mason, an implementation specialist for a software factory. You must respond with a single raw JSON object and nothing else — no prose before it, no explanation after it, no markdown fences. The object must have exactly these keys: \"summary\" (string), \"rationale\" (array of strings), \"edits\" (array). Each edit must have: \"path\" (relative path in staged workspace), \"action\" (must be the string \"write\"), \"summary\" (string), \"content\" (full file contents after edit). Only edit files listed in EDITABLE PATHS. If no edit is needed, return edits as an empty array.".to_string());
+            .unwrap_or_else(|| format!(
+                "You are Mason, an implementation specialist for a software factory. Only edit files listed in EDITABLE PATHS.
+
+{}",
+                crate::mason_transport::FENCED_FORMAT_INSTRUCTION
+            ));
         let repo_context_block = prompt_support
             .as_ref()
             .map(|support| support.repo_context_block.as_str())
@@ -8024,7 +8032,7 @@ CONSTRAINTS:
 CURRENT FILE CONTEXT:
 {}
 
-Respond with a single JSON object only — no prose, no markdown, no explanation outside the object. If no edit is needed, return edits as an empty array. Do not write any text outside this JSON object.",
+Respond using the FILE block format described above. Nothing outside the blocks.",
                     target_source.label,
                     staged_product.display(),
                     render_list(&editable_paths, "No editable paths were resolved."),
@@ -8566,9 +8574,12 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
         let constraints = mason_slim_briefing(briefing);
 
         let req = LlmRequest::simple(
-            "You are Mason, an implementation specialist for a software factory. A build command failed. Produce valid JSON only — a single raw object with keys: \"summary\" (string), \"rationale\" (array of strings), \"edits\" (array). Each edit: \"path\" (relative path in staged workspace), \"action\" (must be \"write\"), \"summary\" (string), \"content\" (full file contents after edit). Only edit files in EDITABLE PATHS. If you cannot fix the problem, return edits as an empty array.",
+            &format!(
+                "You are Mason, an implementation specialist for a software factory. A build command failed. Only edit files in EDITABLE PATHS.\n\n{}",
+                crate::mason_transport::FENCED_FORMAT_INSTRUCTION
+            ),
             format!(
-                "SPEC:\n```yaml\n{spec_yaml}\n```\n\nCONSTRAINTS:\n{constraints}\n\nEDITABLE PATHS: {editable_list}\n\nFILE CONTEXT:\n{context_block}\n\nBUILD FAILURE OUTPUT (iteration {iteration}):\n```\n{build_output}\n```\n\nFix the errors and return the corrected file contents as a JSON edit proposal.",
+                "SPEC:\n```yaml\n{spec_yaml}\n```\n\nCONSTRAINTS:\n{constraints}\n\nEDITABLE PATHS: {editable_list}\n\nFILE CONTEXT:\n{context_block}\n\nBUILD FAILURE OUTPUT (iteration {iteration}):\n```\n{build_output}\n```\n\nFix the errors and return the corrected file contents using the FILE block format described above.",
             ),
         );
 
@@ -8659,41 +8670,34 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             serde_yaml::to_string(spec_obj).unwrap_or_else(|_| format!("{:?}", spec_obj));
         let constraints = mason_slim_briefing(briefing);
 
-        let (system_prompt, user_suffix) = if failure_kind
-            == crate::models::FailureKind::WrongAnswer
-        {
-            (
+        let (system_prompt_prefix, user_suffix) =
+            if failure_kind == crate::models::FailureKind::WrongAnswer {
+                (
                 "You are Mason, an implementation specialist for a software factory. \
                  Tests ran successfully but produced wrong output — the program ran but \
                  returned incorrect results. \
-                 Produce valid JSON only — a single raw object with keys: \
-                 \"summary\" (string), \"rationale\" (array of strings), \"edits\" (array). \
-                 Each edit: \"path\" (relative path in staged workspace), \
-                 \"action\" (must be \"write\"), \"summary\" (string), \
-                 \"content\" (full file contents after edit). \
                  Only edit files in EDITABLE PATHS. \
                  Study the expected vs actual diff carefully and fix the logic error. \
-                 Do not modify test files. If you cannot fix the problem, return edits as an empty array.",
+                 Do not modify test files.",
                 "The test ran but returned wrong output. Study the expected vs actual diff above \
-                 and fix the implementation logic. Return corrected file contents as a JSON edit proposal.",
+                 and fix the implementation logic. Return the corrected file contents using the \
+                 FILE block format described above.",
             )
-        } else {
-            (
-                "You are Mason, an implementation specialist for a software factory. \
+            } else {
+                (
+                    "You are Mason, an implementation specialist for a software factory. \
                  Visible tests have run and produced failures. \
-                 Produce valid JSON only — a single raw object with keys: \
-                 \"summary\" (string), \"rationale\" (array of strings), \"edits\" (array). \
-                 Each edit: \"path\" (relative path in staged workspace), \
-                 \"action\" (must be \"write\"), \"summary\" (string), \
-                 \"content\" (full file contents after edit). \
                  Only edit files in EDITABLE PATHS. \
                  Fix the implementation so the tests pass — do not modify test files \
-                 unless they contain a clear error unrelated to the implementation. \
-                 If you cannot fix the problem, return edits as an empty array.",
-                "Fix the implementation so these tests pass and return the corrected \
-                 file contents as a JSON edit proposal.",
-            )
-        };
+                 unless they contain a clear error unrelated to the implementation.",
+                    "Fix the implementation so these tests pass and return the corrected \
+                 file contents using the FILE block format described above.",
+                )
+            };
+        let system_prompt = format!(
+            "{system_prompt_prefix}\n\n{}",
+            crate::mason_transport::FENCED_FORMAT_INSTRUCTION
+        );
         let req = LlmRequest::simple(
             system_prompt,
             format!(
@@ -28906,6 +28910,37 @@ fn parse_mason_edit_proposal(raw: &str) -> Result<MasonEditProposal> {
     })
 }
 
+/// Try the fenced envelope first, then the legacy JSON object. Keeping both
+/// means a model that ignores the new instruction — or a cached prompt from a
+/// previous run — still produces a usable proposal.
+fn parse_mason_edit_response(raw: &str) -> Result<MasonEditProposal> {
+    match crate::mason_transport::parse_fenced_edits(raw) {
+        Ok(envelope) => {
+            let (summary, rationale, files) = envelope.into_edits();
+            let edits = files
+                .into_iter()
+                .map(|(path, content)| MasonEdit {
+                    path,
+                    action: "write".to_string(),
+                    summary: String::new(),
+                    content,
+                })
+                .collect::<Vec<_>>();
+            validate_mason_edits(&edits)?;
+            Ok(MasonEditProposal {
+                summary,
+                rationale,
+                edits,
+            })
+        }
+        Err(fenced_error) => parse_mason_edit_proposal(raw).map_err(|json_error| {
+            anyhow::anyhow!(
+                "the response matched neither transport. Fenced: {fenced_error:#}. JSON: {json_error:#}"
+            )
+        }),
+    }
+}
+
 /// Ask once, and if the response does not parse, show the model exactly how it
 /// failed and ask again. Models correct malformed output reliably when told
 /// what was wrong; before this, a single bad response ended the run.
@@ -28934,16 +28969,14 @@ async fn complete_edit_proposal_with_retry(
         last_raw = response.content.clone();
 
         let (_reasoning, body) = extract_reasoning(&response.content);
-        match parse_mason_edit_proposal(body) {
+        match parse_mason_edit_response(body) {
             Ok(proposal) => return (Ok(proposal), last_raw),
             Err(error) => {
                 if attempt + 1 < attempts.max(1) {
                     messages.push(crate::llm::Message::assistant(response.content.clone()));
                     messages.push(crate::llm::Message::user(format!(
-                        "Your previous response could not be used: {error:#}\n\n\
-                         Return the same work again as a single valid JSON object with keys \
-                         summary, rationale and edits. Escape every newline, quote and backslash \
-                         inside string values. Emit nothing outside the JSON object.",
+                        "Your previous response could not be used: {error:#}\n\n{}",
+                        crate::mason_transport::FENCED_FORMAT_INSTRUCTION
                     )));
                 }
                 last_error = Some(error);
@@ -31960,6 +31993,27 @@ mod tests {
             "the retry must carry the parse failure back to the model, got: {}",
             calls[1]
         );
+    }
+
+    #[test]
+    fn edit_response_prefers_the_fenced_envelope_and_falls_back_to_json() {
+        let fenced = "SUMMARY: add room\nRATIONALE:\n- because\n\n### FILE: js/bonus.js\nG.rooms.bonus = { a: \"b\", };\n### END FILE\n";
+        let from_fenced = parse_mason_edit_response(fenced).expect("fenced must parse");
+        assert_eq!(from_fenced.edits.len(), 1);
+        assert_eq!(from_fenced.edits[0].path, "js/bonus.js");
+        assert_eq!(from_fenced.edits[0].action, "write");
+        assert!(from_fenced.edits[0].content.contains(r#"a: "b""#));
+
+        let json = r#"{"summary":"s","rationale":[],"edits":[{"path":"js/a.js","action":"write","summary":"s","content":"x"}]}"#;
+        let from_json = parse_mason_edit_response(json).expect("json must still parse");
+        assert_eq!(from_json.edits[0].path, "js/a.js");
+    }
+
+    #[test]
+    fn edit_response_routes_fenced_output_through_edit_validation() {
+        // A path that is really source code must be refused on the fenced path too.
+        let bad = "SUMMARY: x\n\n### FILE: G.rooms = {\n### END FILE\n";
+        assert!(parse_mason_edit_response(bad).is_err());
     }
 
     #[tokio::test]

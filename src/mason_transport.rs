@@ -39,6 +39,19 @@ pub struct FencedEnvelope {
     pub files: Vec<FencedFile>,
 }
 
+impl FencedEnvelope {
+    /// `action` is always `write` — the fenced transport only expresses whole
+    /// files, which is exactly what the existing apply path already handles.
+    pub fn into_edits(self) -> (String, Vec<String>, Vec<(String, String)>) {
+        let files = self
+            .files
+            .into_iter()
+            .map(|file| (file.path, file.content))
+            .collect();
+        (self.summary, self.rationale, files)
+    }
+}
+
 pub fn parse_fenced_edits(raw: &str) -> Result<FencedEnvelope> {
     let mut summary = String::new();
     let mut rationale = Vec::new();
