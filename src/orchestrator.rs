@@ -933,8 +933,46 @@ struct MasonEditApplicationArtifact {
     summary: String,
     proposal_generated: bool,
     changed_files: Vec<String>,
+    #[serde(default)]
+    deltas: Vec<EditDelta>,
+    #[serde(default)]
+    shrank_sharply: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     git_branch: Option<String>,
+}
+
+/// Records the size of an edit's before/after so a whole-file rewrite that
+/// silently dropped code is visible in the artifact instead of looking
+/// identical to a correct append.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EditDelta {
+    lines_before: usize,
+    lines_after: usize,
+    bytes_before: usize,
+    bytes_after: usize,
+    created: bool,
+}
+
+impl EditDelta {
+    /// A whole-file rewrite that keeps under a third of the original lines is
+    /// far more likely to be a model losing context than a deliberate deletion.
+    /// Worth surfacing to the operator; not worth blocking on, since a genuine
+    /// rewrite is legitimate.
+    fn shrank_sharply(&self) -> bool {
+        !self.created && self.lines_before >= 20 && self.lines_after * 3 < self.lines_before
+    }
+}
+
+fn summarize_edit_delta(before: Option<&str>, after: &str) -> EditDelta {
+    let lines_before = before.map(|text| text.lines().count()).unwrap_or(0);
+    let bytes_before = before.map(str::len).unwrap_or(0);
+    EditDelta {
+        lines_before,
+        lines_after: after.lines().count(),
+        bytes_before,
+        bytes_after: after.len(),
+        created: before.is_none(),
+    }
 }
 
 /// Result of a `piper_execute_build` call.
@@ -7918,6 +7956,8 @@ Produce the implementation plan markdown. Treat guardrails and required checks a
                 summary: "Mason edit lane skipped because the spec did not resolve any code-under-test paths inside the staged workspace.".to_string(),
                 proposal_generated: false,
                 changed_files: Vec::new(),
+                deltas: Vec::new(),
+                shrank_sharply: Vec::new(),
                 git_branch: None,
             };
             self.write_mason_edit_application(run_dir, &application)
@@ -7936,6 +7976,8 @@ Produce the implementation plan markdown. Treat guardrails and required checks a
                 summary: "Mason edit lane skipped because no bounded text file context could be loaded for the editable paths.".to_string(),
                 proposal_generated: false,
                 changed_files: Vec::new(),
+                deltas: Vec::new(),
+                shrank_sharply: Vec::new(),
                 git_branch: None,
             };
             self.write_mason_edit_application(run_dir, &application)
@@ -7953,6 +7995,8 @@ Produce the implementation plan markdown. Treat guardrails and required checks a
                 summary: "Mason edit lane skipped because no live LLM provider is configured for Mason in the active setup.".to_string(),
                 proposal_generated: false,
                 changed_files: Vec::new(),
+                deltas: Vec::new(),
+                shrank_sharply: Vec::new(),
                 git_branch: None,
             };
             self.write_mason_edit_application(run_dir, &application)
@@ -8108,6 +8152,8 @@ Respond using the FILE block format described above. Nothing outside the blocks.
                     summary,
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    deltas: Vec::new(),
+                    shrank_sharply: Vec::new(),
                     git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
@@ -8129,6 +8175,8 @@ Respond using the FILE block format described above. Nothing outside the blocks.
                         .to_string(),
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    deltas: Vec::new(),
+                    shrank_sharply: Vec::new(),
                     git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
@@ -8148,6 +8196,8 @@ Respond using the FILE block format described above. Nothing outside the blocks.
                     ),
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    deltas: Vec::new(),
+                    shrank_sharply: Vec::new(),
                     git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
@@ -8167,6 +8217,8 @@ Respond using the FILE block format described above. Nothing outside the blocks.
                     ),
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    deltas: Vec::new(),
+                    shrank_sharply: Vec::new(),
                     git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
@@ -8205,6 +8257,8 @@ Respond using the FILE block format described above. Nothing outside the blocks.
                 },
                 proposal_generated: true,
                 changed_files: Vec::new(),
+                deltas: Vec::new(),
+                shrank_sharply: Vec::new(),
                 git_branch: None,
             };
             self.write_mason_edit_application(run_dir, &application)
@@ -8236,6 +8290,8 @@ Respond using the FILE block format described above. Nothing outside the blocks.
                 summary: lease_msg,
                 proposal_generated: true,
                 changed_files: Vec::new(),
+                deltas: Vec::new(),
+                shrank_sharply: Vec::new(),
                 git_branch: None,
             };
             self.write_mason_edit_application(run_dir, &application)
@@ -8244,6 +8300,8 @@ Respond using the FILE block format described above. Nothing outside the blocks.
         }
 
         let mut changed_files = Vec::new();
+        let mut deltas = Vec::new();
+        let mut shrank_sharply = Vec::new();
         for edit in &proposal.edits {
             let normalized = normalize_project_path(&edit.path);
             let destination = join_workspace_relative_path(staged_product, &normalized)?;
@@ -8251,6 +8309,11 @@ Respond using the FILE block format described above. Nothing outside the blocks.
                 tokio::fs::create_dir_all(parent).await?;
             }
             let existing = tokio::fs::read_to_string(&destination).await.ok();
+            let delta = summarize_edit_delta(existing.as_deref(), &edit.content);
+            if delta.shrank_sharply() {
+                shrank_sharply.push(normalized.clone());
+            }
+            deltas.push(delta);
             if existing.as_deref() != Some(edit.content.as_str()) {
                 tokio::fs::write(&destination, &edit.content).await?;
                 push_unique(&mut changed_files, &normalized);
@@ -8262,11 +8325,21 @@ Respond using the FILE block format described above. Nothing outside the blocks.
                 "Mason generated an edit proposal for '{}' but every file already matched the requested content.",
                 target_source.label
             )
-        } else {
+        } else if shrank_sharply.is_empty() {
             format!(
                 "Mason applied {} LLM-authored file edit(s) inside the staged workspace for '{}'.",
                 changed_files.len(),
                 target_source.label
+            )
+        } else {
+            format!(
+                "Mason applied {} LLM-authored file edit(s) inside the staged workspace for '{}'. \
+                 WARNING: {} file(s) lost more than two thirds of their lines — review before \
+                 trusting this run: {}",
+                changed_files.len(),
+                target_source.label,
+                shrank_sharply.len(),
+                shrank_sharply.join(", ")
             )
         };
 
@@ -8314,6 +8387,8 @@ Respond using the FILE block format described above. Nothing outside the blocks.
             summary,
             proposal_generated: true,
             changed_files,
+            deltas,
+            shrank_sharply,
             git_branch,
         };
         self.write_mason_edit_application(run_dir, &application)
@@ -34560,5 +34635,29 @@ mod tests {
             "approved": true
         })));
         assert_eq!(shape, "keys:approved+scope");
+    }
+
+    #[test]
+    fn edit_delta_flags_a_rewrite_that_loses_most_of_the_file() {
+        let before = (0..100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let after = "line 0\nline 1";
+
+        let delta = summarize_edit_delta(Some(&before), after);
+
+        assert_eq!(delta.lines_before, 100);
+        assert_eq!(delta.lines_after, 2);
+        assert!(!delta.created);
+        assert!(delta.shrank_sharply(), "a 98% reduction must be flagged");
+    }
+
+    #[test]
+    fn edit_delta_treats_a_new_file_as_creation_not_shrinkage() {
+        let delta = summarize_edit_delta(None, "a\nb\nc");
+        assert!(delta.created);
+        assert!(!delta.shrank_sharply());
+        assert_eq!(delta.lines_before, 0);
     }
 }
