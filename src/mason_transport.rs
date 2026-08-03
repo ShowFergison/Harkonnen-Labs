@@ -18,9 +18,10 @@ Then, for every file you are writing, a block of exactly this shape:
 
 Write file contents exactly as they should appear on disk. Do not escape \
 quotes, backslashes or newlines. Do not wrap contents in backticks. Emit one \
-block per file, and nothing after the final ### END FILE. Important: no line \
-inside any file's content may consist solely of '### FILE:' or '### END FILE' — \
-the parser uses those to delimit blocks and cannot distinguish them from content.";
+block per file, and nothing after the final ### END FILE. Important: file content \
+must not contain any line that starts with '### FILE:' — the parser cannot \
+distinguish such a line from a real file header. Also, no line of content may \
+consist solely of '### END FILE' — the parser uses that exact phrase to mark block ends.";
 
 const FILE_MARKER: &str = "### FILE:";
 const END_MARKER: &str = "### END FILE";
@@ -239,5 +240,23 @@ The bonus room ("Dad's Workshop") is optional.
             "CRLF must be preserved, not stripped to LF"
         );
         assert_eq!(envelope.files[0].content, "line1\r\nline2\r");
+    }
+
+    #[test]
+    fn fenced_envelope_rejects_prose_starting_with_file_marker() {
+        // Residual finding: content line starting with "### FILE:" but containing more
+        // (like "### FILE: this is prose about files") must error with nested marker message
+        // even though it's not an exact marker match, because the parser cannot distinguish it
+        let raw = "SUMMARY: Docs\n\n### FILE: README.md\n\
+                   The envelope format is described in task-2-brief.md.\n\
+                   ### FILE: this is prose about files, not a marker\n\
+                   But it starts with the marker phrase.\n\
+                   ### END FILE\n";
+        let error = parse_fenced_edits(raw).expect_err("prose starting with marker must fail");
+        let error_msg = format!("{error:#}");
+        assert!(
+            error_msg.contains("while the") && error_msg.contains("still open"),
+            "should report nested marker, got: {error_msg}"
+        );
     }
 }
