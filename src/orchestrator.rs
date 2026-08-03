@@ -28523,11 +28523,105 @@ fn strip_json_fences(raw: &str) -> &str {
         .trim()
 }
 
+/// `rationale` is specified as a list of strings, but models routinely emit a
+/// list of objects instead — typically edit-shaped records carrying an
+/// `action` such as `"read"`, i.e. a plan to inspect files rather than the
+/// edits themselves. Accept both shapes so a recoverable formatting
+/// difference does not surface as an opaque hard parse failure.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum MasonRationaleEntry {
+    Text(String),
+    Structured(serde_json::Value),
+}
+
+impl MasonRationaleEntry {
+    fn into_text(self) -> String {
+        match self {
+            Self::Text(value) => value,
+            Self::Structured(value) => {
+                let field = |key: &str| {
+                    value
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                };
+                match (field("path"), field("action"), field("summary")) {
+                    (Some(path), Some(action), Some(summary)) => {
+                        format!("{action} {path}: {summary}")
+                    }
+                    (Some(path), None, Some(summary)) => format!("{path}: {summary}"),
+                    (Some(path), Some(action), None) => format!("{action} {path}"),
+                    _ => value.to_string(),
+                }
+            }
+        }
+    }
+
+    fn is_read_action(&self) -> bool {
+        match self {
+            Self::Text(_) => false,
+            Self::Structured(value) => value
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|action| action.eq_ignore_ascii_case("read")),
+        }
+    }
+}
+
+/// Permissive mirror of `MasonEditProposal` used only for parsing. Every field
+/// defaults so that a missing one produces a specific diagnostic below rather
+/// than a serde error naming a field the operator never wrote.
+#[derive(Debug, Deserialize)]
+struct RawMasonEditProposal {
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    rationale: Vec<MasonRationaleEntry>,
+    #[serde(default)]
+    edits: Vec<MasonEdit>,
+}
+
 fn parse_mason_edit_proposal(raw: &str) -> Result<MasonEditProposal> {
     let stripped = strip_json_fences(raw);
-    let proposal = serde_json::from_str::<MasonEditProposal>(stripped)
+    let raw_proposal = serde_json::from_str::<RawMasonEditProposal>(stripped)
         .with_context(|| "parsing Mason edit proposal JSON")?;
-    Ok(proposal)
+
+    let planned_reads = raw_proposal
+        .rationale
+        .iter()
+        .filter(|entry| entry.is_read_action())
+        .count();
+    let rationale = raw_proposal
+        .rationale
+        .into_iter()
+        .map(MasonRationaleEntry::into_text)
+        .collect::<Vec<_>>();
+
+    // An empty `edits` list parses cleanly but is not a proposal — it is the
+    // model declining to edit. Say which of the two it was, because "the model
+    // planned instead of editing" and "the model returned nothing" call for
+    // different responses from the operator.
+    if raw_proposal.edits.is_empty() {
+        if planned_reads > 0 {
+            bail!(
+                "Mason returned a plan to inspect {planned_reads} file(s) rather than any edits. \
+                 The edit lane is single-shot: one response must carry every file write, each with \
+                 its full `content`. A model that expects to read files across multiple turns \
+                 cannot drive this lane."
+            );
+        }
+        bail!(
+            "Mason edit proposal contained no edits. Expected an `edits` array of \
+             {{path, action, summary, content}} objects."
+        );
+    }
+
+    Ok(MasonEditProposal {
+        summary: raw_proposal.summary,
+        rationale,
+        edits: raw_proposal.edits,
+    })
 }
 
 fn copy_tree_contents(source_root: &Path, current: &Path, destination_root: &Path) -> Result<()> {
@@ -31453,6 +31547,75 @@ mod tests {
     use chrono::{Duration, TimeZone};
     use serde_json::{json, Value};
     use std::sync::Mutex;
+
+    /// Verbatim shape returned by a local 9B model (crow-9b-heretic-4.6) when
+    /// asked for an edit proposal: objects in `rationale`, which is typed as
+    /// a list of strings, and no `edits` at all. It had understood the task —
+    /// it named the right three files — but answered with a plan to read them
+    /// first, which the single-shot edit lane cannot use.
+    const CROW_PLAN_INSTEAD_OF_EDITS: &str = r#"{
+        "summary": "Reading project structure to understand room pattern before creating bonus level.",
+        "rationale": [
+            {"path": "js/data.js", "action": "read", "summary": "Examining G.rooms.living for canonical room shape."},
+            {"path": "js/hints.js", "action": "read", "summary": "Learn the hint ladder format."}
+        ]
+    }"#;
+
+    #[test]
+    fn mason_proposal_reports_a_read_plan_as_such_not_as_a_parse_error() {
+        let error = parse_mason_edit_proposal(CROW_PLAN_INSTEAD_OF_EDITS)
+            .expect_err("a proposal with no edits must fail");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("plan to inspect 2 file(s)"),
+            "the operator needs to know the model planned instead of editing, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("parsing Mason edit proposal JSON"),
+            "objects in rationale are recoverable and must not read as a JSON parse failure, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn mason_proposal_accepts_object_rationale_alongside_real_edits() {
+        let raw = r#"{
+            "summary": "Add the bonus room.",
+            "rationale": [
+                "followed the existing room shape",
+                {"path": "js/data.js", "action": "read", "summary": "canonical room shape"}
+            ],
+            "edits": [
+                {"path": "js/bonus.js", "action": "create", "summary": "bonus room", "content": "G.rooms.bonus = {};"}
+            ]
+        }"#;
+
+        let proposal = parse_mason_edit_proposal(raw).expect("object rationale must be accepted");
+
+        assert_eq!(proposal.edits.len(), 1);
+        assert_eq!(proposal.edits[0].path, "js/bonus.js");
+        assert_eq!(
+            proposal.rationale,
+            vec![
+                "followed the existing room shape".to_string(),
+                "read js/data.js: canonical room shape".to_string(),
+            ],
+            "structured rationale entries must be flattened to readable lines"
+        );
+    }
+
+    #[test]
+    fn mason_proposal_distinguishes_empty_edits_from_a_read_plan() {
+        let error = parse_mason_edit_proposal(r#"{"summary": "nothing to do", "rationale": []}"#)
+            .expect_err("no edits must fail");
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("contained no edits"), "got: {rendered}");
+        assert!(
+            !rendered.contains("plan to inspect"),
+            "there was no read plan here, got: {rendered}"
+        );
+    }
 
     /// Regression test for the project scan reporting almost nothing about a
     /// real codebase. The old detector probed ~22 hardcoded names, so a

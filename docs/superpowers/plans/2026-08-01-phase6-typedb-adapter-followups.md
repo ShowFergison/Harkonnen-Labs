@@ -146,3 +146,28 @@ because this is where this branch's deferred items live.
     the list is meant to be "tools that cannot execute arbitrary user code",
     then `npm`, `make`, and `python3` do not belong on it either, and the
     right change is to rethink the classification rather than extend the list.
+
+## Setup reporting
+
+18. **`setup check` reports `[ok]` for an API key that is set but empty.**
+    `print_provider_status` (`src/cli.rs:1857`) decides with
+    `std::env::var(&c.api_key_env).is_ok()`. `env::var` returns `Ok("")` for a
+    variable that exists with an empty value, so a `.env` containing
+    `GEMINI_API_KEY=` reports the provider as healthy. The failure then
+    surfaces much later and much further away, as a provider-side
+    `403 PERMISSION_DENIED — Method doesn't allow unregistered callers`, at the
+    moment an agent first tries to use it.
+
+    Cost of the gap is real: a run can complete planning, auto-approve its
+    transaction boundary, and die in the edit lane, all while `setup check`
+    insists the provider is fine. The check should treat an empty or
+    whitespace-only value as missing.
+
+    The same function has an inverse false negative. A local OpenAI-compatible
+    provider (LM Studio) legitimately sets `api_key_env = ""` because the
+    endpoint needs no auth — `optional_api_key` (`src/llm.rs:297`) handles this
+    correctly and there is a test for it — but `setup check` still prints
+    `[MISSING]`, because an empty *env var name* also fails `env::var`. So the
+    keyless-local case is reported as broken while the empty-key case is
+    reported as fine, which is exactly backwards. Both directions come from the
+    same line and should be fixed together.

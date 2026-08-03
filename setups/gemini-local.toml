@@ -1,0 +1,121 @@
+# Home Linux — full stack
+# Claude + Gemini + Codex, AnythingLLM, OpenClaw, all MCP servers
+#
+# Usage: export HARKONNEN_SETUP=home-linux
+# (same as the root harkonnen.toml — kept here for explicit activation)
+
+[setup]
+name        = "gemini-local"
+platform    = "linux"
+anythingllm = true
+openclaw    = true
+
+[providers]
+default = "gemini"
+
+[providers.claude]
+type         = "anthropic"
+model        = "claude-sonnet-4-6"
+api_key_env  = "ANTHROPIC_API_KEY"
+enabled      = true
+usage_rights = "standard"
+surface      = "claude-code"
+
+# ── Claude tiers ──────────────────────────────────────────────────────────────
+# One named provider per capability tier, so agent routing below can pin
+# roles to the tier that fits (Opus for judgment, Haiku for mechanical work).
+
+[providers.claude-opus]
+type         = "anthropic"
+model        = "claude-opus-4-6"
+api_key_env  = "ANTHROPIC_API_KEY"
+enabled      = true
+usage_rights = "standard"
+surface      = "claude-code"
+
+[providers.claude-sonnet]
+type         = "anthropic"
+model        = "claude-sonnet-4-6"
+api_key_env  = "ANTHROPIC_API_KEY"
+enabled      = true
+usage_rights = "standard"
+surface      = "claude-code"
+
+[providers.claude-haiku]
+type         = "anthropic"
+model        = "claude-haiku-4-5-20251001"
+api_key_env  = "ANTHROPIC_API_KEY"
+enabled      = true
+usage_rights = "standard"
+surface      = "claude-code"
+
+# Gemini remains configured for later reuse, but default routing is temporarily moved off it while the local quota window is exhausted.
+# Gemini quota is constrained on this machine until the reset window passes.
+
+[providers.gemini]
+type         = "google"
+model        = "gemini-2.0-flash"
+api_key_env  = "GEMINI_API_KEY"
+enabled      = true
+usage_rights = "standard"
+surface      = "antigravity"
+
+[providers.codex]
+type         = "openai"
+model        = "gpt-4o"
+api_key_env  = "OPENAI_API_KEY"
+enabled      = true
+usage_rights = "targeted"
+surface      = "vscode"
+# Optional for BYO OpenAI-compatible endpoints: e.g. "http://localhost:11434" or "https://openrouter.ai/api/v1"
+# base_url     = "http://localhost:11434"
+
+[typedb]
+enabled = true
+url = "localhost:1729"
+database = "harkonnen_semantic"
+schema_path = "factory/coobie_semantic/typedb/schema.tql"
+reasoning_mode = "function_backed"
+
+[routing.agents]
+scout   = "gemini"
+sable   = "gemini"
+coobie  = "gemini"
+mason   = "gemini"
+bramble = "gemini"
+keeper  = "gemini"
+piper   = "gemini"
+ash     = "gemini"
+flint   = "gemini"
+
+[[mcp.servers]]
+name         = "filesystem"
+command      = "npx"
+args         = ["-y", "@modelcontextprotocol/server-filesystem", "./products", "./factory/workspaces", "./factory/artifacts"]
+tool_aliases = ["filesystem_read", "workspace_write", "artifact_writer"]
+
+[[mcp.servers]]
+name         = "memory"
+command      = "npx"
+args         = ["-y", "@modelcontextprotocol/server-memory"]
+tool_aliases = ["memory_store", "metadata_query"]
+
+[[mcp.servers]]
+name         = "sqlite"
+command      = "npx"
+args         = ["-y", "@modelcontextprotocol/server-sqlite", "./factory/state.db"]
+tool_aliases = ["db_read"]
+
+[[mcp.servers]]
+name         = "github"
+command      = "npx"
+args         = ["-y", "@modelcontextprotocol/server-github"]
+env          = { GITHUB_PERSONAL_ACCESS_TOKEN = "GITHUB_TOKEN" }
+tool_aliases = ["fetch_docs", "github_read"]
+
+[[mcp.servers]]
+name         = "brave-search"
+command      = "npx"
+args         = ["-y", "@modelcontextprotocol/server-brave-search"]
+env          = { BRAVE_API_KEY = "BRAVE_API_KEY" }
+tool_aliases = ["web_search"]
