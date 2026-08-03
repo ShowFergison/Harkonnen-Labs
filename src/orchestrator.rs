@@ -8036,28 +8036,14 @@ Respond with a single JSON object only — no prose, no markdown, no explanation
             temperature: 0.1,
         };
 
-        // Wraps `provider` so the usage of whichever attempt actually produced a
-        // response can still be reported for tracing and cost accounting, even
-        // though `complete_edit_proposal_with_retry` itself only returns the raw
-        // body (it may make more than one call under the hood).
-        struct UsageTrackingProvider<'a> {
-            inner: &'a dyn crate::llm::LlmProvider,
-            last_usage: std::sync::Mutex<Option<crate::llm::LlmUsage>>,
-        }
-        #[async_trait::async_trait]
-        impl<'a> crate::llm::LlmProvider for UsageTrackingProvider<'a> {
-            async fn complete(&self, req: LlmRequest) -> Result<crate::llm::LlmResponse> {
-                let response = self.inner.complete(req).await?;
-                if let Some(usage) = response.usage.clone() {
-                    *self.last_usage.lock().expect("lock") = Some(usage);
-                }
-                Ok(response)
-            }
-        }
-
+        // Wraps `provider` so the usage of every attempt actually made can still be
+        // reported for tracing and cost accounting, even though
+        // `complete_edit_proposal_with_retry` itself only returns the raw body (it
+        // may make more than one call under the hood, and a retry means two real,
+        // separately billed calls).
         let usage_tracker = UsageTrackingProvider {
             inner: provider.as_ref(),
-            last_usage: std::sync::Mutex::new(None),
+            usage_total: std::sync::Mutex::new(None),
         };
         let (parsed, raw_body) = complete_edit_proposal_with_retry(&usage_tracker, req, 2).await;
 
@@ -8065,7 +8051,7 @@ Respond with a single JSON object only — no prose, no markdown, no explanation
         let raw_response_path = run_dir.join("mason_raw_response.txt");
         let _ = tokio::fs::write(&raw_response_path, &raw_body).await;
 
-        let last_usage = usage_tracker.last_usage.lock().expect("lock").clone();
+        let total_usage = usage_tracker.usage_total.lock().expect("lock").clone();
         if !raw_body.is_empty() {
             let (reasoning, _edit_body) = extract_reasoning(&raw_body);
             let edit_actions = vec![format!("generate file edits for spec '{}'", spec_obj.id)];
@@ -8077,10 +8063,10 @@ Respond with a single JSON object only — no prose, no markdown, no explanation
                 &reasoning,
                 &edit_actions,
                 "success",
-                last_usage.as_ref(),
+                total_usage.as_ref(),
             )
             .await;
-            if let Some(usage) = &last_usage {
+            if let Some(usage) = &total_usage {
                 let provider_label = self
                     .paths
                     .setup
@@ -8093,17 +8079,25 @@ Respond with a single JSON object only — no prose, no markdown, no explanation
         let proposal = match parsed {
             Ok(proposal) => proposal,
             Err(error) => {
-                let preview: String = raw_body.chars().take(500).collect();
+                let summary = if raw_body.is_empty() {
+                    format!(
+                        "Mason edit lane failed before any response was received: {}",
+                        error
+                    )
+                } else {
+                    let preview: String = raw_body.chars().take(500).collect();
+                    format!(
+                        "Mason edit lane produced an invalid JSON edit proposal: {}\nRaw response preview: {}",
+                        error, preview
+                    )
+                };
                 let application = MasonEditApplicationArtifact {
                     run_id: run_id.to_string(),
                     spec_id: spec_obj.id.clone(),
                     product: target_source.label.clone(),
                     generated_at: Utc::now().to_rfc3339(),
                     status: "invalid_llm_edit_response".to_string(),
-                    summary: format!(
-                        "Mason edit lane produced an invalid JSON edit proposal: {}\nRaw response preview: {}",
-                        error, preview
-                    ),
+                    summary,
                     proposal_generated: false,
                     changed_files: Vec::new(),
                     git_branch: None,
@@ -28963,6 +28957,35 @@ async fn complete_edit_proposal_with_retry(
     )
 }
 
+/// Wraps an `LlmProvider` so every attempt's usage is accumulated rather than
+/// only the last one kept. `complete_edit_proposal_with_retry` may issue more
+/// than one real, separately billed call on a retry — summing here is what
+/// makes the eventual cost event reflect the true number of tokens spent, not
+/// just the tokens of whichever attempt happened to parse.
+struct UsageTrackingProvider<'a> {
+    inner: &'a dyn crate::llm::LlmProvider,
+    usage_total: std::sync::Mutex<Option<crate::llm::LlmUsage>>,
+}
+
+#[async_trait::async_trait]
+impl<'a> crate::llm::LlmProvider for UsageTrackingProvider<'a> {
+    async fn complete(&self, req: crate::llm::LlmRequest) -> Result<crate::llm::LlmResponse> {
+        let response = self.inner.complete(req).await?;
+        if let Some(usage) = response.usage.clone() {
+            let mut total = self.usage_total.lock().expect("lock");
+            *total = Some(match total.take() {
+                Some(existing) => crate::llm::LlmUsage {
+                    input_tokens: existing.input_tokens + usage.input_tokens,
+                    output_tokens: existing.output_tokens + usage.output_tokens,
+                    latency_ms: existing.latency_ms + usage.latency_ms,
+                },
+                None => usage,
+            });
+        }
+        Ok(response)
+    }
+}
+
 fn copy_tree_contents(source_root: &Path, current: &Path, destination_root: &Path) -> Result<()> {
     for entry in
         std::fs::read_dir(current).with_context(|| format!("reading {}", current.display()))?
@@ -31937,6 +31960,65 @@ mod tests {
             "the retry must carry the parse failure back to the model, got: {}",
             calls[1]
         );
+    }
+
+    #[tokio::test]
+    async fn usage_tracking_provider_accumulates_usage_across_retries() {
+        struct TwoAttemptProvider {
+            calls: std::sync::Mutex<u32>,
+        }
+        #[async_trait::async_trait]
+        impl crate::llm::LlmProvider for TwoAttemptProvider {
+            async fn complete(
+                &self,
+                _req: crate::llm::LlmRequest,
+            ) -> Result<crate::llm::LlmResponse> {
+                let mut calls = self.calls.lock().expect("lock");
+                *calls += 1;
+                let content = if *calls == 1 {
+                    "{\"summary\":\"x\",\"edits\":[".to_string()
+                } else {
+                    r#"{"summary":"ok","rationale":[],"edits":[{"path":"js/a.js","action":"write","summary":"s","content":"x"}]}"#.to_string()
+                };
+                Ok(crate::llm::LlmResponse {
+                    content,
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        latency_ms: 10,
+                    }),
+                })
+            }
+        }
+
+        let inner = TwoAttemptProvider {
+            calls: std::sync::Mutex::new(0),
+        };
+        let tracker = UsageTrackingProvider {
+            inner: &inner,
+            usage_total: std::sync::Mutex::new(None),
+        };
+        let req = crate::llm::LlmRequest {
+            messages: vec![crate::llm::Message::user("edit please".to_string())],
+            max_tokens: 4000,
+            temperature: 0.1,
+        };
+
+        let (result, _raw) = complete_edit_proposal_with_retry(&tracker, req, 2).await;
+        result.expect("second attempt must succeed");
+
+        let total = tracker
+            .usage_total
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("usage must have been recorded");
+        assert_eq!(
+            total.input_tokens, 200,
+            "usage must accumulate across both attempts, not just track the last one"
+        );
+        assert_eq!(total.output_tokens, 100);
+        assert_eq!(total.latency_ms, 20);
     }
 
     /// Both malformations Gemini produced in one response: bare object keys
