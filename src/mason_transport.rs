@@ -142,6 +142,95 @@ pub fn parse_fenced_edits(raw: &str) -> Result<FencedEnvelope> {
     })
 }
 
+pub const PATCH_FORMAT_INSTRUCTION: &str = "\
+When changing an existing file, emit a patch rather than the whole file:
+
+### PATCH: <relative/path>
+<<<<<<< SEARCH
+<text to find, copied exactly from the current file>
+=======
+<text to put in its place>
+>>>>>>> REPLACE
+
+The SEARCH text must appear exactly once in the file, copied character for \
+character including indentation. Use a whole ### FILE: block instead when \
+creating a new file.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchBlock {
+    pub path: String,
+    pub search: String,
+    pub replace: String,
+}
+
+/// Exact match only, and it must be unique. A fuzzy matcher would apply more
+/// patches, and would sometimes apply them in the wrong place — which is
+/// unrecoverable once written. Refusing costs a retry; guessing costs the file.
+pub fn apply_patch_block(original: &str, block: &PatchBlock) -> Result<String> {
+    if block.search.is_empty() {
+        bail!("patch for {} has an empty SEARCH section", block.path);
+    }
+    let occurrences = original.matches(block.search.as_str()).count();
+    match occurrences {
+        0 => bail!(
+            "patch for {} did not match: the SEARCH text is not present in the file",
+            block.path
+        ),
+        1 => Ok(original.replacen(block.search.as_str(), &block.replace, 1)),
+        n => bail!(
+            "patch for {} is ambiguous: the SEARCH text matched {n} times, so the target is \
+             unclear. Include more surrounding context to make it unique.",
+            block.path
+        ),
+    }
+}
+
+pub fn parse_patch_blocks(raw: &str) -> Result<Vec<PatchBlock>> {
+    const PATCH_MARKER: &str = "### PATCH:";
+    const SEARCH_START: &str = "<<<<<<< SEARCH";
+    const DIVIDER: &str = "=======";
+    const REPLACE_END: &str = ">>>>>>> REPLACE";
+
+    let mut blocks = Vec::new();
+    let mut path: Option<String> = None;
+    let mut search: Vec<String> = Vec::new();
+    let mut replace: Vec<String> = Vec::new();
+    let mut section = 0u8; // 0 outside, 1 in SEARCH, 2 in REPLACE
+
+    for line in raw.lines() {
+        let trimmed = line.trim_end();
+        if let Some(rest) = trimmed.trim().strip_prefix(PATCH_MARKER) {
+            path = Some(rest.trim().to_string());
+            search.clear();
+            replace.clear();
+            section = 0;
+        } else if trimmed.trim() == SEARCH_START {
+            section = 1;
+        } else if trimmed.trim() == DIVIDER && section == 1 {
+            section = 2;
+        } else if trimmed.trim() == REPLACE_END && section == 2 {
+            let Some(current_path) = path.clone() else {
+                bail!("a patch block closed without a preceding {PATCH_MARKER} line");
+            };
+            blocks.push(PatchBlock {
+                path: current_path,
+                search: search.join("\n"),
+                replace: replace.join("\n"),
+            });
+            section = 0;
+        } else if section == 1 {
+            search.push(line.to_string());
+        } else if section == 2 {
+            replace.push(line.to_string());
+        }
+    }
+
+    if section != 0 {
+        bail!("a patch block was never closed with {REPLACE_END} — the response was cut off");
+    }
+    Ok(blocks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +360,51 @@ The bonus room ("Dad's Workshop") is optional.
             error_msg.contains("while the") && error_msg.contains("still open"),
             "should report nested marker, got: {error_msg}"
         );
+    }
+
+    #[test]
+    fn patch_block_replaces_an_exact_region() {
+        let original = "line a\nline b\nline c\n";
+        let block = PatchBlock {
+            path: "js/a.js".to_string(),
+            search: "line b".to_string(),
+            replace: "line B1\nline B2".to_string(),
+        };
+
+        let patched = apply_patch_block(original, &block).expect("must apply");
+
+        assert_eq!(patched, "line a\nline B1\nline B2\nline c\n");
+    }
+
+    #[test]
+    fn patch_block_refuses_when_the_search_text_is_absent() {
+        let block = PatchBlock {
+            path: "js/a.js".to_string(),
+            search: "nowhere".to_string(),
+            replace: "x".to_string(),
+        };
+        let error = apply_patch_block("line a\n", &block).expect_err("must refuse");
+        assert!(format!("{error:#}").contains("did not match"));
+    }
+
+    #[test]
+    fn patch_block_refuses_an_ambiguous_match() {
+        let block = PatchBlock {
+            path: "js/a.js".to_string(),
+            search: "dup".to_string(),
+            replace: "x".to_string(),
+        };
+        let error = apply_patch_block("dup\ndup\n", &block).expect_err("must refuse");
+        assert!(format!("{error:#}").contains("matched 2 times"));
+    }
+
+    #[test]
+    fn patch_blocks_parse_from_the_wire_format() {
+        let raw = "### PATCH: js/a.js\n<<<<<<< SEARCH\nline b\n=======\nline B\n>>>>>>> REPLACE\n";
+        let blocks = parse_patch_blocks(raw).expect("must parse");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].path, "js/a.js");
+        assert_eq!(blocks[0].search, "line b");
+        assert_eq!(blocks[0].replace, "line B");
     }
 }
