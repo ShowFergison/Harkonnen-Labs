@@ -54,6 +54,48 @@ impl FencedEnvelope {
     }
 }
 
+/// Tracks whether the line currently being scanned lies inside a `### FILE:`
+/// … `### END FILE` or `### PATCH:` … `>>>>>>> REPLACE` block body, as opposed
+/// to being a header/closer line or ordinary top-level text. Each block only
+/// closes on the marker that actually opened it — a `>>>>>>> REPLACE` line
+/// quoted inside a `### FILE:` block's documentation content does not
+/// prematurely end that FILE block, and vice versa.
+///
+/// This is a best-effort scanner, not a structural validator: `parse_fenced_edits`
+/// and `parse_patch_blocks` remain the source of truth for whether the blocks
+/// themselves are well-formed. Shared by `parse_summary_and_rationale` and
+/// `has_top_level_patch_header` — one block-tracking implementation, so the
+/// two functions can never disagree about what counts as "inside a block."
+struct BlockTracker {
+    closing_marker: Option<&'static str>,
+}
+
+impl BlockTracker {
+    fn new() -> Self {
+        Self {
+            closing_marker: None,
+        }
+    }
+
+    /// Feed the next trimmed line. Returns `true` if this line lies outside
+    /// any block body (a header line, a closer line, or top-level text), and
+    /// `false` if it lies inside one.
+    fn consume(&mut self, trimmed: &str) -> bool {
+        if let Some(closer) = self.closing_marker {
+            if trimmed == closer {
+                self.closing_marker = None;
+            }
+            return false;
+        }
+        if trimmed.strip_prefix(FILE_MARKER).is_some() {
+            self.closing_marker = Some(END_MARKER);
+        } else if trimmed.strip_prefix(PATCH_HEADER_MARKER).is_some() {
+            self.closing_marker = Some(REPLACE_END_MARKER);
+        }
+        true
+    }
+}
+
 /// Extracts `SUMMARY:` and `RATIONALE:` header lines independent of any
 /// `### FILE:` or `### PATCH:` block. Shared by `parse_fenced_edits` and the
 /// patch transport so summary/rationale extraction never diverges between
@@ -61,33 +103,23 @@ impl FencedEnvelope {
 /// exist) is not silently treated as carrying no summary or rationale just
 /// because it has no `### FILE:` block for the old, file-block-gated logic
 /// to key off of.
-///
-/// This is a best-effort scanner, not a structural validator: `parse_fenced_edits`
-/// and `parse_patch_blocks` are the source of truth for whether the blocks
-/// themselves are well-formed. This function only needs to skip over block
-/// bodies well enough that stray '- ' lines or metadata-looking lines inside
-/// file/patch content are not misread as rationale items.
 pub fn parse_summary_and_rationale(raw: &str) -> (String, Vec<String>) {
     let mut summary = String::new();
     let mut rationale = Vec::new();
     let mut in_rationale = false;
-    let mut in_block = false;
+    let mut tracker = BlockTracker::new();
 
     for line in raw.split('\n') {
         let line_for_markers = line.trim_end_matches('\r');
         let trimmed = line_for_markers.trim();
 
-        if in_block {
-            if trimmed == END_MARKER || trimmed == REPLACE_END_MARKER {
-                in_block = false;
-            }
+        if !tracker.consume(trimmed) {
             continue;
         }
 
         if trimmed.strip_prefix(FILE_MARKER).is_some()
             || trimmed.strip_prefix(PATCH_HEADER_MARKER).is_some()
         {
-            in_block = true;
             in_rationale = false;
             continue;
         }
@@ -105,6 +137,30 @@ pub fn parse_summary_and_rationale(raw: &str) -> (String, Vec<String>) {
     }
 
     (summary, rationale)
+}
+
+/// True only when a `### PATCH:` header appears outside of any `### FILE:` …
+/// `### END FILE` block — i.e. as a real patch, not as text quoted inside a
+/// whole file's documentation content. `PATCH_FORMAT_INSTRUCTION` is itself a
+/// complete example patch block and now appears in every Mason system
+/// prompt, so a model writing documentation that quotes it back is not a
+/// contrived case: a naive `raw.contains("### PATCH:")` check would treat
+/// that quoted example as a real patch and reject (or misparse) an otherwise
+/// valid whole-file response.
+pub fn has_top_level_patch_header(raw: &str) -> bool {
+    let mut tracker = BlockTracker::new();
+
+    for line in raw.split('\n') {
+        let line_for_markers = line.trim_end_matches('\r');
+        let trimmed = line_for_markers.trim();
+
+        let is_top_level = tracker.consume(trimmed);
+        if is_top_level && trimmed.strip_prefix(PATCH_HEADER_MARKER).is_some() {
+            return true;
+        }
+    }
+
+    false
 }
 
 pub fn parse_fenced_edits(raw: &str) -> Result<FencedEnvelope> {
@@ -510,6 +566,41 @@ The bonus room ("Dad's Workshop") is optional.
         assert_eq!(blocks[0].path, "js/a.js");
         assert_eq!(blocks[0].search, "line b");
         assert_eq!(blocks[0].replace, "line B");
+    }
+
+    #[test]
+    fn has_top_level_patch_header_detects_a_real_patch() {
+        let raw =
+            "SUMMARY: x\n\n### PATCH: js/a.js\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n";
+        assert!(has_top_level_patch_header(raw));
+    }
+
+    #[test]
+    fn has_top_level_patch_header_ignores_a_patch_quoted_inside_a_file_block() {
+        // The exact failure mode this function exists to prevent: PATCH_FORMAT_INSTRUCTION
+        // is a complete example patch block, and it now appears in every Mason
+        // system prompt, so a whole-file response documenting or quoting it
+        // back must not be mistaken for a real patch.
+        let raw = format!(
+            "SUMMARY: docs\n\n### FILE: docs/PATCHES.md\n{}\n### END FILE\n",
+            PATCH_FORMAT_INSTRUCTION
+        );
+        assert!(
+            !has_top_level_patch_header(&raw),
+            "a ### PATCH: line quoted inside a ### FILE: block must not count as top-level"
+        );
+    }
+
+    #[test]
+    fn has_top_level_patch_header_is_false_with_no_patch_marker_at_all() {
+        let raw = "SUMMARY: x\n\n### FILE: a.txt\ncontent\n### END FILE\n";
+        assert!(!has_top_level_patch_header(raw));
+    }
+
+    #[test]
+    fn has_top_level_patch_header_still_finds_a_real_patch_after_a_file_block() {
+        let raw = "SUMMARY: x\n\n### FILE: a.txt\ncontent\n### END FILE\n\n### PATCH: b.js\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n";
+        assert!(has_top_level_patch_header(raw));
     }
 
     #[test]

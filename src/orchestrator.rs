@@ -28922,13 +28922,24 @@ fn validate_mason_edits(edits: &[MasonEdit]) -> Result<()> {
     // every transport — two `### PATCH:` blocks on one path, two `### FILE:`
     // blocks on one path, a patch and a file on one path, or duplicate JSON
     // entries — because every one of them routes through this function.
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    //
+    // Every transport already normalizes `edit.path` at construction (via
+    // `normalize_project_path`), so a patch for `./js/hints.js` and a
+    // `### FILE:` block for `js/hints.js` collapse to the same string before
+    // they ever reach here. Normalizing again here too is deliberate
+    // defense-in-depth, not the primary fix: relying on comparison-site
+    // normalization alone would leave every *other* consumer of these paths
+    // (the apply loop, delta reporting) still working from the divergent,
+    // unnormalized strings.
+    let mut counts: HashMap<String, usize> = HashMap::new();
     for edit in edits {
-        *counts.entry(edit.path.trim()).or_insert(0) += 1;
+        *counts
+            .entry(normalize_project_path(edit.path.trim()))
+            .or_insert(0) += 1;
     }
     for edit in edits {
-        let path = edit.path.trim();
-        if let Some(&count) = counts.get(path) {
+        let path = normalize_project_path(edit.path.trim());
+        if let Some(&count) = counts.get(&path) {
             if count > 1 {
                 bail!(
                     "Mason proposed {count} edits all targeting {path:?} — refusing to apply, \
@@ -28993,13 +29004,24 @@ fn parse_mason_edit_proposal(raw: &str) -> Result<MasonEditProposal> {
         .map(MasonRationaleEntry::into_text)
         .collect::<Vec<_>>();
 
-    validate_mason_edits(&raw_proposal.edits)?;
+    // Normalize every path at construction, before validation ever sees it.
+    // The duplicate-path check in `validate_mason_edits` compares raw strings
+    // — if this transport left a path as `./js/hints.js` while another
+    // transport's edit for the same file read `js/hints.js`, the two would
+    // look distinct, pass validation, and silently collide on disk once both
+    // got normalized at apply time.
+    let mut edits = raw_proposal.edits;
+    for edit in edits.iter_mut() {
+        edit.path = normalize_project_path(&edit.path);
+    }
+
+    validate_mason_edits(&edits)?;
 
     // An empty `edits` list parses cleanly but is not a proposal — it is the
     // model declining to edit. Say which of the two it was, because "the model
     // planned instead of editing" and "the model returned nothing" call for
     // different responses from the operator.
-    if raw_proposal.edits.is_empty() {
+    if edits.is_empty() {
         if planned_reads > 0 {
             bail!(
                 "Mason returned a plan to inspect {planned_reads} file(s) rather than any edits. \
@@ -29017,7 +29039,7 @@ fn parse_mason_edit_proposal(raw: &str) -> Result<MasonEditProposal> {
     Ok(MasonEditProposal {
         summary: raw_proposal.summary,
         rationale,
-        edits: raw_proposal.edits,
+        edits,
     })
 }
 
@@ -29031,7 +29053,7 @@ fn parse_mason_edit_response(raw: &str) -> Result<MasonEditProposal> {
             let edits = files
                 .into_iter()
                 .map(|(path, content)| MasonEdit {
-                    path,
+                    path: normalize_project_path(&path),
                     action: "write".to_string(),
                     summary: String::new(),
                     content,
@@ -29060,15 +29082,23 @@ fn parse_mason_edit_response_with_staged(
     staged_product: &Path,
 ) -> Result<MasonEditProposal> {
     // A syntactic pre-check, not a swallowed error: only treat this as a pure
-    // whole-file response when the raw text contains no patch marker at all.
-    // Once `### PATCH:` is present, `parse_patch_blocks` runs as a single
+    // whole-file response when the raw text contains no *top-level* patch
+    // marker. Once one is present, `parse_patch_blocks` runs as a single
     // state machine over the whole response — a grammar violation anywhere
     // fails the entire parse, and that failure must propagate. Silently
     // falling back to `parse_mason_edit_response` here previously let a
     // malformed patch hide behind an accompanying, valid `### FILE:` block:
     // the fenced parse would succeed, and the model's intended patch vanished
     // with no error anywhere.
-    if !raw.contains("### PATCH:") {
+    //
+    // A plain `raw.contains("### PATCH:")` is not enough: `PATCH_FORMAT_INSTRUCTION`
+    // is itself a complete example patch block and appears in every Mason
+    // system prompt, so a whole-file response that merely documents or quotes
+    // the format (plausible in a repo whose own source contains that string)
+    // would trip a naive substring check and be wrongly rejected, forever, on
+    // every retry. `has_top_level_patch_header` only matches a `### PATCH:`
+    // line that is not itself inside a `### FILE:` block's content.
+    if !crate::mason_transport::has_top_level_patch_header(raw) {
         return parse_mason_edit_response(raw);
     }
 
@@ -29100,11 +29130,16 @@ fn parse_mason_edit_response_with_staged(
     let (summary, rationale) = crate::mason_transport::parse_summary_and_rationale(raw);
 
     // Whole-file blocks may accompany patches — new files cannot be patched.
+    // Normalized at construction, same as the patch-derived edits above, so a
+    // `### FILE:` block and a `### PATCH:` block naming the same real file
+    // under different spellings (`./js/hints.js` vs `js/hints.js`) still
+    // collide in `validate_mason_edits` instead of slipping past it as two
+    // distinct paths.
     if let Ok(envelope) = crate::mason_transport::parse_fenced_edits(raw) {
         let (_envelope_summary, _envelope_rationale, files) = envelope.into_edits();
         for (path, content) in files {
             edits.push(MasonEdit {
-                path,
+                path: normalize_project_path(&path),
                 action: "write".to_string(),
                 summary: String::new(),
                 content,
@@ -32271,19 +32306,48 @@ mod tests {
 
     #[test]
     fn a_patch_and_a_file_block_on_the_same_path_are_rejected() {
+        // Deliberately uses different spellings of the same real file
+        // (`./hints.js` vs `hints.js`) — a test that used byte-identical
+        // spellings on both sides would pass even with the path-normalization
+        // gap present, since exact-string duplicate detection alone already
+        // caught that case. This is the case that actually exercises
+        // normalize-before-compare.
         let dir = tempfile::tempdir().expect("tempdir");
         let staged = dir.path();
         std::fs::write(staged.join("hints.js"), "line a\n").expect("write");
 
-        let raw = "SUMMARY: x\n\n### PATCH: hints.js\n<<<<<<< SEARCH\nline a\n=======\nLINE A\n>>>>>>> REPLACE\n\n### FILE: hints.js\nwhole new content\n### END FILE\n";
+        let raw = "SUMMARY: x\n\n### PATCH: ./hints.js\n<<<<<<< SEARCH\nline a\n=======\nLINE A\n>>>>>>> REPLACE\n\n### FILE: hints.js\nwhole new content\n### END FILE\n";
 
-        let error = parse_mason_edit_response_with_staged(raw, staged)
-            .expect_err("a patch and a whole-file block on the same path must be refused");
+        let error = parse_mason_edit_response_with_staged(raw, staged).expect_err(
+            "a patch and a whole-file block on the same real file, spelled differently, must be refused",
+        );
         let msg = format!("{error:#}");
         assert!(
             msg.contains("hints.js"),
-            "error must name the duplicated path, got: {msg}"
+            "error must name the duplicated path (normalized), got: {msg}"
         );
+    }
+
+    #[test]
+    fn a_whole_file_response_quoting_the_patch_format_is_not_rejected() {
+        // PATCH_FORMAT_INSTRUCTION is a complete example patch block and now
+        // appears in every Mason system prompt, so a whole-file response that
+        // documents or quotes it back (plausible in a repo whose own source
+        // contains this string) must not be mistaken for a real patch by a
+        // naive substring check on "### PATCH:".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = format!(
+            "SUMMARY: document the patch format\n\n### FILE: docs/PATCHES.md\n{}\n### END FILE\n",
+            crate::mason_transport::PATCH_FORMAT_INSTRUCTION
+        );
+
+        let proposal = parse_mason_edit_response_with_staged(&raw, dir.path())
+            .expect("a whole-file response merely quoting the patch format must not be rejected");
+        assert_eq!(proposal.edits.len(), 1);
+        assert_eq!(proposal.edits[0].path, "docs/PATCHES.md");
+        assert!(proposal.edits[0]
+            .content
+            .contains("### PATCH: <relative/path>"));
     }
 
     #[test]
