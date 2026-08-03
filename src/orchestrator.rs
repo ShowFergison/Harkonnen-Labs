@@ -28883,6 +28883,28 @@ fn repair_model_json(raw: &str) -> ModelJsonRepair {
     }
 }
 
+/// Canonical key for duplicate-path detection: the sequence of real path
+/// segments (`Component::Normal` parts only — `.` and repeated/trailing
+/// separators contribute nothing, matching how the OS itself would resolve
+/// them). Two spellings of the same file — `js/hints.js`, `js//hints.js`,
+/// `js/hints.js/`, `js/./hints.js` — must collapse to the same key even
+/// though they are different strings, because they land on the same file at
+/// write time. A `..` component is deliberately *not* special-cased into an
+/// error here: `join_workspace_relative_path` already rejects any path
+/// containing one, loudly, before it is ever joined onto the staged
+/// workspace, so this key does not need to model `..`'s real filesystem
+/// semantics for a path that will never actually be written.
+fn path_dedup_key(path: &str) -> String {
+    Path::new(&normalize_project_path(path))
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Last line of defence before Mason writes to the operator's files.
 ///
 /// The repair pass above cannot always tell a string terminator from a quote
@@ -28925,24 +28947,31 @@ fn validate_mason_edits(edits: &[MasonEdit]) -> Result<()> {
     //
     // Every transport already normalizes `edit.path` at construction (via
     // `normalize_project_path`), so a patch for `./js/hints.js` and a
-    // `### FILE:` block for `js/hints.js` collapse to the same string before
-    // they ever reach here. Normalizing again here too is deliberate
-    // defense-in-depth, not the primary fix: relying on comparison-site
-    // normalization alone would leave every *other* consumer of these paths
-    // (the apply loop, delta reporting) still working from the divergent,
-    // unnormalized strings.
+    // `### FILE:` block for `js/hints.js` collapse to the same *string*
+    // before they ever reach here. But `normalize_project_path` does not
+    // collapse repeated separators, a trailing separator, or an interior `.`
+    // component, so `js//hints.js`, `js/hints.js/`, and `js/./hints.js` all
+    // still read as distinct strings from `js/hints.js` even though they are
+    // the same real file — comparing strings alone misses exactly that class
+    // of collapse. `path_dedup_key` below compares the *component sequence*
+    // instead, using the same interpretation `join_workspace_relative_path`
+    // (the function that actually joins these paths onto the staged
+    // workspace at apply time) already enforces, so the duplicate check and
+    // the write can no longer disagree about whether two paths name the same
+    // file. A path containing `..` needs no special handling here: it
+    // produces a `Component::ParentDir`, which `join_workspace_relative_path`
+    // rejects outright — loudly, before anything is written — regardless of
+    // what this key computes for it.
     let mut counts: HashMap<String, usize> = HashMap::new();
     for edit in edits {
-        *counts
-            .entry(normalize_project_path(edit.path.trim()))
-            .or_insert(0) += 1;
+        *counts.entry(path_dedup_key(&edit.path)).or_insert(0) += 1;
     }
     for edit in edits {
-        let path = normalize_project_path(edit.path.trim());
-        if let Some(&count) = counts.get(&path) {
+        let key = path_dedup_key(&edit.path);
+        if let Some(&count) = counts.get(&key) {
             if count > 1 {
                 bail!(
-                    "Mason proposed {count} edits all targeting {path:?} — refusing to apply, \
+                    "Mason proposed {count} edits all targeting {key:?} — refusing to apply, \
                      since the later edit would silently overwrite the earlier one with no \
                      signal. Combine them into a single edit."
                 );
@@ -32348,6 +32377,115 @@ mod tests {
         assert!(proposal.edits[0]
             .content
             .contains("### PATCH: <relative/path>"));
+    }
+
+    #[test]
+    fn a_real_patch_with_a_file_block_quoting_the_format_resolves_both_edits() {
+        // The deeper break behind the naive substring pre-check:
+        // parse_patch_blocks itself is a flat state machine with no
+        // ### FILE: awareness, so before this fix it would also scan the doc
+        // file's content, find the quoted PATCH_FORMAT_INSTRUCTION example
+        // (syntactically valid patch grammar), and parse it as a bogus second
+        // patch targeting the literal path "<relative/path>" — which fails to
+        // resolve and rejects the whole response, including the real patch.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+        std::fs::write(staged.join("real.js"), "line a\n").expect("write");
+
+        let raw = format!(
+            "SUMMARY: fix and document\n\n### PATCH: real.js\n<<<<<<< SEARCH\nline a\n=======\nLINE A\n>>>>>>> REPLACE\n\n### FILE: docs/PATCHES.md\n{}\n### END FILE\n",
+            crate::mason_transport::PATCH_FORMAT_INSTRUCTION
+        );
+
+        let proposal = parse_mason_edit_response_with_staged(&raw, staged).expect(
+            "a real top-level patch plus a FILE block quoting the patch format must resolve, \
+             not be rejected because of the quoted example",
+        );
+
+        assert_eq!(
+            proposal.edits.len(),
+            2,
+            "both the patch and the file must survive"
+        );
+        let real = proposal
+            .edits
+            .iter()
+            .find(|edit| edit.path == "real.js")
+            .expect("the real patch's edit must be present");
+        assert!(real.content.contains("LINE A"));
+        let docs = proposal
+            .edits
+            .iter()
+            .find(|edit| edit.path == "docs/PATCHES.md")
+            .expect("the quoting file's edit must be present");
+        assert!(docs.content.contains("### PATCH: <relative/path>"));
+    }
+
+    #[test]
+    fn double_slash_and_single_slash_spellings_of_one_path_are_rejected_as_duplicates() {
+        // Path::components() silently collapses repeated separators, so
+        // "js//hints.js" and "js/hints.js" are different strings but the same
+        // real file. normalize_project_path does not collapse this, so a
+        // string-based duplicate check misses it entirely.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+        std::fs::create_dir_all(staged.join("js")).expect("mkdir");
+        std::fs::write(staged.join("js/hints.js"), "line a\n").expect("write");
+
+        let raw = "SUMMARY: x\n\n### PATCH: js/hints.js\n<<<<<<< SEARCH\nline a\n=======\nLINE A\n>>>>>>> REPLACE\n\n### FILE: js//hints.js\nwhole new content\n### END FILE\n";
+
+        let error = parse_mason_edit_response_with_staged(raw, staged).expect_err(
+            "js//hints.js and js/hints.js name the same real file and must be rejected as duplicates",
+        );
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("hints.js"),
+            "error must name the duplicated path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_spelling_of_a_path_is_rejected_as_a_duplicate() {
+        // Same collapse as the double-slash case, from the other end:
+        // "js/hints.js/" and "js/hints.js" are the same real file.
+        // The weird spelling is deliberately carried by a ### FILE: block
+        // (rather than a second ### PATCH:) so this test exercises duplicate
+        // detection specifically, rather than incidentally failing earlier
+        // because a trailing-slash path can't be opened for read on POSIX
+        // when the target is a regular file (ENOTDIR).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+        std::fs::create_dir_all(staged.join("js")).expect("mkdir");
+        std::fs::write(staged.join("js/hints.js"), "line a\n").expect("write");
+
+        let raw = "SUMMARY: x\n\n### PATCH: js/hints.js\n<<<<<<< SEARCH\nline a\n=======\nLINE A\n>>>>>>> REPLACE\n\n### FILE: js/hints.js/\nwhole new content\n### END FILE\n";
+
+        let error = parse_mason_edit_response_with_staged(raw, staged).expect_err(
+            "js/hints.js/ and js/hints.js name the same real file and must be rejected as duplicates",
+        );
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("hints.js"),
+            "error must name the duplicated path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_parent_dir_component_is_rejected_loudly_by_the_containment_guard() {
+        // Pinning the coordinator's correction: ".." is not a silent clobber.
+        // join_workspace_relative_path -- the same function both the
+        // validation loop and the write loop in mason_generate_and_apply_edits
+        // use to resolve an edit's path onto the staged workspace -- bails on
+        // any non-Normal path component, so a ".." escape attempt fails
+        // loudly, before anything is written, rather than being silently
+        // resolved or silently colliding with another edit.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = join_workspace_relative_path(dir.path(), "js/sub/../hints.js")
+            .expect_err("a path containing .. must be rejected, not silently resolved");
+        assert!(
+            format!("{error:#}").contains("escapes"),
+            "expected the containment guard's error, got: {error:#}"
+        );
     }
 
     #[test]

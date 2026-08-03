@@ -63,17 +63,44 @@ impl FencedEnvelope {
 ///
 /// This is a best-effort scanner, not a structural validator: `parse_fenced_edits`
 /// and `parse_patch_blocks` remain the source of truth for whether the blocks
-/// themselves are well-formed. Shared by `parse_summary_and_rationale` and
-/// `has_top_level_patch_header` — one block-tracking implementation, so the
-/// two functions can never disagree about what counts as "inside a block."
+/// themselves are well-formed. Shared by three consumers —
+/// `parse_summary_and_rationale`, `has_top_level_patch_header`, and
+/// `parse_patch_blocks` — one block-tracking implementation, so none of them
+/// can disagree about what counts as "inside a block." `parse_patch_blocks`
+/// uses `file_blocks_only()`: it already owns `### PATCH:` block internals
+/// via its own SEARCH/REPLACE section state machine, so this tracker must
+/// not also treat `### PATCH:` as an opener for it — doing so would cause a
+/// *real* top-level patch's own body lines to be skipped here as if they
+/// were block content, when they need to reach that state machine instead.
+///
+/// Coupling note: this tracker and `parse_fenced_edits` agree on the FILE
+/// block closing rule only because both hardcode the literal `### END FILE`
+/// (via the shared `END_MARKER` constant). Nothing besides that shared
+/// constant enforces the agreement — if `parse_fenced_edits`'s own
+/// file-block-building loop ever changes what it accepts as a closer, this
+/// tracker must change with it.
 struct BlockTracker {
     closing_marker: Option<&'static str>,
+    recognize_patch_headers: bool,
 }
 
 impl BlockTracker {
+    /// Tracks both `### FILE:` and `### PATCH:` blocks — for consumers that
+    /// need to skip over either kind of block indiscriminately.
     fn new() -> Self {
         Self {
             closing_marker: None,
+            recognize_patch_headers: true,
+        }
+    }
+
+    /// Tracks only `### FILE:` blocks, leaving `### PATCH:` headers and
+    /// bodies untouched — for `parse_patch_blocks`, which must keep
+    /// processing those lines itself rather than have them skipped here too.
+    fn file_blocks_only() -> Self {
+        Self {
+            closing_marker: None,
+            recognize_patch_headers: false,
         }
     }
 
@@ -89,7 +116,9 @@ impl BlockTracker {
         }
         if trimmed.strip_prefix(FILE_MARKER).is_some() {
             self.closing_marker = Some(END_MARKER);
-        } else if trimmed.strip_prefix(PATCH_HEADER_MARKER).is_some() {
+        } else if self.recognize_patch_headers
+            && trimmed.strip_prefix(PATCH_HEADER_MARKER).is_some()
+        {
             self.closing_marker = Some(REPLACE_END_MARKER);
         }
         true
@@ -167,6 +196,15 @@ pub fn parse_fenced_edits(raw: &str) -> Result<FencedEnvelope> {
     let (summary, rationale) = parse_summary_and_rationale(raw);
     let mut files = Vec::new();
 
+    // This loop implements its own FILE-block open/close tracking (`current`)
+    // rather than going through `BlockTracker`, because it also needs to
+    // accumulate the body content and raise the specific errors below —
+    // `BlockTracker` only reports in/out. It agrees with `BlockTracker` on
+    // what closes a FILE block only because both compare against the same
+    // `END_MARKER` constant; that constant is the entire coupling. If this
+    // loop's notion of "closed" ever changes, `BlockTracker` (and therefore
+    // `parse_summary_and_rationale`, `has_top_level_patch_header`, and
+    // `parse_patch_blocks`'s FILE-block skipping) must change with it.
     let mut current: Option<(String, Vec<String>)> = None;
 
     // Split on \n but preserve original lines (including trailing \r for CRLF)
@@ -310,11 +348,26 @@ pub fn parse_patch_blocks(raw: &str) -> Result<Vec<PatchBlock>> {
     let mut replace: Vec<String> = Vec::new();
     let mut section = 0u8; // 0 outside, 1 in SEARCH, 2 in REPLACE
 
+    // This state machine is a flat scan over the whole response with no
+    // awareness of `### FILE:` boundaries on its own — patch markers inside
+    // a file block's body are content, not structure, so they must never
+    // reach the checks below. A `### FILE:` block that documents or quotes
+    // PATCH_FORMAT_INSTRUCTION (syntactically valid patch grammar, sitting
+    // right there as file content) would otherwise be parsed as a second,
+    // bogus patch and reject the entire response, permanently, alongside a
+    // real top-level patch in the same reply.
+    let mut file_tracker = BlockTracker::file_blocks_only();
+
     for (line_idx, line) in raw.lines().enumerate() {
         let line_num = line_idx + 1;
         let trimmed = line.trim_end();
+        let marker_trim = trimmed.trim();
 
-        if let Some(rest) = trimmed.trim().strip_prefix(PATCH_MARKER) {
+        if !file_tracker.consume(marker_trim) {
+            continue;
+        }
+
+        if let Some(rest) = marker_trim.strip_prefix(PATCH_MARKER) {
             // Guard: no new patch while one is open (section != 0)
             if section != 0 {
                 let prev_path = path.as_ref().map(|p| p.as_str()).unwrap_or("(unknown)");
@@ -328,7 +381,7 @@ pub fn parse_patch_blocks(raw: &str) -> Result<Vec<PatchBlock>> {
             search.clear();
             replace.clear();
             section = 0;
-        } else if trimmed.trim() == SEARCH_START {
+        } else if marker_trim == SEARCH_START {
             // Guard: SEARCH marker only valid outside a block (section == 0)
             if section != 0 {
                 bail!(
@@ -337,7 +390,7 @@ pub fn parse_patch_blocks(raw: &str) -> Result<Vec<PatchBlock>> {
                 );
             }
             section = 1;
-        } else if trimmed.trim() == DIVIDER {
+        } else if marker_trim == DIVIDER {
             // Guard: divider only valid in SEARCH section (section == 1)
             if section == 1 {
                 section = 2;
@@ -352,7 +405,7 @@ pub fn parse_patch_blocks(raw: &str) -> Result<Vec<PatchBlock>> {
                      expected only after {SEARCH_START}"
                 );
             }
-        } else if trimmed.trim() == REPLACE_END {
+        } else if marker_trim == REPLACE_END {
             // Guard: terminator only valid in REPLACE section (section == 2)
             if section == 2 {
                 let Some(current_path) = path.clone() else {
