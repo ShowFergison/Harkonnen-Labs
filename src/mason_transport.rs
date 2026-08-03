@@ -154,7 +154,18 @@ When changing an existing file, emit a patch rather than the whole file:
 
 The SEARCH text must appear exactly once in the file, copied character for \
 character including indentation. Use a whole ### FILE: block instead when \
-creating a new file.";
+creating a new file.
+
+IMPORTANT: The SEARCH and REPLACE sections must not contain lines that consist \
+solely of '<<<<<<< SEARCH', '=======', or '>>>>>>> REPLACE', nor may they start \
+with '### PATCH:' — the parser cannot distinguish such lines from real delimiters. \
+If a file contains these lines, use a whole ### FILE: block instead of a patch.
+
+IMPORTANT: The format cannot express a trailing newline in the REPLACE section. \
+To delete a line, include an adjacent line as context in both SEARCH and REPLACE. \
+For example, to delete 'line 2' from a three-line file, search for 'line 1\\nline 2' \
+and replace with 'line 1' — do not search for just 'line 2' and replace with empty, \
+which would leave a blank line.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatchBlock {
@@ -197,27 +208,74 @@ pub fn parse_patch_blocks(raw: &str) -> Result<Vec<PatchBlock>> {
     let mut replace: Vec<String> = Vec::new();
     let mut section = 0u8; // 0 outside, 1 in SEARCH, 2 in REPLACE
 
-    for line in raw.lines() {
+    for (line_idx, line) in raw.lines().enumerate() {
+        let line_num = line_idx + 1;
         let trimmed = line.trim_end();
+
         if let Some(rest) = trimmed.trim().strip_prefix(PATCH_MARKER) {
+            // Guard: no new patch while one is open (section != 0)
+            if section != 0 {
+                let prev_path = path.as_ref().map(|p| p.as_str()).unwrap_or("(unknown)");
+                let new_path = rest.trim();
+                bail!(
+                    "line {line_num}: a new patch header appeared while the block for \
+                     {prev_path:?} was still open — found {PATCH_MARKER} {new_path:?}"
+                );
+            }
             path = Some(rest.trim().to_string());
             search.clear();
             replace.clear();
             section = 0;
         } else if trimmed.trim() == SEARCH_START {
+            // Guard: SEARCH marker only valid outside a block (section == 0)
+            if section != 0 {
+                bail!(
+                    "line {line_num}: found {SEARCH_START} inside an open block (section {section}), \
+                     expected only at the start of a new block"
+                );
+            }
             section = 1;
-        } else if trimmed.trim() == DIVIDER && section == 1 {
-            section = 2;
-        } else if trimmed.trim() == REPLACE_END && section == 2 {
-            let Some(current_path) = path.clone() else {
-                bail!("a patch block closed without a preceding {PATCH_MARKER} line");
-            };
-            blocks.push(PatchBlock {
-                path: current_path,
-                search: search.join("\n"),
-                replace: replace.join("\n"),
-            });
-            section = 0;
+        } else if trimmed.trim() == DIVIDER {
+            // Guard: divider only valid in SEARCH section (section == 1)
+            if section == 1 {
+                section = 2;
+            } else if section == 2 {
+                bail!(
+                    "line {line_num}: found a second {DIVIDER} in one patch block, \
+                     each block has exactly one divider"
+                );
+            } else {
+                bail!(
+                    "line {line_num}: found {DIVIDER} outside of SEARCH section (section {section}), \
+                     expected only after {SEARCH_START}"
+                );
+            }
+        } else if trimmed.trim() == REPLACE_END {
+            // Guard: terminator only valid in REPLACE section (section == 2)
+            if section == 2 {
+                let Some(current_path) = path.clone() else {
+                    bail!("line {line_num}: found {REPLACE_END} without a preceding {PATCH_MARKER} line");
+                };
+                blocks.push(PatchBlock {
+                    path: current_path,
+                    search: search.join("\n"),
+                    replace: replace.join("\n"),
+                });
+                path = None;
+                search.clear();
+                replace.clear();
+                section = 0;
+            } else if section == 1 {
+                bail!(
+                    "line {line_num}: found {REPLACE_END} while still in SEARCH section, \
+                     expected {DIVIDER} before {REPLACE_END}"
+                );
+            } else {
+                bail!(
+                    "line {line_num}: found {REPLACE_END} outside of any patch block (section {section}), \
+                     no open block to close"
+                );
+            }
         } else if section == 1 {
             search.push(line.to_string());
         } else if section == 2 {
@@ -406,5 +464,56 @@ The bonus room ("Dad's Workshop") is optional.
         assert_eq!(blocks[0].path, "js/a.js");
         assert_eq!(blocks[0].search, "line b");
         assert_eq!(blocks[0].replace, "line B");
+    }
+
+    #[test]
+    fn parse_patch_blocks_rejects_duplicate_divider_in_replace() {
+        // Defect 1: a second ======= inside REPLACE section should error
+        let raw = "### PATCH: js/a.js\n<<<<<<< SEARCH\nsearch\n=======\nreplace1\n=======\nmore\n>>>>>>> REPLACE\n";
+        let error = parse_patch_blocks(raw).expect_err("must reject second divider");
+        let msg = format!("{error:#}");
+        assert!(msg.contains("=======") && msg.contains("second"));
+    }
+
+    #[test]
+    fn parse_patch_blocks_rejects_stray_terminator() {
+        // Defect 2: >>>>>>> REPLACE appearing after a block closes is a stray terminator
+        let raw = "### PATCH: js/a.js\n<<<<<<< SEARCH\nsearch\n=======\nreplace\n>>>>>>> REPLACE\ntrailing\n>>>>>>> REPLACE\n";
+        let error = parse_patch_blocks(raw).expect_err("must reject stray terminator");
+        let msg = format!("{error:#}");
+        assert!(msg.contains(">>>>>>> REPLACE") || msg.contains("no open"));
+    }
+
+    #[test]
+    fn parse_patch_blocks_rejects_search_marker_in_replace_section() {
+        // Defect 3: <<<<<<< SEARCH inside REPLACE section should error
+        let raw = "### PATCH: js/a.js\n<<<<<<< SEARCH\nsearch\n=======\nline1\n<<<<<<< SEARCH\nline2\n>>>>>>> REPLACE\n";
+        let error =
+            parse_patch_blocks(raw).expect_err("must reject SEARCH marker in REPLACE section");
+        let msg = format!("{error:#}");
+        assert!(msg.contains("<<<<<<< SEARCH"));
+    }
+
+    #[test]
+    fn parse_patch_blocks_rejects_overlapping_patch_headers() {
+        // Defect 4: ### PATCH: appearing before previous block closes silently discards it
+        let raw = "### PATCH: a.js\n<<<<<<< SEARCH\nsearch a\n=======\nreplace a\n### PATCH: b.js\n<<<<<<< SEARCH\nsearch b\n=======\nreplace b\n>>>>>>> REPLACE\n";
+        let error = parse_patch_blocks(raw).expect_err("must reject overlapping blocks");
+        let msg = format!("{error:#}");
+        assert!(msg.contains("a.js") || msg.contains("while the block"));
+    }
+
+    #[test]
+    fn patch_format_cannot_express_trailing_newline() {
+        // Defect 5: The format cannot express trailing newlines; deleting a line without context leaves a blank
+        let block = PatchBlock {
+            path: "test.txt".to_string(),
+            search: "line 2".to_string(),
+            replace: "".to_string(),
+        };
+        let original = "line 1\nline 2\nline 3\n";
+        let result = apply_patch_block(original, &block).expect("must apply");
+        // Deleting "line 2" leaves a blank line because the search doesn't include the newline
+        assert_eq!(result, "line 1\n\nline 3\n");
     }
 }
