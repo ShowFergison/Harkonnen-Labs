@@ -8032,7 +8032,7 @@ Respond with a single JSON object only — no prose, no markdown, no explanation
                     repo_context_block = repo_context_block,
                 )),
             ],
-            max_tokens: 8000,
+            max_tokens: mason_edit_max_tokens(),
             temperature: 0.1,
         };
 
@@ -28582,10 +28582,294 @@ struct RawMasonEditProposal {
     edits: Vec<MasonEdit>,
 }
 
+/// Output budget for Mason's edit lane. This is not an ordinary completion:
+/// the response must carry the *entire* `content` of every file written, so it
+/// scales with the size of the change, not with how much the model has to say.
+/// The former 8000 truncated a single new ~300-line module plus two small edits
+/// — and a truncated response is indistinguishable from a malformed one
+/// downstream, so the budget failed silently.
+///
+/// Providers clamp this to their own output ceiling, so a value larger than a
+/// given model supports is harmless.
+const MASON_EDIT_MAX_TOKENS: u32 = 32_000;
+
+fn mason_edit_max_tokens() -> u32 {
+    std::env::var("MASON_EDIT_MAX_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(MASON_EDIT_MAX_TOKENS)
+}
+
+/// Outcome of scanning a model's JSON-ish response for the two malformations
+/// that show up constantly in edit proposals, plus the one condition that is
+/// not a malformation at all.
+struct ModelJsonRepair {
+    repaired: String,
+    /// The response ran out mid-value: unbalanced brackets, or ended inside a
+    /// string. Repairing this is not possible — the content is simply absent —
+    /// so it must be reported as a token-budget problem, not a format one.
+    truncated: bool,
+    quoted_keys: usize,
+    escaped_controls: usize,
+    escaped_quotes: usize,
+}
+
+/// Repair the JavaScript-object-literal habits models fall into when asked for
+/// JSON: unquoted object keys (`path: "x"`) and raw newlines inside string
+/// values instead of `\n`. Both leave a response that is complete and correct
+/// in substance but rejected by a strict parser.
+///
+/// Single pass, tracking string/escape state, so identifiers *inside* strings
+/// are never touched — the file contents Mason emits are full of `foo:` that
+/// must survive untouched.
+fn repair_model_json(raw: &str) -> ModelJsonRepair {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len() + 64);
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut depth: i32 = 0;
+    let mut quoted_keys = 0usize;
+    let mut escaped_controls = 0usize;
+    let mut escaped_quotes = 0usize;
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let ch = chars[i];
+
+        if in_string {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+            } else {
+                match ch {
+                    '\\' => {
+                        out.push(ch);
+                        escaped = true;
+                    }
+                    '"' => {
+                        // A quote inside a string value is only a terminator if
+                        // the document continues structurally after it. Models
+                        // routinely leave literal quotes unescaped inside file
+                        // content ("Dad's Workshop"), which closes the string
+                        // early and corrupts everything after it.
+                        //
+                        // Heuristic, and it can be fooled: prose ending a quoted
+                        // phrase immediately before a comma reads as a
+                        // terminator. That misfire is rarer than the failure it
+                        // fixes, and it degrades to the same parse error we
+                        // would have had anyway.
+                        let mut lookahead = i + 1;
+                        while lookahead < chars.len() && chars[lookahead].is_whitespace() {
+                            lookahead += 1;
+                        }
+                        let terminates = if lookahead >= chars.len() {
+                            true
+                        } else {
+                            match chars[lookahead] {
+                                '}' | ']' | ':' => true,
+                                // A comma alone is NOT enough. Mason's `content`
+                                // is source code, and `",` appears constantly
+                                // inside it (`lookat: "text",`). Treating those
+                                // as terminators ends the string mid-file and
+                                // then parses the code itself as JSON — which
+                                // can "succeed" and write corrupted files.
+                                // Require a real JSON key or object to follow.
+                                ',' => {
+                                    let mut after = lookahead + 1;
+                                    while after < chars.len() && chars[after].is_whitespace() {
+                                        after += 1;
+                                    }
+                                    match chars.get(after) {
+                                        Some('"') | Some('{') | None => true,
+                                        // A bare key may follow, since bare keys
+                                        // are exactly what this pass repairs.
+                                        // Indistinguishable from JS code inside a
+                                        // content string, so the guarantee that
+                                        // garbage is not applied comes from
+                                        // validate_mason_edits below, not here.
+                                        Some(c) if c.is_alphabetic() || *c == '_' => {
+                                            let mut end = after;
+                                            while end < chars.len()
+                                                && (chars[end].is_alphanumeric()
+                                                    || chars[end] == '_'
+                                                    || chars[end] == '-')
+                                            {
+                                                end += 1;
+                                            }
+                                            while end < chars.len() && chars[end].is_whitespace() {
+                                                end += 1;
+                                            }
+                                            chars.get(end) == Some(&':')
+                                        }
+                                        _ => false,
+                                    }
+                                }
+                                _ => false,
+                            }
+                        };
+                        if terminates {
+                            out.push(ch);
+                            in_string = false;
+                        } else {
+                            out.push_str("\\\"");
+                            escaped_quotes += 1;
+                        }
+                    }
+                    '\n' => {
+                        out.push_str("\\n");
+                        escaped_controls += 1;
+                    }
+                    '\r' => {
+                        out.push_str("\\r");
+                        escaped_controls += 1;
+                    }
+                    '\t' => {
+                        out.push_str("\\t");
+                        escaped_controls += 1;
+                    }
+                    control if (control as u32) < 0x20 => {
+                        out.push_str(&format!("\\u{:04x}", control as u32));
+                        escaped_controls += 1;
+                    }
+                    other => out.push(other),
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                out.push(ch);
+                in_string = true;
+                i += 1;
+            }
+            '{' | '[' => {
+                depth += 1;
+                out.push(ch);
+                i += 1;
+            }
+            '}' | ']' => {
+                depth -= 1;
+                out.push(ch);
+                i += 1;
+            }
+            first if first.is_alphabetic() || first == '_' => {
+                let start = i;
+                let mut end = i;
+                while end < chars.len()
+                    && (chars[end].is_alphanumeric() || chars[end] == '_' || chars[end] == '-')
+                {
+                    end += 1;
+                }
+                let ident: String = chars[start..end].iter().collect();
+
+                let mut lookahead = end;
+                while lookahead < chars.len() && chars[lookahead].is_whitespace() {
+                    lookahead += 1;
+                }
+                let is_key = lookahead < chars.len()
+                    && chars[lookahead] == ':'
+                    && !matches!(ident.as_str(), "true" | "false" | "null");
+
+                if is_key {
+                    out.push('"');
+                    out.push_str(&ident);
+                    out.push('"');
+                    quoted_keys += 1;
+                } else {
+                    out.push_str(&ident);
+                }
+                i = end;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+
+    ModelJsonRepair {
+        repaired: out,
+        truncated: in_string || depth > 0,
+        quoted_keys,
+        escaped_controls,
+        escaped_quotes,
+    }
+}
+
+/// Last line of defence before Mason writes to the operator's files.
+///
+/// The repair pass above cannot always tell a string terminator from a quote
+/// inside source code, so a mis-repair can yield something that parses but is
+/// really fragments of the model's own file content reinterpreted as
+/// structure. Those fragments do not survive these checks: paths come out
+/// multi-line, empty, or absurdly long. Failing here costs a re-run; not
+/// failing here costs a corrupted working tree.
+fn validate_mason_edits(edits: &[MasonEdit]) -> Result<()> {
+    for (index, edit) in edits.iter().enumerate() {
+        let path = edit.path.trim();
+        if path.is_empty() {
+            bail!("Mason edit #{index} has an empty path — the proposal did not parse coherently.");
+        }
+        if path.contains('\n') || path.contains('{') || path.contains('"') {
+            bail!(
+                "Mason edit #{index} has a path that is not a path ({path:?}). The response was \
+                 most likely mis-recovered, with file content read as structure — refusing to \
+                 apply it."
+            );
+        }
+        if path.len() > 200 {
+            bail!(
+                "Mason edit #{index} has an implausible {} character path — refusing to apply.",
+                path.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn parse_mason_edit_proposal(raw: &str) -> Result<MasonEditProposal> {
     let stripped = strip_json_fences(raw);
-    let raw_proposal = serde_json::from_str::<RawMasonEditProposal>(stripped)
-        .with_context(|| "parsing Mason edit proposal JSON")?;
+
+    let raw_proposal = match serde_json::from_str::<RawMasonEditProposal>(stripped) {
+        Ok(proposal) => proposal,
+        Err(strict_error) => {
+            let repair = repair_model_json(stripped);
+
+            // Truncation first: a cut-off response and a malformed one look
+            // identical to a parser, but only one of them is the operator's
+            // problem to fix, and the fix is a bigger token budget rather than
+            // a better prompt.
+            if repair.truncated {
+                bail!(
+                    "Mason's edit proposal was cut off mid-response after {} bytes — the JSON \
+                     never closes. This is a token-budget failure, not a formatting one: the \
+                     edit lane must return every file's full `content` in a single response. \
+                     Raise MASON_EDIT_MAX_TOKENS or narrow the spec's editable surface.",
+                    stripped.len()
+                );
+            }
+
+            serde_json::from_str::<RawMasonEditProposal>(&repair.repaired).map_err(
+                |repair_error| {
+                    // Report where the *repaired* document failed, not where the
+                    // original did. The original error points at damage the
+                    // repair already fixed, which sends the reader to the wrong
+                    // place entirely.
+                    anyhow::anyhow!(
+                        "parsing Mason edit proposal JSON. Strict parse: {strict_error}. \
+                         After repairing {} bare key(s), {} control character(s) and {} \
+                         unescaped quote(s): {repair_error}",
+                        repair.quoted_keys,
+                        repair.escaped_controls,
+                        repair.escaped_quotes
+                    )
+                },
+            )?
+        }
+    };
 
     let planned_reads = raw_proposal
         .rationale
@@ -28597,6 +28881,8 @@ fn parse_mason_edit_proposal(raw: &str) -> Result<MasonEditProposal> {
         .into_iter()
         .map(MasonRationaleEntry::into_text)
         .collect::<Vec<_>>();
+
+    validate_mason_edits(&raw_proposal.edits)?;
 
     // An empty `edits` list parses cleanly but is not a proposal — it is the
     // model declining to edit. Say which of the two it was, because "the model
@@ -31547,6 +31833,168 @@ mod tests {
     use chrono::{Duration, TimeZone};
     use serde_json::{json, Value};
     use std::sync::Mutex;
+
+    /// Both malformations Gemini produced in one response: bare object keys
+    /// (`path:` rather than `"path":`) and a literal newline inside a string
+    /// value. The substance was correct; only the syntax was JavaScript.
+    #[test]
+    fn mason_proposal_repairs_bare_keys_and_raw_newlines() {
+        let raw = "{\n  \"summary\": \"add bonus room\",\n  \"rationale\": [\"followed G.rooms shape\"],\n  edits: [\n    {\n      path: \"js/bonus.js\",\n      action: \"create\",\n      summary: \"bonus room\",\n      content: \"G.rooms.bonus = {\nid: 'bonus'\n};\"\n    }\n  ]\n}";
+
+        let proposal =
+            parse_mason_edit_proposal(raw).expect("a JS-literal proposal must be recovered");
+
+        assert_eq!(proposal.edits.len(), 1);
+        assert_eq!(proposal.edits[0].path, "js/bonus.js");
+        assert!(
+            proposal.edits[0].content.contains("G.rooms.bonus"),
+            "file content must survive the repair intact"
+        );
+        assert!(
+            proposal.edits[0].content.contains('\n'),
+            "escaped newlines must decode back to real ones, got {:?}",
+            proposal.edits[0].content
+        );
+    }
+
+    /// Verbatim failure from gemini-flash-latest: a README body containing
+    /// `("Dad's Workshop")` with the inner quotes unescaped, which closed the
+    /// JSON string early and corrupted everything after it.
+    #[test]
+    fn mason_proposal_repairs_unescaped_quotes_in_content() {
+        let raw = r#"{"summary":"add room","rationale":["r"],"edits":[{"path":"README.md","action":"write","summary":"docs","content":"The bonus room ("Dad's Workshop") is optional."}]}"#;
+
+        let proposal =
+            parse_mason_edit_proposal(raw).expect("unescaped inner quotes must be recovered");
+
+        assert_eq!(proposal.edits.len(), 1);
+        assert!(
+            proposal.edits[0].content.contains(r#"("Dad's Workshop")"#),
+            "the quoted phrase must survive intact, got {:?}",
+            proposal.edits[0].content
+        );
+    }
+
+    /// The dangerous case. Mason's `content` is source code, so `",` occurs
+    /// constantly inside it. An earlier version of the repair treated every
+    /// `",` as a string terminator, ended the content string mid-file, and then
+    /// parsed the JavaScript itself as JSON structure — quoting 118 "keys" that
+    /// were really game code. A repair that succeeds wrongly is worse than one
+    /// that fails, because the result gets written to the operator's files.
+    #[test]
+    fn json_repair_does_not_end_a_string_at_code_that_merely_looks_structural() {
+        let raw = r#"{"summary":"s","rationale":[],"edits":[{"path":"js/bonus.js","action":"write","summary":"room","content":"G.rooms.bonus = { id: \"bonus\", verbs: { lookat: \"A dusty attic\", open: \"It creaks\" } };"}]}"#;
+
+        let proposal = parse_mason_edit_proposal(raw).expect("valid input must parse");
+
+        assert_eq!(
+            proposal.edits.len(),
+            1,
+            "the code must stay one content value"
+        );
+        assert!(
+            proposal.edits[0].content.contains("lookat:")
+                && proposal.edits[0].content.contains("open:"),
+            "JS object keys inside content must survive verbatim, got {:?}",
+            proposal.edits[0].content
+        );
+
+        let repair = repair_model_json(raw);
+        assert_eq!(
+            repair.quoted_keys, 0,
+            "nothing inside the content string is a JSON key"
+        );
+    }
+
+    /// A mis-recovered proposal must never reach the filesystem. This is the
+    /// shape a bad repair produces: file content reinterpreted as structure,
+    /// leaving "paths" that are really fragments of source code.
+    #[test]
+    fn mason_edits_with_code_shaped_paths_are_refused() {
+        let bogus = vec![MasonEdit {
+            path: "G.rooms.bonus = {\n  id: \"bonus\"".to_string(),
+            action: "write".to_string(),
+            summary: "s".to_string(),
+            content: "x".to_string(),
+        }];
+        let error = validate_mason_edits(&bogus).expect_err("code-shaped path must be refused");
+        assert!(format!("{error:#}").contains("not a path"));
+
+        let empty = vec![MasonEdit {
+            path: "   ".to_string(),
+            action: "write".to_string(),
+            summary: "s".to_string(),
+            content: "x".to_string(),
+        }];
+        assert!(
+            validate_mason_edits(&empty).is_err(),
+            "empty path must be refused"
+        );
+
+        let good = vec![MasonEdit {
+            path: "js/bonus.js".to_string(),
+            action: "write".to_string(),
+            summary: "s".to_string(),
+            content: "x".to_string(),
+        }];
+        assert!(validate_mason_edits(&good).is_ok(), "a real path must pass");
+    }
+
+    /// The repair must not swallow a genuine structural quote: every value here
+    /// ends legitimately, and the document must round-trip unchanged.
+    #[test]
+    fn json_repair_keeps_real_string_terminators() {
+        let raw = r#"{"summary":"a","rationale":["b","c"],"edits":[{"path":"x","action":"create","summary":"s","content":"c"}]}"#;
+        let repair = repair_model_json(raw);
+
+        assert_eq!(repair.escaped_quotes, 0, "no quote here is a literal");
+        assert_eq!(repair.repaired, raw);
+        assert!(parse_mason_edit_proposal(raw).is_ok());
+    }
+
+    /// Identifiers inside string values must never be treated as keys — Mason's
+    /// `content` fields are full of `foo:` that has to survive untouched.
+    #[test]
+    fn json_repair_leaves_colons_inside_strings_alone() {
+        let raw = r#"{"summary": "uses id: bonus and name: Attic", "edits": []}"#;
+        let repair = repair_model_json(raw);
+
+        assert_eq!(
+            repair.quoted_keys, 0,
+            "nothing inside a string is a key, got {:?}",
+            repair.repaired
+        );
+        assert_eq!(repair.repaired, raw, "a valid document must be unchanged");
+        assert!(!repair.truncated);
+    }
+
+    /// A response cut off by the token budget must say so. Previously this was
+    /// indistinguishable from malformed output, which sent the operator looking
+    /// at the model's formatting instead of at max_tokens.
+    #[test]
+    fn mason_proposal_reports_truncation_as_a_budget_failure() {
+        let truncated = r#"{"summary": "add room", "edits": [{"path": "js/bonus.js", "action": "create", "summary": "Add a"#;
+
+        let error = parse_mason_edit_proposal(truncated).expect_err("truncated input must fail");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("cut off mid-response"),
+            "truncation must be named as such, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("MASON_EDIT_MAX_TOKENS"),
+            "the operator needs the knob that fixes it, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn mason_edit_budget_is_overridable_and_defaults_high_enough_for_a_module() {
+        // Guards the regression directly: 8000 could not hold one new module
+        // plus two small edits.
+        assert!(MASON_EDIT_MAX_TOKENS >= 32_000);
+        assert_eq!(mason_edit_max_tokens(), MASON_EDIT_MAX_TOKENS);
+    }
 
     /// Verbatim shape returned by a local 9B model (crow-9b-heretic-4.6) when
     /// asked for an edit proposal: objects in `rationale`, which is typed as

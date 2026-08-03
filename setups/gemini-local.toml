@@ -54,7 +54,7 @@ surface      = "claude-code"
 
 [providers.gemini]
 type         = "google"
-model        = "gemini-2.0-flash"
+model        = "gemini-flash-lite-latest"
 api_key_env  = "GEMINI_API_KEY"
 enabled      = true
 usage_rights = "standard"
