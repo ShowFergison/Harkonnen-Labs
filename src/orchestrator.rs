@@ -8036,52 +8036,64 @@ Respond with a single JSON object only — no prose, no markdown, no explanation
             temperature: 0.1,
         };
 
-        let response = match provider.complete(req).await {
-            Ok(response) => response,
-            Err(error) => {
-                let application = MasonEditApplicationArtifact {
-                    run_id: run_id.to_string(),
-                    spec_id: spec_obj.id.clone(),
-                    product: target_source.label.clone(),
-                    generated_at: Utc::now().to_rfc3339(),
-                    status: "llm_error".to_string(),
-                    summary: format!("Mason edit lane failed before applying edits: {}", error),
-                    proposal_generated: false,
-                    changed_files: Vec::new(),
-                    git_branch: None,
-                };
-                self.write_mason_edit_application(run_dir, &application)
-                    .await?;
-                return Ok(application);
+        // Wraps `provider` so the usage of whichever attempt actually produced a
+        // response can still be reported for tracing and cost accounting, even
+        // though `complete_edit_proposal_with_retry` itself only returns the raw
+        // body (it may make more than one call under the hood).
+        struct UsageTrackingProvider<'a> {
+            inner: &'a dyn crate::llm::LlmProvider,
+            last_usage: std::sync::Mutex<Option<crate::llm::LlmUsage>>,
+        }
+        #[async_trait::async_trait]
+        impl<'a> crate::llm::LlmProvider for UsageTrackingProvider<'a> {
+            async fn complete(&self, req: LlmRequest) -> Result<crate::llm::LlmResponse> {
+                let response = self.inner.complete(req).await?;
+                if let Some(usage) = response.usage.clone() {
+                    *self.last_usage.lock().expect("lock") = Some(usage);
+                }
+                Ok(response)
             }
+        }
+
+        let usage_tracker = UsageTrackingProvider {
+            inner: provider.as_ref(),
+            last_usage: std::sync::Mutex::new(None),
         };
+        let (parsed, raw_body) = complete_edit_proposal_with_retry(&usage_tracker, req, 2).await;
 
         // Write raw response to disk before parsing so failures are diagnosable.
         let raw_response_path = run_dir.join("mason_raw_response.txt");
-        let _ = tokio::fs::write(&raw_response_path, &response.content).await;
+        let _ = tokio::fs::write(&raw_response_path, &raw_body).await;
 
-        let (reasoning, edit_body) = extract_reasoning(&response.content);
-        let edit_actions = vec![format!("generate file edits for spec '{}'", spec_obj.id)];
-        self.record_agent_trace(
-            run_id,
-            "mason",
-            "edits",
-            &trace_input_summary(&spec_obj.title),
-            &reasoning,
-            &edit_actions,
-            "success",
-            response.usage.as_ref(),
-        )
-        .await;
-        if let Some(usage) = &response.usage {
-            self.record_llm_cost_event(run_id, "mason", "edits", "gemini", "", usage)
-                .await;
+        let last_usage = usage_tracker.last_usage.lock().expect("lock").clone();
+        if !raw_body.is_empty() {
+            let (reasoning, _edit_body) = extract_reasoning(&raw_body);
+            let edit_actions = vec![format!("generate file edits for spec '{}'", spec_obj.id)];
+            self.record_agent_trace(
+                run_id,
+                "mason",
+                "edits",
+                &trace_input_summary(&spec_obj.title),
+                &reasoning,
+                &edit_actions,
+                "success",
+                last_usage.as_ref(),
+            )
+            .await;
+            if let Some(usage) = &last_usage {
+                let provider_label = self
+                    .paths
+                    .setup
+                    .resolve_agent_provider_name("mason", "default");
+                self.record_llm_cost_event(run_id, "mason", "edits", &provider_label, "", usage)
+                    .await;
+            }
         }
 
-        let proposal = match parse_mason_edit_proposal(edit_body) {
+        let proposal = match parsed {
             Ok(proposal) => proposal,
             Err(error) => {
-                let preview: String = response.content.chars().take(500).collect();
+                let preview: String = raw_body.chars().take(500).collect();
                 let application = MasonEditApplicationArtifact {
                     run_id: run_id.to_string(),
                     spec_id: spec_obj.id.clone(),
@@ -8566,15 +8578,10 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             ),
         );
 
-        let response = match provider.complete(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("Mason fix LLM call failed ({})", e);
-                return Ok(None);
-            }
-        };
+        let (parsed, _raw_body) =
+            complete_edit_proposal_with_retry(provider.as_ref(), req, 2).await;
 
-        match parse_mason_edit_proposal(&response.content) {
+        match parsed {
             Ok(proposal) => {
                 self.record_event(
                     run_id,
@@ -8592,7 +8599,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                 Ok(Some(proposal))
             }
             Err(e) => {
-                tracing::warn!("Mason fix proposal parse failed ({})", e);
+                tracing::warn!("Mason fix attempt failed ({})", e);
                 Ok(None)
             }
         }
@@ -8708,15 +8715,10 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             ),
         );
 
-        let response = match provider.complete(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("Mason validation fix LLM call failed ({})", e);
-                return Ok(None);
-            }
-        };
+        let (parsed, _raw_body) =
+            complete_edit_proposal_with_retry(provider.as_ref(), req, 2).await;
 
-        match parse_mason_edit_proposal(&response.content) {
+        match parsed {
             Ok(proposal) => {
                 self.record_event(
                     run_id,
@@ -8734,7 +8736,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                 Ok(Some(proposal))
             }
             Err(e) => {
-                tracing::warn!("Mason validation fix proposal parse failed ({})", e);
+                tracing::warn!("Mason validation fix attempt failed ({})", e);
                 Ok(None)
             }
         }
@@ -28910,6 +28912,57 @@ fn parse_mason_edit_proposal(raw: &str) -> Result<MasonEditProposal> {
     })
 }
 
+/// Ask once, and if the response does not parse, show the model exactly how it
+/// failed and ask again. Models correct malformed output reliably when told
+/// what was wrong; before this, a single bad response ended the run.
+///
+/// Returns the last raw body alongside the result so the caller can still write
+/// `mason_raw_response.txt` for the attempt that actually failed.
+async fn complete_edit_proposal_with_retry(
+    provider: &dyn crate::llm::LlmProvider,
+    req: crate::llm::LlmRequest,
+    attempts: u32,
+) -> (Result<MasonEditProposal>, String) {
+    let mut messages = req.messages.clone();
+    let mut last_raw = String::new();
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 0..attempts.max(1) {
+        let this_req = crate::llm::LlmRequest {
+            messages: messages.clone(),
+            max_tokens: req.max_tokens,
+            temperature: req.temperature,
+        };
+        let response = match provider.complete(this_req).await {
+            Ok(response) => response,
+            Err(error) => return (Err(error), last_raw),
+        };
+        last_raw = response.content.clone();
+
+        let (_reasoning, body) = extract_reasoning(&response.content);
+        match parse_mason_edit_proposal(body) {
+            Ok(proposal) => return (Ok(proposal), last_raw),
+            Err(error) => {
+                if attempt + 1 < attempts.max(1) {
+                    messages.push(crate::llm::Message::assistant(response.content.clone()));
+                    messages.push(crate::llm::Message::user(format!(
+                        "Your previous response could not be used: {error:#}\n\n\
+                         Return the same work again as a single valid JSON object with keys \
+                         summary, rationale and edits. Escape every newline, quote and backslash \
+                         inside string values. Emit nothing outside the JSON object.",
+                    )));
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+
+    (
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no attempts were made"))),
+        last_raw,
+    )
+}
+
 fn copy_tree_contents(source_root: &Path, current: &Path, destination_root: &Path) -> Result<()> {
     for entry in
         std::fs::read_dir(current).with_context(|| format!("reading {}", current.display()))?
@@ -31833,6 +31886,58 @@ mod tests {
     use chrono::{Duration, TimeZone};
     use serde_json::{json, Value};
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn edit_proposal_retry_feeds_the_parse_error_back_and_succeeds() {
+        struct FlakyProvider {
+            calls: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl crate::llm::LlmProvider for FlakyProvider {
+            async fn complete(
+                &self,
+                req: crate::llm::LlmRequest,
+            ) -> Result<crate::llm::LlmResponse> {
+                let mut calls = self.calls.lock().expect("lock");
+                let last_user = req
+                    .messages
+                    .last()
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+                calls.push(last_user);
+                let content = if calls.len() == 1 {
+                    "{\"summary\":\"x\",\"edits\":[".to_string()
+                } else {
+                    r#"{"summary":"ok","rationale":[],"edits":[{"path":"js/a.js","action":"write","summary":"s","content":"x"}]}"#.to_string()
+                };
+                Ok(crate::llm::LlmResponse {
+                    content,
+                    usage: None,
+                })
+            }
+        }
+
+        let provider = FlakyProvider {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let req = crate::llm::LlmRequest {
+            messages: vec![crate::llm::Message::user("edit please".to_string())],
+            max_tokens: 4000,
+            temperature: 0.1,
+        };
+
+        let (result, _raw) = complete_edit_proposal_with_retry(&provider, req, 2).await;
+        let proposal = result.expect("second attempt must succeed");
+
+        assert_eq!(proposal.edits.len(), 1);
+        let calls = provider.calls.lock().expect("lock");
+        assert_eq!(calls.len(), 2, "must retry exactly once");
+        assert!(
+            calls[1].contains("cut off mid-response") || calls[1].contains("did not parse"),
+            "the retry must carry the parse failure back to the model, got: {}",
+            calls[1]
+        );
+    }
 
     /// Both malformations Gemini produced in one response: bare object keys
     /// (`path:` rather than `"path":`) and a literal newline inside a string

@@ -28,6 +28,12 @@ impl Message {
             content: content.into(),
         }
     }
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+        }
+    }
 }
 
 /// Parameters for an LLM call.
