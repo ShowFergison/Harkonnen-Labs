@@ -28911,6 +28911,33 @@ fn validate_mason_edits(edits: &[MasonEdit]) -> Result<()> {
             );
         }
     }
+
+    // Two edits targeting the same path is last-write-wins with no signal: the
+    // second silently clobbers the first, and — because each patch/file resolves
+    // against the pristine on-disk original independently — the earlier edit's
+    // intent simply vanishes. It also corrupts delta reporting, since the second
+    // edit's delta would be computed against the first edit's already-written
+    // content rather than the true original. Refusing costs a retry; guessing
+    // which edit the operator meant costs the file. This applies uniformly to
+    // every transport — two `### PATCH:` blocks on one path, two `### FILE:`
+    // blocks on one path, a patch and a file on one path, or duplicate JSON
+    // entries — because every one of them routes through this function.
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for edit in edits {
+        *counts.entry(edit.path.trim()).or_insert(0) += 1;
+    }
+    for edit in edits {
+        let path = edit.path.trim();
+        if let Some(&count) = counts.get(path) {
+            if count > 1 {
+                bail!(
+                    "Mason proposed {count} edits all targeting {path:?} — refusing to apply, \
+                     since the later edit would silently overwrite the earlier one with no \
+                     signal. Combine them into a single edit."
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -29032,10 +29059,20 @@ fn parse_mason_edit_response_with_staged(
     raw: &str,
     staged_product: &Path,
 ) -> Result<MasonEditProposal> {
-    let patches = crate::mason_transport::parse_patch_blocks(raw).unwrap_or_default();
-    if patches.is_empty() {
+    // A syntactic pre-check, not a swallowed error: only treat this as a pure
+    // whole-file response when the raw text contains no patch marker at all.
+    // Once `### PATCH:` is present, `parse_patch_blocks` runs as a single
+    // state machine over the whole response — a grammar violation anywhere
+    // fails the entire parse, and that failure must propagate. Silently
+    // falling back to `parse_mason_edit_response` here previously let a
+    // malformed patch hide behind an accompanying, valid `### FILE:` block:
+    // the fenced parse would succeed, and the model's intended patch vanished
+    // with no error anywhere.
+    if !raw.contains("### PATCH:") {
         return parse_mason_edit_response(raw);
     }
+
+    let patches = crate::mason_transport::parse_patch_blocks(raw)?;
 
     let mut edits = Vec::new();
     for patch in &patches {
@@ -29056,16 +29093,15 @@ fn parse_mason_edit_response_with_staged(
         });
     }
 
+    // SUMMARY/RATIONALE are extracted independent of whether any `### FILE:`
+    // block is present, so a patch-only response — the common case — still
+    // carries the model's summary and rationale into the run report and
+    // decision log instead of always coming back empty.
+    let (summary, rationale) = crate::mason_transport::parse_summary_and_rationale(raw);
+
     // Whole-file blocks may accompany patches — new files cannot be patched.
-    // Keep the envelope's summary and rationale: they are what the run report
-    // and the decision log show the operator, and dropping them would make a
-    // mixed patch/file response less legible than a pure one.
-    let mut summary = String::new();
-    let mut rationale = Vec::new();
     if let Ok(envelope) = crate::mason_transport::parse_fenced_edits(raw) {
-        let (envelope_summary, envelope_rationale, files) = envelope.into_edits();
-        summary = envelope_summary;
-        rationale = envelope_rationale;
+        let (_envelope_summary, _envelope_rationale, files) = envelope.into_edits();
         for (path, content) in files {
             edits.push(MasonEdit {
                 path,
@@ -29076,6 +29112,9 @@ fn parse_mason_edit_response_with_staged(
         }
     }
 
+    // Two edits targeting the same path (a duplicate patch, or a patch and a
+    // `### FILE:` block on the same path) are caught generically by
+    // `validate_mason_edits` below — every transport routes through it.
     validate_mason_edits(&edits)?;
     Ok(MasonEditProposal {
         summary,
@@ -32190,6 +32229,81 @@ mod tests {
             "SUMMARY: x\n\n### PATCH: js/nope.js\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n";
         let error = parse_mason_edit_response_with_staged(raw, dir.path()).expect_err("must fail");
         assert!(format!("{error:#}").contains("js/nope.js"));
+    }
+
+    #[test]
+    fn a_malformed_patch_with_a_valid_file_block_errors_instead_of_silently_dropping() {
+        // Regression for a silent Critical: a broken ### PATCH: block used to
+        // vanish without a trace whenever the response also carried a valid
+        // ### FILE: block, because the patch parse error was swallowed and
+        // the fenced parse succeeded on the FILE block alone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = "SUMMARY: x\n\n### FILE: js/other.js\nnew content\n### END FILE\n\n### PATCH: js/hints.js\n<<<<<<< SEARCH\na\n=======\nb\n";
+        let error = parse_mason_edit_response_with_staged(raw, dir.path()).expect_err(
+            "a malformed patch must not be silently dropped just because a valid FILE block is present",
+        );
+        assert!(
+            format!("{error:#}").contains("never closed"),
+            "expected the patch grammar error to propagate, got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn two_patches_on_the_same_path_are_rejected_not_last_write_wins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+        std::fs::write(staged.join("hints.js"), "line a\nline b\nline c\n").expect("write");
+
+        let raw = "SUMMARY: x\n\n### PATCH: hints.js\n<<<<<<< SEARCH\nline a\n=======\nLINE A\n>>>>>>> REPLACE\n\n### PATCH: hints.js\n<<<<<<< SEARCH\nline c\n=======\nLINE C\n>>>>>>> REPLACE\n";
+
+        let error = parse_mason_edit_response_with_staged(raw, staged)
+            .expect_err("two patches on one path must be refused, not last-write-wins");
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("hints.js"),
+            "error must name the duplicated path, got: {msg}"
+        );
+        assert!(
+            msg.contains('2'),
+            "error should note how many edits targeted it, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_patch_and_a_file_block_on_the_same_path_are_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+        std::fs::write(staged.join("hints.js"), "line a\n").expect("write");
+
+        let raw = "SUMMARY: x\n\n### PATCH: hints.js\n<<<<<<< SEARCH\nline a\n=======\nLINE A\n>>>>>>> REPLACE\n\n### FILE: hints.js\nwhole new content\n### END FILE\n";
+
+        let error = parse_mason_edit_response_with_staged(raw, staged)
+            .expect_err("a patch and a whole-file block on the same path must be refused");
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("hints.js"),
+            "error must name the duplicated path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn summary_and_rationale_survive_a_patch_only_response() {
+        // Regression for a silent Important: summary/rationale used to come
+        // back empty for every patch-only response, since recovery was gated
+        // on parse_fenced_edits succeeding, which bails when no FILE blocks
+        // exist — true for the common case of a pure patch response.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+        std::fs::write(staged.join("hints.js"), "line a\n").expect("write");
+
+        let raw = "SUMMARY: add a hint\nRATIONALE:\n- keeps the pattern consistent\n\n### PATCH: hints.js\n<<<<<<< SEARCH\nline a\n=======\nline A\n>>>>>>> REPLACE\n";
+
+        let proposal = parse_mason_edit_response_with_staged(raw, staged).expect("must resolve");
+        assert_eq!(proposal.summary, "add a hint");
+        assert_eq!(
+            proposal.rationale,
+            vec!["keeps the pattern consistent".to_string()]
+        );
     }
 
     #[tokio::test]

@@ -25,6 +25,8 @@ consist solely of '### END FILE' — the parser uses that exact phrase to mark b
 
 const FILE_MARKER: &str = "### FILE:";
 const END_MARKER: &str = "### END FILE";
+const PATCH_HEADER_MARKER: &str = "### PATCH:";
+const REPLACE_END_MARKER: &str = ">>>>>>> REPLACE";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FencedFile {
@@ -52,13 +54,64 @@ impl FencedEnvelope {
     }
 }
 
-pub fn parse_fenced_edits(raw: &str) -> Result<FencedEnvelope> {
+/// Extracts `SUMMARY:` and `RATIONALE:` header lines independent of any
+/// `### FILE:` or `### PATCH:` block. Shared by `parse_fenced_edits` and the
+/// patch transport so summary/rationale extraction never diverges between
+/// them — in particular, a patch-only response (the common case once patches
+/// exist) is not silently treated as carrying no summary or rationale just
+/// because it has no `### FILE:` block for the old, file-block-gated logic
+/// to key off of.
+///
+/// This is a best-effort scanner, not a structural validator: `parse_fenced_edits`
+/// and `parse_patch_blocks` are the source of truth for whether the blocks
+/// themselves are well-formed. This function only needs to skip over block
+/// bodies well enough that stray '- ' lines or metadata-looking lines inside
+/// file/patch content are not misread as rationale items.
+pub fn parse_summary_and_rationale(raw: &str) -> (String, Vec<String>) {
     let mut summary = String::new();
     let mut rationale = Vec::new();
+    let mut in_rationale = false;
+    let mut in_block = false;
+
+    for line in raw.split('\n') {
+        let line_for_markers = line.trim_end_matches('\r');
+        let trimmed = line_for_markers.trim();
+
+        if in_block {
+            if trimmed == END_MARKER || trimmed == REPLACE_END_MARKER {
+                in_block = false;
+            }
+            continue;
+        }
+
+        if trimmed.strip_prefix(FILE_MARKER).is_some()
+            || trimmed.strip_prefix(PATCH_HEADER_MARKER).is_some()
+        {
+            in_block = true;
+            in_rationale = false;
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("SUMMARY:") {
+            summary = rest.trim().to_string();
+            in_rationale = false;
+        } else if trimmed == "RATIONALE:" {
+            in_rationale = true;
+        } else if in_rationale {
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                rationale.push(item.trim().to_string());
+            }
+        }
+    }
+
+    (summary, rationale)
+}
+
+pub fn parse_fenced_edits(raw: &str) -> Result<FencedEnvelope> {
+    let (summary, rationale) = parse_summary_and_rationale(raw);
     let mut files = Vec::new();
 
     let mut current: Option<(String, Vec<String>)> = None;
-    let mut in_rationale = false;
 
     // Split on \n but preserve original lines (including trailing \r for CRLF)
     let lines: Vec<&str> = raw.split('\n').collect();
@@ -90,7 +143,7 @@ pub fn parse_fenced_edits(raw: &str) -> Result<FencedEnvelope> {
             continue;
         }
 
-        // We're not in a file block; check for markers or metadata
+        // We're not in a file block; check for markers
         if let Some(rest) = trimmed.strip_prefix(FILE_MARKER) {
             let path = rest.trim().to_string();
             if path.is_empty() {
@@ -99,7 +152,6 @@ pub fn parse_fenced_edits(raw: &str) -> Result<FencedEnvelope> {
             if path.contains('"') || path.len() > 200 {
                 bail!("a {FILE_MARKER} block declared an implausible path: {path:?}");
             }
-            in_rationale = false;
             current = Some((path, Vec::new()));
         } else if trimmed == END_MARKER {
             // A stray END_MARKER outside any open block is an error
@@ -109,16 +161,10 @@ pub fn parse_fenced_edits(raw: &str) -> Result<FencedEnvelope> {
                  '### END FILE'",
                 line_num + 1
             );
-        } else if let Some(rest) = trimmed.strip_prefix("SUMMARY:") {
-            summary = rest.trim().to_string();
-            in_rationale = false;
-        } else if trimmed == "RATIONALE:" {
-            in_rationale = true;
-        } else if in_rationale {
-            if let Some(item) = trimmed.strip_prefix("- ") {
-                rationale.push(item.trim().to_string());
-            }
         }
+        // SUMMARY:/RATIONALE:/rationale-item lines are metadata already
+        // captured by `parse_summary_and_rationale` above; nothing to do
+        // with them here.
     }
 
     // An unterminated block is a truncated response, not a formatting mistake.
