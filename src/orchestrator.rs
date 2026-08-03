@@ -8033,15 +8033,21 @@ Produce the implementation plan markdown. Treat guardrails and required checks a
 Task contract:
 You are Mason, an implementation specialist for a software factory. Only edit files within the provided editable paths.
 
+{}
+
 {}",
                 support.system_instruction,
-                crate::mason_transport::FENCED_FORMAT_INSTRUCTION
+                crate::mason_transport::FENCED_FORMAT_INSTRUCTION,
+                crate::mason_transport::PATCH_FORMAT_INSTRUCTION
             ))
             .unwrap_or_else(|| format!(
                 "You are Mason, an implementation specialist for a software factory. Only edit files listed in EDITABLE PATHS.
 
+{}
+
 {}",
-                crate::mason_transport::FENCED_FORMAT_INSTRUCTION
+                crate::mason_transport::FENCED_FORMAT_INSTRUCTION,
+                crate::mason_transport::PATCH_FORMAT_INSTRUCTION
             ));
         let repo_context_block = prompt_support
             .as_ref()
@@ -8097,7 +8103,8 @@ Respond using the FILE block format described above. Nothing outside the blocks.
             inner: provider.as_ref(),
             usage_total: std::sync::Mutex::new(None),
         };
-        let (parsed, raw_body) = complete_edit_proposal_with_retry(&usage_tracker, req, 2).await;
+        let (parsed, raw_body) =
+            complete_edit_proposal_with_retry(&usage_tracker, req, 2, staged_product).await;
 
         // Write raw response to disk before parsing so failures are diagnosable.
         let raw_response_path = run_dir.join("mason_raw_response.txt");
@@ -8650,8 +8657,9 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
 
         let req = LlmRequest::simple(
             &format!(
-                "You are Mason, an implementation specialist for a software factory. A build command failed. Only edit files in EDITABLE PATHS.\n\n{}",
-                crate::mason_transport::FENCED_FORMAT_INSTRUCTION
+                "You are Mason, an implementation specialist for a software factory. A build command failed. Only edit files in EDITABLE PATHS.\n\n{}\n\n{}",
+                crate::mason_transport::FENCED_FORMAT_INSTRUCTION,
+                crate::mason_transport::PATCH_FORMAT_INSTRUCTION
             ),
             format!(
                 "SPEC:\n```yaml\n{spec_yaml}\n```\n\nCONSTRAINTS:\n{constraints}\n\nEDITABLE PATHS: {editable_list}\n\nFILE CONTEXT:\n{context_block}\n\nBUILD FAILURE OUTPUT (iteration {iteration}):\n```\n{build_output}\n```\n\nFix the errors and return the corrected file contents using the FILE block format described above.",
@@ -8659,7 +8667,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
         );
 
         let (parsed, _raw_body) =
-            complete_edit_proposal_with_retry(provider.as_ref(), req, 2).await;
+            complete_edit_proposal_with_retry(provider.as_ref(), req, 2, staged_product).await;
 
         match parsed {
             Ok(proposal) => {
@@ -8770,8 +8778,9 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                 )
             };
         let system_prompt = format!(
-            "{system_prompt_prefix}\n\n{}",
-            crate::mason_transport::FENCED_FORMAT_INSTRUCTION
+            "{system_prompt_prefix}\n\n{}\n\n{}",
+            crate::mason_transport::FENCED_FORMAT_INSTRUCTION,
+            crate::mason_transport::PATCH_FORMAT_INSTRUCTION
         );
         let req = LlmRequest::simple(
             system_prompt,
@@ -8789,7 +8798,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
         );
 
         let (parsed, _raw_body) =
-            complete_edit_proposal_with_retry(provider.as_ref(), req, 2).await;
+            complete_edit_proposal_with_retry(provider.as_ref(), req, 2, staged_product).await;
 
         match parsed {
             Ok(proposal) => {
@@ -29016,6 +29025,65 @@ fn parse_mason_edit_response(raw: &str) -> Result<MasonEditProposal> {
     }
 }
 
+/// Patches are resolved to whole-file contents here, at the boundary, so that
+/// everything downstream — validation, the apply loop, delta reporting — keeps
+/// working on exactly one representation.
+fn parse_mason_edit_response_with_staged(
+    raw: &str,
+    staged_product: &Path,
+) -> Result<MasonEditProposal> {
+    let patches = crate::mason_transport::parse_patch_blocks(raw).unwrap_or_default();
+    if patches.is_empty() {
+        return parse_mason_edit_response(raw);
+    }
+
+    let mut edits = Vec::new();
+    for patch in &patches {
+        let normalized = normalize_project_path(&patch.path);
+        let full = staged_product.join(&normalized);
+        let original = std::fs::read_to_string(&full).with_context(|| {
+            format!(
+                "patch targets {} but that file does not exist in the staged workspace",
+                patch.path
+            )
+        })?;
+        let patched = crate::mason_transport::apply_patch_block(&original, patch)?;
+        edits.push(MasonEdit {
+            path: normalized,
+            action: "write".to_string(),
+            summary: format!("patch {}", patch.path),
+            content: patched,
+        });
+    }
+
+    // Whole-file blocks may accompany patches — new files cannot be patched.
+    // Keep the envelope's summary and rationale: they are what the run report
+    // and the decision log show the operator, and dropping them would make a
+    // mixed patch/file response less legible than a pure one.
+    let mut summary = String::new();
+    let mut rationale = Vec::new();
+    if let Ok(envelope) = crate::mason_transport::parse_fenced_edits(raw) {
+        let (envelope_summary, envelope_rationale, files) = envelope.into_edits();
+        summary = envelope_summary;
+        rationale = envelope_rationale;
+        for (path, content) in files {
+            edits.push(MasonEdit {
+                path,
+                action: "write".to_string(),
+                summary: String::new(),
+                content,
+            });
+        }
+    }
+
+    validate_mason_edits(&edits)?;
+    Ok(MasonEditProposal {
+        summary,
+        rationale,
+        edits,
+    })
+}
+
 /// Ask once, and if the response does not parse, show the model exactly how it
 /// failed and ask again. Models correct malformed output reliably when told
 /// what was wrong; before this, a single bad response ended the run.
@@ -29026,6 +29094,7 @@ async fn complete_edit_proposal_with_retry(
     provider: &dyn crate::llm::LlmProvider,
     req: crate::llm::LlmRequest,
     attempts: u32,
+    staged_product: &Path,
 ) -> (Result<MasonEditProposal>, String) {
     let mut messages = req.messages.clone();
     let mut last_raw = String::new();
@@ -29044,14 +29113,15 @@ async fn complete_edit_proposal_with_retry(
         last_raw = response.content.clone();
 
         let (_reasoning, body) = extract_reasoning(&response.content);
-        match parse_mason_edit_response(body) {
+        match parse_mason_edit_response_with_staged(body, staged_product) {
             Ok(proposal) => return (Ok(proposal), last_raw),
             Err(error) => {
                 if attempt + 1 < attempts.max(1) {
                     messages.push(crate::llm::Message::assistant(response.content.clone()));
                     messages.push(crate::llm::Message::user(format!(
-                        "Your previous response could not be used: {error:#}\n\n{}",
-                        crate::mason_transport::FENCED_FORMAT_INSTRUCTION
+                        "Your previous response could not be used: {error:#}\n\n{}\n\n{}",
+                        crate::mason_transport::FENCED_FORMAT_INSTRUCTION,
+                        crate::mason_transport::PATCH_FORMAT_INSTRUCTION
                     )));
                 }
                 last_error = Some(error);
@@ -32057,7 +32127,9 @@ mod tests {
             temperature: 0.1,
         };
 
-        let (result, _raw) = complete_edit_proposal_with_retry(&provider, req, 2).await;
+        let staged_dir = tempfile::tempdir().expect("tempdir");
+        let (result, _raw) =
+            complete_edit_proposal_with_retry(&provider, req, 2, staged_dir.path()).await;
         let proposal = result.expect("second attempt must succeed");
 
         assert_eq!(proposal.edits.len(), 1);
@@ -32089,6 +32161,35 @@ mod tests {
         // A path that is really source code must be refused on the fenced path too.
         let bad = "SUMMARY: x\n\n### FILE: G.rooms = {\n### END FILE\n";
         assert!(parse_mason_edit_response(bad).is_err());
+    }
+
+    #[test]
+    fn patches_resolve_against_staged_files_into_whole_file_edits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+        std::fs::create_dir_all(staged.join("js")).expect("mkdir");
+        std::fs::write(staged.join("js/hints.js"), "const HINTS = [\n  'a',\n];\n").expect("write");
+
+        let raw = "SUMMARY: add a hint\n\n### PATCH: js/hints.js\n<<<<<<< SEARCH\n  'a',\n=======\n  'a',\n  'b',\n>>>>>>> REPLACE\n";
+
+        let proposal = parse_mason_edit_response_with_staged(raw, staged).expect("must resolve");
+
+        assert_eq!(proposal.edits.len(), 1);
+        assert_eq!(proposal.edits[0].path, "js/hints.js");
+        assert!(proposal.edits[0].content.contains("'b',"));
+        assert!(
+            proposal.edits[0].content.contains("const HINTS"),
+            "unpatched regions must be preserved"
+        );
+    }
+
+    #[test]
+    fn a_patch_against_a_missing_file_is_refused_clearly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw =
+            "SUMMARY: x\n\n### PATCH: js/nope.js\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n";
+        let error = parse_mason_edit_response_with_staged(raw, dir.path()).expect_err("must fail");
+        assert!(format!("{error:#}").contains("js/nope.js"));
     }
 
     #[tokio::test]
@@ -32133,7 +32234,9 @@ mod tests {
             temperature: 0.1,
         };
 
-        let (result, _raw) = complete_edit_proposal_with_retry(&tracker, req, 2).await;
+        let staged_dir = tempfile::tempdir().expect("tempdir");
+        let (result, _raw) =
+            complete_edit_proposal_with_retry(&tracker, req, 2, staged_dir.path()).await;
         result.expect("second attempt must succeed");
 
         let total = tracker
