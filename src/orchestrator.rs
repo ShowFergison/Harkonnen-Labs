@@ -29164,7 +29164,15 @@ fn parse_mason_edit_response_with_staged(
     // under different spellings (`./js/hints.js` vs `js/hints.js`) still
     // collide in `validate_mason_edits` instead of slipping past it as two
     // distinct paths.
-    if let Ok(envelope) = crate::mason_transport::parse_fenced_edits(raw) {
+    //
+    // `_optional`, and propagated with `?`, on purpose. A patch-only response
+    // legitimately has no `### FILE:` blocks, so their absence cannot be an
+    // error — but running this best-effort and ignoring the `Err` (as this
+    // once did) meant a file block the model *did* write vanished whenever it
+    // failed to parse for any other reason, while the patches beside it
+    // applied and the run reported success. `Ok(None)` is absence; every
+    // structural problem is an `Err` and rejects the response.
+    if let Some(envelope) = crate::mason_transport::parse_fenced_edits_optional(raw)? {
         let (_envelope_summary, _envelope_rationale, files) = envelope.into_edits();
         for (path, content) in files {
             edits.push(MasonEdit {
@@ -32485,6 +32493,123 @@ mod tests {
         assert!(
             format!("{error:#}").contains("escapes"),
             "expected the containment guard's error, got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_patch_after_an_unclosed_file_block_is_not_silently_dropped() {
+        // Reproduction of a silent Critical: patch, then a ### FILE: block
+        // that never closes, then a second genuine, complete patch. The
+        // FILE-block tracker inside parse_patch_blocks opened on the unclosed
+        // block and consumed every remaining line, so the second patch never
+        // reached the patch state machine at all — and because that machine
+        // was left at section 0, its own end-of-input guard stayed quiet.
+        // The result was Ok with one edit: b.js was never written, and the run
+        // report said success without ever mentioning it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+        std::fs::write(staged.join("a.js"), "line a\n").expect("write");
+        std::fs::write(staged.join("b.js"), "line b\n").expect("write");
+
+        let raw = "SUMMARY: two edits\n\n### PATCH: a.js\n<<<<<<< SEARCH\nline a\n=======\nLINE A\n>>>>>>> REPLACE\n\n### FILE: broken.js\nthis block is never terminated\n\n### PATCH: b.js\n<<<<<<< SEARCH\nline b\n=======\nLINE B\n>>>>>>> REPLACE\n";
+
+        let error = parse_mason_edit_response_with_staged(raw, staged).expect_err(
+            "an unclosed ### FILE: block hides every later edit, so the response must be refused \
+             rather than silently applied minus the edits it hid",
+        );
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("never closed"),
+            "expected a truncation error, got: {msg}"
+        );
+        assert!(
+            msg.contains("broken.js"),
+            "the error must name the block that swallowed the rest, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn patches_interleaved_with_a_file_block_all_survive() {
+        // The well-formed twin of a_patch_after_an_unclosed_file_block_...:
+        // the same patch / ### FILE: / patch ordering, with the file block
+        // properly closed. Rejecting an unclosed block must not come at the
+        // cost of this shape, which is the one Mason actually emits when it
+        // edits two files and creates a third.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+        std::fs::write(staged.join("a.js"), "line a\n").expect("write");
+        std::fs::write(staged.join("b.js"), "line b\n").expect("write");
+
+        let raw = "SUMMARY: three edits\n\n### PATCH: a.js\n<<<<<<< SEARCH\nline a\n=======\nLINE A\n>>>>>>> REPLACE\n\n### FILE: c.js\nbrand new\n### END FILE\n\n### PATCH: b.js\n<<<<<<< SEARCH\nline b\n=======\nLINE B\n>>>>>>> REPLACE\n";
+
+        let proposal =
+            parse_mason_edit_response_with_staged(raw, staged).expect("all three must resolve");
+
+        let mut paths: Vec<&str> = proposal.edits.iter().map(|e| e.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["a.js", "b.js", "c.js"]);
+        let by_path = |want: &str| {
+            proposal
+                .edits
+                .iter()
+                .find(|e| e.path == want)
+                .unwrap_or_else(|| panic!("{want} must be present"))
+        };
+        assert_eq!(by_path("a.js").content, "LINE A\n");
+        assert_eq!(by_path("b.js").content, "LINE B\n");
+        assert_eq!(by_path("c.js").content, "brand new");
+        assert_eq!(proposal.summary, "three edits");
+    }
+
+    #[test]
+    fn a_patch_body_containing_file_markers_does_not_invent_a_phantom_file() {
+        // A patch that edits a file documenting the edit format carries
+        // `### FILE:` / `### END FILE` lines inside its SEARCH and REPLACE
+        // bodies. Those belong to the patch. Reading them as a whole-file
+        // block writes a file the model never asked for — silently, since
+        // nothing downstream can tell an invented edit from a requested one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+        std::fs::create_dir_all(staged.join("docs")).expect("mkdir");
+        std::fs::write(
+            staged.join("docs/format.md"),
+            "intro\n### FILE: phantom\nbody\n### END FILE\noutro\n",
+        )
+        .expect("write");
+
+        let raw = "SUMMARY: rewrite the example\n\n### PATCH: docs/format.md\n<<<<<<< SEARCH\n### FILE: phantom\nbody\n### END FILE\n=======\nrewritten\n>>>>>>> REPLACE\n";
+
+        let proposal =
+            parse_mason_edit_response_with_staged(raw, staged).expect("the patch must resolve");
+        assert_eq!(
+            proposal.edits.len(),
+            1,
+            "only the patched file may be written, got: {:?}",
+            proposal.edits.iter().map(|e| &e.path).collect::<Vec<_>>()
+        );
+        assert_eq!(proposal.edits[0].path, "docs/format.md");
+        assert_eq!(proposal.edits[0].content, "intro\nrewritten\noutro\n");
+    }
+
+    #[test]
+    fn a_malformed_file_block_beside_a_valid_patch_is_not_silently_dropped() {
+        // The mirror of a_malformed_patch_with_a_valid_file_block_...: the
+        // fenced parse used to run best-effort here, so a file block the
+        // model meant to write could fail to parse and vanish while the
+        // accompanying patch applied and the run reported success.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+        std::fs::write(staged.join("a.js"), "line a\n").expect("write");
+
+        let raw = "SUMMARY: x\n\n### PATCH: a.js\n<<<<<<< SEARCH\nline a\n=======\nLINE A\n>>>>>>> REPLACE\n\n### FILE: outer.txt\nfirst\n### FILE: inner.txt\nsecond\n### END FILE\n";
+
+        let error = parse_mason_edit_response_with_staged(raw, staged).expect_err(
+            "a file block that does not parse must be reported, not dropped because the patch \
+             beside it happened to succeed",
+        );
+        assert!(
+            format!("{error:#}").contains("still open"),
+            "expected the nested-marker error to propagate, got: {error:#}"
         );
     }
 

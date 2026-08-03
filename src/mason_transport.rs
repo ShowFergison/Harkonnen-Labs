@@ -63,15 +63,23 @@ impl FencedEnvelope {
 ///
 /// This is a best-effort scanner, not a structural validator: `parse_fenced_edits`
 /// and `parse_patch_blocks` remain the source of truth for whether the blocks
-/// themselves are well-formed. Shared by three consumers —
-/// `parse_summary_and_rationale`, `has_top_level_patch_header`, and
-/// `parse_patch_blocks` — one block-tracking implementation, so none of them
-/// can disagree about what counts as "inside a block." `parse_patch_blocks`
-/// uses `file_blocks_only()`: it already owns `### PATCH:` block internals
-/// via its own SEARCH/REPLACE section state machine, so this tracker must
-/// not also treat `### PATCH:` as an opener for it — doing so would cause a
-/// *real* top-level patch's own body lines to be skipped here as if they
-/// were block content, when they need to reach that state machine instead.
+/// themselves are well-formed. Shared by four consumers —
+/// `parse_summary_and_rationale`, `has_top_level_patch_header`,
+/// `parse_patch_blocks`, and `parse_fenced_edits` — one block-tracking
+/// implementation, so none of them can disagree about what counts as "inside
+/// a block."
+///
+/// The two structural parsers each track only the *other* transport's blocks,
+/// because each already owns its own block internals and needs those lines to
+/// reach its own state machine rather than be skipped here:
+/// `parse_patch_blocks` uses `file_blocks_only()`, and `parse_fenced_edits`
+/// uses `patch_blocks_only()`. Tracking a parser's own block type here would
+/// silently eat the body lines it exists to read.
+///
+/// Skipping is only ever *deferral*, never *discard*: because a tracker that
+/// is still open at end of input means every line after the opener was hidden
+/// from the parser, both structural parsers check `open_block_label()` when
+/// their scan finishes and fail loudly rather than return a partial result.
 ///
 /// Coupling note: this tracker and `parse_fenced_edits` agree on the FILE
 /// block closing rule only because both hardcode the literal `### END FILE`
@@ -81,6 +89,8 @@ impl FencedEnvelope {
 /// tracker must change with it.
 struct BlockTracker {
     closing_marker: Option<&'static str>,
+    open_label: Option<String>,
+    recognize_file_headers: bool,
     recognize_patch_headers: bool,
 }
 
@@ -90,6 +100,8 @@ impl BlockTracker {
     fn new() -> Self {
         Self {
             closing_marker: None,
+            open_label: None,
+            recognize_file_headers: true,
             recognize_patch_headers: true,
         }
     }
@@ -100,7 +112,23 @@ impl BlockTracker {
     fn file_blocks_only() -> Self {
         Self {
             closing_marker: None,
+            open_label: None,
+            recognize_file_headers: true,
             recognize_patch_headers: false,
+        }
+    }
+
+    /// The mirror image: tracks only `### PATCH:` blocks, leaving `### FILE:`
+    /// headers and bodies untouched — for `parse_fenced_edits`, which owns
+    /// FILE block internals and must not have them skipped, but must also not
+    /// mistake a `### FILE:` line quoted inside a *patch's* SEARCH or REPLACE
+    /// body for a real file block of its own.
+    fn patch_blocks_only() -> Self {
+        Self {
+            closing_marker: None,
+            open_label: None,
+            recognize_file_headers: false,
+            recognize_patch_headers: true,
         }
     }
 
@@ -111,17 +139,33 @@ impl BlockTracker {
         if let Some(closer) = self.closing_marker {
             if trimmed == closer {
                 self.closing_marker = None;
+                self.open_label = None;
             }
             return false;
         }
-        if trimmed.strip_prefix(FILE_MARKER).is_some() {
-            self.closing_marker = Some(END_MARKER);
-        } else if self.recognize_patch_headers
-            && trimmed.strip_prefix(PATCH_HEADER_MARKER).is_some()
-        {
-            self.closing_marker = Some(REPLACE_END_MARKER);
+        if self.recognize_file_headers {
+            if let Some(rest) = trimmed.strip_prefix(FILE_MARKER) {
+                self.closing_marker = Some(END_MARKER);
+                self.open_label = Some(rest.trim().to_string());
+                return true;
+            }
+        }
+        if self.recognize_patch_headers {
+            if let Some(rest) = trimmed.strip_prefix(PATCH_HEADER_MARKER) {
+                self.closing_marker = Some(REPLACE_END_MARKER);
+                self.open_label = Some(rest.trim().to_string());
+            }
         }
         true
+    }
+
+    /// `Some(path)` when a block is still open — i.e. the scan ended while
+    /// this tracker was still swallowing lines as block content. Every line
+    /// after that opener was hidden from the parser that owns this tracker,
+    /// so a caller finding `Some` here must fail rather than return whatever
+    /// it managed to collect before the opener.
+    fn open_block_label(&self) -> Option<&str> {
+        self.open_label.as_deref()
     }
 }
 
@@ -192,7 +236,32 @@ pub fn has_top_level_patch_header(raw: &str) -> bool {
     false
 }
 
+/// Whole-file blocks, or an error explaining why there are none. For the
+/// fenced transport a response without a single `### FILE:` block is a
+/// failure, so that stays an error here.
 pub fn parse_fenced_edits(raw: &str) -> Result<FencedEnvelope> {
+    match collect_fenced_edits(raw)? {
+        Some(envelope) => Ok(envelope),
+        None => bail!("no {FILE_MARKER} blocks were found in the response"),
+    }
+}
+
+/// The same scan, for callers where *absence* of `### FILE:` blocks is
+/// legitimate but *malformation* is not — the patch transport, where a
+/// patch-only response is the common case and carries no file blocks at all.
+///
+/// This exists so those two outcomes cannot be conflated. Testing the error
+/// message, or running `parse_fenced_edits` best-effort and ignoring its
+/// `Err`, would silently discard a file block the model meant to write
+/// whenever it failed to parse for any *other* reason — the operator loses a
+/// file and the run still reports success.
+pub fn parse_fenced_edits_optional(raw: &str) -> Result<Option<FencedEnvelope>> {
+    collect_fenced_edits(raw)
+}
+
+/// `Ok(None)` means the response contained no file blocks. Any structural
+/// problem is an `Err`; nothing is ever dropped quietly.
+fn collect_fenced_edits(raw: &str) -> Result<Option<FencedEnvelope>> {
     let (summary, rationale) = parse_summary_and_rationale(raw);
     let mut files = Vec::new();
 
@@ -206,6 +275,16 @@ pub fn parse_fenced_edits(raw: &str) -> Result<FencedEnvelope> {
     // `parse_summary_and_rationale`, `has_top_level_patch_header`, and
     // `parse_patch_blocks`'s FILE-block skipping) must change with it.
     let mut current: Option<(String, Vec<String>)> = None;
+
+    // Between file blocks, `### PATCH:` bodies are skipped. A patch that edits
+    // a file documenting this very format legitimately carries `### FILE:` and
+    // `### END FILE` lines inside its SEARCH and REPLACE text; reading those
+    // as a file block of this parser's own invents a whole-file write nobody
+    // asked for, or rejects the response over a stray terminator that was
+    // really just patch content. This tracker is only consulted at top level —
+    // a `### PATCH:` line inside an open file block is that file's content and
+    // is handled by the `current` branch below, before we get here.
+    let mut patch_tracker = BlockTracker::patch_blocks_only();
 
     // Split on \n but preserve original lines (including trailing \r for CRLF)
     let lines: Vec<&str> = raw.split('\n').collect();
@@ -237,7 +316,12 @@ pub fn parse_fenced_edits(raw: &str) -> Result<FencedEnvelope> {
             continue;
         }
 
-        // We're not in a file block; check for markers
+        // We're not in a file block; skip any top-level patch body, then
+        // check for markers.
+        if !patch_tracker.consume(trimmed) {
+            continue;
+        }
+
         if let Some(rest) = trimmed.strip_prefix(FILE_MARKER) {
             let path = rest.trim().to_string();
             if path.is_empty() {
@@ -271,15 +355,26 @@ pub fn parse_fenced_edits(raw: &str) -> Result<FencedEnvelope> {
         );
     }
 
-    if files.is_empty() {
-        bail!("no {FILE_MARKER} blocks were found in the response");
+    // An unterminated patch swallowed every line after it, so any file block
+    // beyond that point was skipped rather than parsed. Returning the blocks
+    // collected before it would drop the rest without a word.
+    if let Some(path) = patch_tracker.open_block_label() {
+        bail!(
+            "the {PATCH_HEADER_MARKER} block for {path:?} was never closed with \
+             {REPLACE_END_MARKER} — every line after it, including any further {FILE_MARKER} \
+             blocks, was read as that patch's content. The response was cut off."
+        );
     }
 
-    Ok(FencedEnvelope {
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(FencedEnvelope {
         summary,
         rationale,
         files,
-    })
+    }))
 }
 
 pub const PATCH_FORMAT_INSTRUCTION: &str = "\
@@ -363,7 +458,20 @@ pub fn parse_patch_blocks(raw: &str) -> Result<Vec<PatchBlock>> {
         let trimmed = line.trim_end();
         let marker_trim = trimmed.trim();
 
-        if !file_tracker.consume(marker_trim) {
+        // Only consult the FILE tracker between patches. Inside an open patch
+        // (`section != 0`) every line belongs to that patch's SEARCH or
+        // REPLACE body — including a `### FILE:` line, which there is ordinary
+        // text being searched for or written, not the start of a file block.
+        // Letting the tracker open mid-body silently dropped the rest of the
+        // SEARCH text, and a truncated SEARCH that still matched somewhere
+        // applied a real edit in the wrong place with `Ok` returned.
+        //
+        // This also keeps the two states mutually exclusive: the tracker can
+        // only open while `section == 0`, and while it is open every line is
+        // skipped, so `section` cannot move. An open tracker therefore always
+        // implies `section == 0` — which is exactly why `section`'s own
+        // end-of-input guard below could not see this failure.
+        if section == 0 && !file_tracker.consume(marker_trim) {
             continue;
         }
 
@@ -438,6 +546,21 @@ pub fn parse_patch_blocks(raw: &str) -> Result<Vec<PatchBlock>> {
         }
     }
 
+    // A `### FILE:` block left open swallowed every line after it — including
+    // any further, perfectly well-formed `### PATCH:` blocks, which never
+    // reached the state machine above at all. `section` is necessarily still 0
+    // in that case (see the tracker note in the loop), so its guard below
+    // cannot notice, and returning `Ok` here would hand back a partial edit
+    // list with no signal that anything was dropped. Skipping content is only
+    // safe while the block that justified the skip is known to close.
+    if let Some(path) = file_tracker.open_block_label() {
+        bail!(
+            "the {FILE_MARKER} block for {path:?} was never closed with {END_MARKER} — every line \
+             after it, including any further {PATCH_MARKER} blocks, was read as that block's \
+             content. The response was cut off. Raise MASON_EDIT_MAX_TOKENS or narrow the \
+             editable surface."
+        );
+    }
     if section != 0 {
         bail!("a patch block was never closed with {REPLACE_END} — the response was cut off");
     }
@@ -576,6 +699,62 @@ The bonus room ("Dad's Workshop") is optional.
     }
 
     #[test]
+    fn fenced_envelope_ignores_file_markers_inside_a_patch_body() {
+        // The mirror of the FILE-block skipping in parse_patch_blocks: a
+        // patch that edits a file which itself documents the edit format has
+        // `### FILE:` / `### END FILE` lines in its SEARCH and REPLACE bodies.
+        // Those are that patch's content. Reading them as a file block of its
+        // own invents a whole-file write the model never asked for.
+        let raw = "SUMMARY: x\n\n### PATCH: docs/format.md\n<<<<<<< SEARCH\n### FILE: phantom\nbody\n### END FILE\n=======\nrewritten\n>>>>>>> REPLACE\n\n### FILE: real.txt\nreal content\n### END FILE\n";
+
+        let envelope = parse_fenced_edits(raw).expect("the real file block must still parse");
+        assert_eq!(
+            envelope.files.len(),
+            1,
+            "only the top-level file block is a file, got: {:?}",
+            envelope.files
+        );
+        assert_eq!(envelope.files[0].path, "real.txt");
+    }
+
+    #[test]
+    fn fenced_envelope_rejects_a_patch_block_that_never_closes() {
+        // Same rule as parse_patch_blocks': skipping is deferral, not
+        // discard. An unterminated patch hides every later file block, so
+        // returning what was collected before it would drop them silently.
+        let raw = "SUMMARY: x\n\n### PATCH: a.js\n<<<<<<< SEARCH\nline a\n=======\nLINE A\n\n### FILE: real.txt\nreal content\n### END FILE\n";
+        let error = parse_fenced_edits(raw).expect_err("an unterminated patch must fail loudly");
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("never closed") && msg.contains("a.js"),
+            "the error must name the unclosed patch, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn optional_fenced_edits_separate_absence_from_malformation() {
+        // The distinction the patch transport needs: a patch-only response
+        // legitimately has no file blocks, but a *malformed* file block must
+        // never be mistaken for that case and dropped.
+        let patch_only =
+            "SUMMARY: x\n\n### PATCH: a.js\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n";
+        assert!(
+            parse_fenced_edits_optional(patch_only)
+                .expect("absence of file blocks is not an error")
+                .is_none(),
+            "a patch-only response has no file blocks — that is absence, not malformation"
+        );
+
+        let malformed = "SUMMARY: x\n\n### PATCH: a.js\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n\n### FILE: outer.txt\nfirst\n### FILE: inner.txt\nsecond\n### END FILE\n";
+        let error = parse_fenced_edits_optional(malformed)
+            .expect_err("a malformed file block must be reported, not reported as absence");
+        assert!(
+            format!("{error:#}").contains("still open"),
+            "expected the nested-marker error, got: {error:#}"
+        );
+    }
+
+    #[test]
     fn patch_block_replaces_an_exact_region() {
         let original = "line a\nline b\nline c\n";
         let block = PatchBlock {
@@ -691,6 +870,50 @@ The bonus room ("Dad's Workshop") is optional.
         let error = parse_patch_blocks(raw).expect_err("must reject overlapping blocks");
         let msg = format!("{error:#}");
         assert!(msg.contains("a.js") || msg.contains("while the block"));
+    }
+
+    #[test]
+    fn parse_patch_blocks_rejects_a_file_block_that_never_closes() {
+        // Reproduction: a real patch, then a ### FILE: block that is never
+        // closed, then a second genuine patch. The FILE tracker opens on the
+        // unclosed block and every later line — including the whole second
+        // patch — is skipped as if it were block content, so the patch state
+        // machine never sees it and `section` is still 0 at EOF. Before the
+        // fix this returned Ok with only the first patch: a complete, valid
+        // edit silently discarded with no error anywhere.
+        let raw = "### PATCH: a.js\n<<<<<<< SEARCH\nline a\n=======\nLINE A\n>>>>>>> REPLACE\n\
+                   \n### FILE: broken.js\nsome content that never terminates\n\
+                   \n### PATCH: b.js\n<<<<<<< SEARCH\nline b\n=======\nLINE B\n>>>>>>> REPLACE\n";
+
+        let error = parse_patch_blocks(raw).expect_err(
+            "a ### FILE: block left open swallows every later patch, so it must fail loudly",
+        );
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("never closed") && msg.contains("broken.js"),
+            "the error must name the unclosed block, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_patch_blocks_keeps_file_markers_inside_a_patch_body_as_content() {
+        // A patch to a file that itself documents the edit format: its SEARCH
+        // text legitimately contains `### FILE:` / `### END FILE` lines. The
+        // FILE tracker must not open mid-patch-body, or those lines are eaten
+        // out of the SEARCH text and the truncated remainder is matched
+        // against the file — which applies a real edit in the wrong place,
+        // silently, with Ok returned.
+        let raw = "### PATCH: docs/format.md\n<<<<<<< SEARCH\n### FILE: x\nbody\n### END FILE\n\
+                   =======\nreplaced\n>>>>>>> REPLACE\n";
+
+        let blocks = parse_patch_blocks(raw).expect("a real patch body is content, not structure");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].path, "docs/format.md");
+        assert_eq!(
+            blocks[0].search, "### FILE: x\nbody\n### END FILE",
+            "the whole SEARCH body must survive, not just its first line"
+        );
+        assert_eq!(blocks[0].replace, "replaced");
     }
 
     #[test]
