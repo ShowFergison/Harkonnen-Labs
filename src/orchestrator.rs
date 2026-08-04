@@ -3070,6 +3070,16 @@ next_actions={}",
             )
             .await?;
 
+            // `tool_loop` only has meaning inside the `llm_edits` lane. Set on
+            // its own it does exactly nothing, which from the outside is
+            // indistinguishable from the loop running and finding no work.
+            if worker_harness.tool_loop && !worker_harness.llm_edits {
+                tracing::warn!(
+                    "spec sets worker_harness.tool_loop but not llm_edits — the Mason edit lane \
+                     is off entirely, so the tool loop will not run. Set llm_edits: true as well."
+                );
+            }
+
             if worker_harness.llm_edits {
                 // Snapshot workspace before Mason edits so Coobie can diff state later.
                 let pre_impl_snap = snapshot_workspace_state(&staged_product);
@@ -24137,7 +24147,10 @@ fn project_memory_provenance(
     }
 }
 
-fn normalize_project_path(path: &str) -> String {
+/// `pub(crate)` so the tool loop confines the same string the apply path
+/// confines. Feeding one confinement implementation two different spellings of
+/// a path is how the two ends of a write disagree about whether it is legal.
+pub(crate) fn normalize_project_path(path: &str) -> String {
     path.trim()
         .replace('\\', "/")
         .trim_start_matches("./")
@@ -28353,21 +28366,27 @@ fn workspace_snapshots_equivalent(
     expected_files == actual_files
 }
 
+/// Path prefixes Mason is never shown, in any lane: build output, VCS
+/// internals, and factory state. Shared between `is_mason_context_candidate`
+/// (which picks the single-shot context files) and `mason_tools::read_refusal`
+/// (which filters the tool loop's reads), so the two lanes cannot drift into
+/// disagreeing about what is off limits.
+pub(crate) const MASON_BLOCKED_PATH_PREFIXES: [&str; 7] = [
+    ".git/",
+    ".harkonnen/",
+    "target/",
+    "dist/",
+    "build/",
+    "node_modules/",
+    "factory/",
+];
+
 fn is_mason_context_candidate(path: &str) -> bool {
     let normalized = normalize_project_path(path);
     if normalized.is_empty() {
         return false;
     }
-    let blocked_prefixes = [
-        ".git/",
-        ".harkonnen/",
-        "target/",
-        "dist/",
-        "build/",
-        "node_modules/",
-        "factory/",
-    ];
-    if blocked_prefixes
+    if MASON_BLOCKED_PATH_PREFIXES
         .iter()
         .any(|prefix| normalized.starts_with(prefix))
     {
