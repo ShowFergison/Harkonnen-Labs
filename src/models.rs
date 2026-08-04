@@ -64,6 +64,12 @@ pub struct WorkerHarnessConfig {
     /// (mason/<spec-id>-<short-run-id>) so a real diff is always available.
     #[serde(default)]
     pub git_branch: bool,
+    /// When true, Mason runs the multi-turn tool loop (`src/mason_tools.rs`)
+    /// instead of the single-shot edit transports: it may read files and list
+    /// directories before deciding what to write. Off unless a spec asks for
+    /// it, so every existing spec keeps the single-shot behaviour exactly.
+    #[serde(default)]
+    pub tool_loop: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

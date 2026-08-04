@@ -8024,31 +8024,50 @@ Produce the implementation plan markdown. Treat guardrails and required checks a
             .collect::<Vec<_>>()
             .join("\n\n");
 
+        // Opt-in, and off for every spec that does not say otherwise: the tool
+        // loop is a different conversation shape, not a better one, and the
+        // single-shot transports stay the default until it has proven itself
+        // against a real target.
+        let tool_loop_enabled = spec_obj
+            .worker_harness
+            .as_ref()
+            .map(|harness| harness.tool_loop)
+            .unwrap_or(false);
+
+        // One instruction set per lane. Sending the fenced/patch instructions
+        // into a tool loop is how a model ends up emitting `### FILE:` blocks
+        // the loop cannot read.
+        let format_instruction = if tool_loop_enabled {
+            crate::mason_tools::TOOL_LOOP_INSTRUCTION.to_string()
+        } else {
+            format!(
+                "{}\n\n{}",
+                crate::mason_transport::FENCED_FORMAT_INSTRUCTION,
+                crate::mason_transport::PATCH_FORMAT_INSTRUCTION
+            )
+        };
+
         let prompt_support = self.agent_prompt_support("mason", spec_obj, target_source);
         let system_instruction = prompt_support
             .as_ref()
-            .map(|support| format!(
-                "{}
+            .map(|support| {
+                format!(
+                    "{}
 
 Task contract:
 You are Mason, an implementation specialist for a software factory. Only edit files within the provided editable paths.
 
-{}
+{format_instruction}",
+                    support.system_instruction
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "You are Mason, an implementation specialist for a software factory. Only edit files listed in EDITABLE PATHS.
 
-{}",
-                support.system_instruction,
-                crate::mason_transport::FENCED_FORMAT_INSTRUCTION,
-                crate::mason_transport::PATCH_FORMAT_INSTRUCTION
-            ))
-            .unwrap_or_else(|| format!(
-                "You are Mason, an implementation specialist for a software factory. Only edit files listed in EDITABLE PATHS.
-
-{}
-
-{}",
-                crate::mason_transport::FENCED_FORMAT_INSTRUCTION,
-                crate::mason_transport::PATCH_FORMAT_INSTRUCTION
-            ));
+{format_instruction}"
+                )
+            });
         let repo_context_block = prompt_support
             .as_ref()
             .map(|support| support.repo_context_block.as_str())
@@ -8082,12 +8101,20 @@ CONSTRAINTS:
 CURRENT FILE CONTEXT:
 {}
 
-Respond using the FILE block format described above. Nothing outside the blocks.",
+{closing_instruction}",
                     target_source.label,
                     staged_product.display(),
                     render_list(&editable_paths, "No editable paths were resolved."),
                     context_block,
                     repo_context_block = repo_context_block,
+                    closing_instruction = if tool_loop_enabled {
+                        "The file context above is a starting point, not the whole workspace. Use \
+                         read_file and list_dir when you need more, then write every change with \
+                         write_file tool calls."
+                    } else {
+                        "Respond using the FILE block format described above. Nothing outside the \
+                         blocks."
+                    },
                 )),
             ],
             max_tokens: mason_edit_max_tokens(),
@@ -8103,8 +8130,63 @@ Respond using the FILE block format described above. Nothing outside the blocks.
             inner: provider.as_ref(),
             usage_total: std::sync::Mutex::new(None),
         };
-        let (parsed, raw_body) =
-            complete_edit_proposal_with_retry(&usage_tracker, req, 2, staged_product).await;
+        let (parsed, raw_body) = if tool_loop_enabled {
+            // The loop returns `(path, content)` pairs and applies nothing. They
+            // become `MasonEdit`s here and then follow exactly the same route
+            // every other transport takes — scope check, `validate_mason_edits`,
+            // the single apply loop below — so there is still one place where a
+            // Mason write reaches disk.
+            let transcript = TranscriptProvider {
+                inner: &usage_tracker,
+                transcript: std::sync::Mutex::new(String::new()),
+                last_response: std::sync::Mutex::new(String::new()),
+            };
+            let recorder = MasonToolLoopRecorder {
+                app: self,
+                run_id: run_id.to_string(),
+                cwd: staged_product.to_path_buf(),
+            };
+            let outcome = crate::mason_tools::run_mason_tool_loop_with_recorder(
+                &transcript,
+                req,
+                staged_product,
+                mason_tool_loop_max_turns(),
+                Some(&recorder),
+            )
+            .await;
+            let raw_body = transcript.transcript.lock().expect("lock").clone();
+            let last_response = transcript.last_response.lock().expect("lock").clone();
+            let parsed = outcome.and_then(|writes| {
+                let edits = writes
+                    .into_iter()
+                    .map(|(path, content)| MasonEdit {
+                        path: normalize_project_path(&path),
+                        action: "write".to_string(),
+                        summary: String::new(),
+                        content,
+                    })
+                    .collect::<Vec<_>>();
+                validate_mason_edits(&edits)?;
+                let (summary, rationale) =
+                    crate::mason_transport::parse_summary_and_rationale(&last_response);
+                let summary = if summary.trim().is_empty() {
+                    format!(
+                        "Mason finished its tool loop with {} file write(s).",
+                        edits.len()
+                    )
+                } else {
+                    summary
+                };
+                Ok(MasonEditProposal {
+                    summary,
+                    rationale,
+                    edits,
+                })
+            });
+            (parsed, raw_body)
+        } else {
+            complete_edit_proposal_with_retry(&usage_tracker, req, 2, staged_product).await
+        };
 
         // Write raw response to disk before parsing so failures are diagnosable.
         let raw_response_path = run_dir.join("mason_raw_response.txt");
@@ -8145,10 +8227,12 @@ Respond using the FILE block format described above. Nothing outside the blocks.
                     )
                 } else {
                     let preview: String = raw_body.chars().take(500).collect();
-                    format!(
-                        "Mason edit lane produced an invalid JSON edit proposal: {}\nRaw response preview: {}",
-                        error, preview
-                    )
+                    let lane = if tool_loop_enabled {
+                        "Mason tool loop did not produce a usable set of writes"
+                    } else {
+                        "Mason edit lane produced an invalid edit proposal"
+                    };
+                    format!("{lane}: {error}\nRaw response preview: {preview}")
                 };
                 let application = MasonEditApplicationArtifact {
                     run_id: run_id.to_string(),
@@ -28413,7 +28497,12 @@ fn build_mason_context_files(
     Ok(context)
 }
 
-fn join_workspace_relative_path(base: &Path, relative: &str) -> Result<PathBuf> {
+/// The one place a model-supplied relative path becomes a real path inside the
+/// staged workspace. `pub(crate)` so `mason_tools`'s tool loop confines its own
+/// paths with exactly this function rather than a second, subtly different
+/// check — two confinement implementations would eventually disagree, and only
+/// one of them would be the one that matters.
+pub(crate) fn join_workspace_relative_path(base: &Path, relative: &str) -> Result<PathBuf> {
     let base = base.canonicalize()?;
     let relative = Path::new(relative);
     if relative.is_absolute() {
@@ -28683,6 +28772,20 @@ fn mason_edit_max_tokens() -> u32 {
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(MASON_EDIT_MAX_TOKENS)
+}
+
+/// Turn budget for the opt-in tool loop. Each turn is a real, separately billed
+/// call, so this is a cost ceiling as much as a termination guarantee: enough
+/// room to list a directory, read two or three files and write a handful, and
+/// no room to wander.
+const MASON_TOOL_LOOP_MAX_TURNS: u32 = 12;
+
+fn mason_tool_loop_max_turns() -> u32 {
+    std::env::var("MASON_TOOL_LOOP_MAX_TURNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(MASON_TOOL_LOOP_MAX_TURNS)
 }
 
 /// Outcome of scanning a model's JSON-ish response for the two malformations
@@ -29272,6 +29375,106 @@ impl<'a> crate::llm::LlmProvider for UsageTrackingProvider<'a> {
             });
         }
         Ok(response)
+    }
+}
+
+/// Keeps every assistant turn of a tool loop so `mason_raw_response.txt` is
+/// still written when the lane is multi-turn.
+///
+/// A wrapper rather than a field on `UsageTrackingProvider` because the two
+/// concerns are independent — the single-shot lane already has `last_raw` and
+/// needs no transcript — and because the loop must compose them
+/// (`transcript(usage(provider))`) without either knowing about the other.
+struct TranscriptProvider<'a> {
+    inner: &'a dyn crate::llm::LlmProvider,
+    transcript: std::sync::Mutex<String>,
+    last_response: std::sync::Mutex<String>,
+}
+
+#[async_trait::async_trait]
+impl<'a> crate::llm::LlmProvider for TranscriptProvider<'a> {
+    async fn complete(&self, req: crate::llm::LlmRequest) -> Result<crate::llm::LlmResponse> {
+        let response = self.inner.complete(req).await?;
+        {
+            let mut transcript = self.transcript.lock().expect("lock");
+            if !transcript.is_empty() {
+                transcript.push_str("\n\n--- next turn ---\n\n");
+            }
+            transcript.push_str(&response.content);
+        }
+        *self.last_response.lock().expect("lock") = response.content.clone();
+        Ok(response)
+    }
+}
+
+/// Routes each tool-loop write through the same invocation gateway host
+/// commands already go through, so a write Mason performed with a tool is
+/// visible in `tool_invocations.json` beside `pytest` and `git` — one log of
+/// everything an agent did, not one log per mechanism.
+struct MasonToolLoopRecorder<'a> {
+    app: &'a AppContext,
+    run_id: String,
+    cwd: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl<'a> crate::mason_tools::MasonToolRecorder for MasonToolLoopRecorder<'a> {
+    async fn record_write(&self, path: &str, byte_len: usize) -> Result<bool> {
+        let assessment = ToolInvocationAssessment {
+            surface_type: "mason_tool".to_string(),
+            tool_name: "mason_tool_write".to_string(),
+            command: path.to_string(),
+            cwd: self.cwd.to_string_lossy().to_string(),
+            risk: "medium".to_string(),
+            // Not independently approval-gated: the write does not happen here.
+            // The loop only *records* it, and the batch is applied later behind
+            // the implementation transaction boundary and the workspace lease,
+            // both of which have already been cleared by the time this runs.
+            // Gating each write again would deadlock every tool-loop run at the
+            // first file for no additional protection.
+            approval_required: false,
+            reasons: vec![
+                format!("Mason tool loop proposed a {byte_len} byte write to {path}"),
+                "staged-workspace write inside the approved implementation transaction boundary"
+                    .to_string(),
+            ],
+        };
+        let mut record = self
+            .app
+            .ensure_tool_invocation_assessment_allowed(
+                &self.run_id,
+                "implementation",
+                "mason",
+                &self.cwd,
+                assessment,
+            )
+            .await?;
+        if !record.allowed {
+            return Ok(false);
+        }
+        // Close the record immediately, through the same helper host commands
+        // use. An invocation left open reads as one still running, and this one
+        // never will be: the gateway step is complete the moment the write is
+        // recorded. Whether the write then lands on disk is the business of
+        // `mason_edit_application.json`, and the note below says so rather than
+        // letting a `success: true` here be read as proof the file was written.
+        self.app
+            .finalize_tool_invocation_record(
+                &self.run_id,
+                &mut record,
+                &CommandOutcome {
+                    success: true,
+                    code: Some(0),
+                    stdout: format!(
+                        "Recorded a {byte_len} byte tool write to {path}. Applied later with the \
+                         rest of the Mason edit batch — see mason_edit_application.json for \
+                         whether it reached disk."
+                    ),
+                    stderr: String::new(),
+                },
+            )
+            .await?;
+        Ok(true)
     }
 }
 
@@ -34312,6 +34515,7 @@ mod tests {
                 continuity_file: Some("trail-state.json".to_string()),
                 llm_edits: true,
                 git_branch: false,
+                tool_loop: false,
             }),
             test_commands: vec!["pytest -q".to_string()],
         };
