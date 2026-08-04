@@ -8187,16 +8187,14 @@ CURRENT FILE CONTEXT:
                 } else {
                     summary
                 };
-                // Carried into `mason_edit_application.json`, so the caveat
-                // reaches the artifact an operator actually reads when deciding
-                // whether the run did what the spec asked. The loop concludes
-                // the model is done by failing to recognize a write, so a clean
-                // result is evidence, not proof.
-                let summary = format!(
-                    "{summary} NOTE: tool-loop termination is heuristic — the loop stops on a \
-                     message carrying no recognized tool call or write. Check these edits against \
-                     the spec rather than assuming every requested file is here."
-                );
+                // Carried into `mason_edit_proposal.json`. The apply path
+                // rebuilds `summary` from scratch, so the same caveat is
+                // appended again there (see `MASON_TOOL_LOOP_TERMINATION_CAVEAT`
+                // at the applied-path summary below) — otherwise the note that
+                // tells the operator to "review mason_edit_application.json" is
+                // absent from that very file in the one case it was written
+                // for: a run reporting success.
+                let summary = format!("{summary} {MASON_TOOL_LOOP_TERMINATION_CAVEAT}");
                 Ok(MasonEditProposal {
                     summary,
                     rationale,
@@ -8452,6 +8450,18 @@ CURRENT FILE CONTEXT:
                 shrank_sharply.len(),
                 shrank_sharply.join(", ")
             )
+        };
+
+        // The caveat appended to the proposal summary above does not survive to
+        // here — this branch rebuilds `summary` from scratch — so it has to be
+        // re-appended, or `mason_edit_application.json` (the artifact its own
+        // text tells the operator to review) carries it in every case except
+        // the one that matters: a run that reports success. Gated on the tool
+        // loop, which is the only lane whose termination is heuristic.
+        let summary = if tool_loop_enabled {
+            format!("{summary} {MASON_TOOL_LOOP_TERMINATION_CAVEAT}")
+        } else {
+            summary
         };
 
         // If git_branch is requested and there are real changes, commit them to a
@@ -28376,11 +28386,26 @@ fn workspace_snapshots_equivalent(
     expected_files == actual_files
 }
 
+/// Appended to both the proposal summary and the *applied* summary when the
+/// tool loop is the lane in use, so the operator reads it in
+/// `mason_edit_application.json` — which is the artifact the note itself points
+/// at — and not only in `mason_edit_proposal.json`.
+///
+/// One constant, two sites, because the applied branch rebuilds its summary
+/// from scratch and the two texts drifting apart is how the note went missing
+/// from the success case in the first place.
+const MASON_TOOL_LOOP_TERMINATION_CAVEAT: &str =
+    "NOTE: tool-loop termination is heuristic — the loop stops on a message carrying no \
+     recognized tool call or write. Check these edits against the spec rather than assuming \
+     every requested file is here.";
+
 /// Path prefixes Mason is never shown, in any lane: build output, VCS
-/// internals, and factory state. Shared between `is_mason_context_candidate`
-/// (which picks the single-shot context files) and `mason_tools::read_refusal`
-/// (which filters the tool loop's reads), so the two lanes cannot drift into
-/// disagreeing about what is off limits.
+/// internals, and factory state. Applied through
+/// [`mason_blocked_path_component`] by `is_mason_context_candidate` (which picks
+/// the single-shot context files), `mason_tools::read_refusal` (which filters
+/// the tool loop's reads), and `path_allowed_for_edit` (which decides what any
+/// lane may write), so no two of them can drift into disagreeing about what is
+/// off limits.
 pub(crate) const MASON_BLOCKED_PATH_PREFIXES: [&str; 7] = [
     ".git/",
     ".harkonnen/",
@@ -28391,15 +28416,42 @@ pub(crate) const MASON_BLOCKED_PATH_PREFIXES: [&str; 7] = [
     "factory/",
 ];
 
+/// `Some(prefix)` when any component of `normalized` names one of
+/// [`MASON_BLOCKED_PATH_PREFIXES`].
+///
+/// Components, not a leading-prefix test, and the same rule for reads and for
+/// writes. A leading-prefix test only sees `.git/config`; it lets
+/// `sub/.git/config` and `a/target/x` straight through, and a nested `.git` is
+/// every bit as much a real git directory as the root one.
+///
+/// Used by `mason_tools::read_refusal` (which filters what the tool loop may
+/// read) and by `path_allowed_for_edit` (which decides what any lane may
+/// write), so the filter and the boundary cannot disagree about what is off
+/// limits. Lower-cased on both sides, since a case-insensitive filesystem will
+/// happily resolve `.GIT` to the same directory.
+pub(crate) fn mason_blocked_path_component(normalized: &str) -> Option<&'static str> {
+    let lowered: Vec<String> = Path::new(normalized)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+
+    MASON_BLOCKED_PATH_PREFIXES.iter().copied().find(|prefix| {
+        let name = prefix.trim_end_matches('/');
+        lowered.iter().any(|component| component == name)
+    })
+}
+
 fn is_mason_context_candidate(path: &str) -> bool {
     let normalized = normalize_project_path(path);
     if normalized.is_empty() {
         return false;
     }
-    if MASON_BLOCKED_PATH_PREFIXES
-        .iter()
-        .any(|prefix| normalized.starts_with(prefix))
-    {
+    // Same component test as the read filter and the write boundary — three
+    // callers, one rule, so there is nothing left to drift.
+    if mason_blocked_path_component(&normalized).is_some() {
         return false;
     }
     let Some(ext) = Path::new(&normalized)
@@ -28597,8 +28649,28 @@ fn mason_slim_briefing(briefing: &CoobieBriefing) -> String {
     }
 }
 
+/// Whether Mason may write `path`.
+///
+/// The blocked prefixes are denied *unconditionally*, before `editable_paths`
+/// is consulted at all, so no spec can grant `.git/`, `target/` or `factory/`
+/// by naming them — or, far more easily, by naming the product root. An
+/// ordinary whole-repo spec makes `resolve_path_for_staged_workspace` return
+/// `"."`, the `root == "."` arm below then said yes to everything including
+/// `.git/config`, and with `worker_harness.git_branch: true` the staged file
+/// was copied into the *real* repository by `mason_commit_branch`. The
+/// subsequent `git add -- .git/config` fails and that function bails — but the
+/// copy has already landed and persists. Overwriting `.git/config` destroys
+/// remotes and branch configuration, and `core.fsmonitor` / `core.pager` are
+/// executed by git as shell commands with no executable bit required, so it is
+/// also a code-execution path. The tool loop already refused these; only the
+/// default lanes could do it.
+///
+/// Denying here is loud: the caller reports `edit_outside_scope` and stops.
 fn path_allowed_for_edit(path: &str, editable_paths: &[String]) -> bool {
     let path = normalize_project_path(path);
+    if mason_blocked_path_component(&path).is_some() {
+        return false;
+    }
     editable_paths.iter().any(|root| {
         let root = normalize_project_path(root);
         root == "." || path == root || path.starts_with(&format!("{root}/"))
@@ -29242,6 +29314,74 @@ fn parse_mason_edit_response_with_staged(
     raw: &str,
     staged_product: &Path,
 ) -> Result<MasonEditProposal> {
+    // Route JSON to the JSON parser *first*, before either text transport gets
+    // a look.
+    //
+    // `parse_mason_edit_response` tries fenced, then falls back to JSON only on
+    // `Err`. A JSON edit proposal whose `content` carries literal newlines and
+    // documents the fenced format contains a line reading `### FILE: <path>`,
+    // and to `collect_fenced_edits` that is a real header at top level: the
+    // fenced parse *succeeds*, yielding one file literally named `<path>`.
+    // `validate_mason_edits` has no objection to that name, so the phantom file
+    // is written and every real edit in the proposal is discarded, with `Ok`
+    // returned. Reproduced.
+    //
+    // The alternative fix — requiring the fenced parse to account for the whole
+    // response — was rejected. It is a rejecting heuristic on the live path with
+    // a large false-positive surface (models routinely wrap correct blocks in
+    // prose), and a false rejection there is deterministic and costs the entire
+    // run. This is a *routing* decision instead: it changes only which parser is
+    // tried first, keeps the other as a fallback, and so cannot make any
+    // response that parses today stop parsing. A response written to
+    // `FENCED_FORMAT_INSTRUCTION` begins with `SUMMARY:`, never with `{`.
+    let json_first = strip_json_fences(raw).starts_with('{');
+    let json_error = if json_first {
+        match parse_mason_edit_proposal(raw) {
+            Ok(proposal) => return Ok(proposal),
+            Err(error) => Some(error),
+        }
+    } else {
+        None
+    };
+
+    // A near-miss marker spelling is not a parse error in either text
+    // transport — it is top-level prose, and so is every line of the block
+    // behind it. One correct block alongside one misspelled block therefore
+    // returned `Ok` with the misspelled file simply gone. Reject the whole
+    // response instead; a retry costs one attempt, a dropped file costs the
+    // operator a file they were told was written.
+    //
+    // Deliberately after the JSON route above: a JSON body's `content` string
+    // is opaque to the block tracker, so a proposal documenting `#### FILE:`
+    // would be rejected here even though the JSON parser handles it correctly.
+    // This scan guards the text lanes only.
+    if let Some(problem) = crate::mason_transport::unreadable_edit_marker(raw) {
+        match json_error {
+            Some(json_error) => bail!(
+                "the response matched neither transport. JSON: {json_error:#}. Fenced/patch: \
+                 {problem}"
+            ),
+            None => bail!("Mason's response carries an unreadable edit marker. {problem}"),
+        }
+    }
+
+    parse_mason_text_edits(raw, staged_product).map_err(|text_error| match json_error {
+        // The body opened with `{`, so JSON was tried first and failed. Report
+        // both failures: a JSON body that reaches the text transports produces
+        // a "no ### FILE: blocks were found" error that names the wrong
+        // problem entirely.
+        Some(json_error) => anyhow::anyhow!(
+            "the response matched neither transport. JSON: {json_error:#}. Fenced/patch: \
+             {text_error:#}"
+        ),
+        None => text_error,
+    })
+}
+
+/// The two text transports — `### FILE:` blocks and `### PATCH:` blocks —
+/// after [`parse_mason_edit_response_with_staged`] has ruled out a JSON body
+/// and rejected unreadable markers.
+fn parse_mason_text_edits(raw: &str, staged_product: &Path) -> Result<MasonEditProposal> {
     // A syntactic pre-check, not a swallowed error: only treat this as a pure
     // whole-file response when the raw text contains no *top-level* patch
     // marker. Once one is present, `parse_patch_blocks` runs as a single
@@ -32789,8 +32929,149 @@ mod tests {
         };
         assert_eq!(by_path("a.js").content, "LINE A\n");
         assert_eq!(by_path("b.js").content, "LINE B\n");
-        assert_eq!(by_path("c.js").content, "brand new");
+        // The `### FILE:` transport gives every file exactly one trailing
+        // newline, matching what the patch lane produces from the on-disk
+        // original beside it.
+        assert_eq!(by_path("c.js").content, "brand new\n");
         assert_eq!(proposal.summary, "three edits");
+    }
+
+    #[test]
+    fn a_near_miss_marker_is_rejected_rather_than_dropping_the_block_behind_it() {
+        // C1. Before this, each of these returned Ok with only `a.js` present:
+        // a near-miss header is top-level prose to `collect_fenced_edits`, and
+        // so is every line of the block behind it. One correct block made the
+        // whole run "succeed" while the operator lost a file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+        std::fs::write(staged.join("b.js"), "old b\n").expect("write");
+
+        let cases = [
+            "SUMMARY: x\n\n### FILE: a.js\naaa\n### END FILE\n\n#### FILE: b.js\nbbb\n#### END FILE\n",
+            "SUMMARY: x\n\n### FILE: a.js\naaa\n### END FILE\n\n### File: b.js\nbbb\n### End File\n",
+            "SUMMARY: x\n\n### FILE: a.js\naaa\n### END FILE\n\n###FILE: b.js\nbbb\n###END FILE\n",
+            "SUMMARY: x\n\n### FILE: a.js\naaa\n### END FILE\n\n## FILE: b.js\nbbb\n## END FILE\n",
+            "SUMMARY: x\n\n### FILE: a.js\naaa\n### END FILE\n\n#### PATCH: b.js\n<<<<<<< SEARCH\nold b\n=======\nnew b\n>>>>>>> REPLACE\n",
+            "SUMMARY: x\n\n### PATCH: b.js\n<<<<<<< SEARCH\nold b\n=======\nnew b\n>>>>>>> REPLACE\n\n#### FILE: a.js\naaa\n#### END FILE\n",
+        ];
+        for raw in cases {
+            let error = parse_mason_edit_response_with_staged(raw, staged)
+                .expect_err("a misspelled block must reject the response, not vanish from it");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("looks like") && message.contains("marker"),
+                "the error must name the near-miss marker, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_well_formed_response_survives_the_near_miss_scan() {
+        // The expensive direction. A false rejection here is deterministic:
+        // the model re-emits the same text, the scan refuses it identically,
+        // both attempts drain and the whole run is lost.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+        std::fs::write(staged.join("b.js"), "old b\n").expect("write");
+
+        let allowed = [
+            "SUMMARY: x\n\n### FILE: a.js\naaa\n### END FILE\n",
+            "SUMMARY: x\n\n## Files changed\n## Patch notes\n\n### FILE: a.js\naaa\n### END FILE\n\nDone.\n",
+            // A file that documents the near-miss spellings — this repo has
+            // several. Those lines are that file's content.
+            "SUMMARY: x\n\n### FILE: docs/format.md\n#### FILE: example\n#### END FILE\n### END FILE\n",
+            "SUMMARY: x\n\n### PATCH: b.js\n<<<<<<< SEARCH\nold b\n=======\nnew b\n>>>>>>> REPLACE\n",
+        ];
+        for raw in allowed {
+            parse_mason_edit_response_with_staged(raw, staged)
+                .unwrap_or_else(|error| panic!("must still parse {raw:?}: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn a_json_proposal_documenting_the_fenced_format_is_not_read_as_a_fenced_response() {
+        // C2. `parse_mason_edit_response` tried fenced first and fell back to
+        // JSON only on Err — and the fenced parse *succeeds* on this body,
+        // yielding one file literally named `<path>`. `validate_mason_edits`
+        // has no objection to that name, so the phantom file was written and
+        // every real edit was discarded, with Ok returned.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path();
+
+        let raw = "{\n  \"summary\": \"document the transport\",\n  \"rationale\": [\"docs\"],\n  \
+                   \"edits\": [\n    {\n      \"path\": \"docs/transport.md\",\n      \
+                   \"action\": \"write\",\n      \"summary\": \"describe it\",\n      \
+                   \"content\": \"Mason writes files like this:\n### FILE: <path>\nthe contents\n\
+                   ### END FILE\nand that is the whole format.\"\n    }\n  ]\n}";
+
+        // The defect, still reachable through the fenced parser directly.
+        let fenced = crate::mason_transport::parse_fenced_edits(raw)
+            .expect("the fenced parser is happy with this — that is the defect");
+        assert_eq!(fenced.files[0].path, "<path>");
+
+        // The routed path recovers the real proposal.
+        let proposal = parse_mason_edit_response_with_staged(raw, staged)
+            .expect("a JSON body must be routed to the JSON parser");
+        let paths: Vec<&str> = proposal.edits.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["docs/transport.md"]);
+        assert!(
+            proposal.edits[0].content.contains("### FILE: <path>"),
+            "the documented format is this file's content and must survive verbatim"
+        );
+    }
+
+    #[test]
+    fn blocked_prefixes_are_denied_however_wide_the_editable_scope_is() {
+        // I6. `resolve_path_for_staged_workspace` returns "." for any spec
+        // whose `code_under_test` names the product root, and the `root == "."`
+        // arm then said yes to everything. With `git_branch: true` the staged
+        // file is copied into the real repository before `git add` refuses it,
+        // and `.git/config` carries `core.fsmonitor` / `core.pager`, which git
+        // executes as shell commands.
+        let whole_repo = vec![".".to_string()];
+        for denied in [
+            ".git/config",
+            ".git/hooks/pre-commit",
+            "sub/.git/config",
+            "target/release/x",
+            "a/target/x",
+            "factory/state.db",
+            "node_modules/x/index.js",
+            ".harkonnen/state",
+        ] {
+            assert!(
+                !path_allowed_for_edit(denied, &whole_repo),
+                "{denied} must be denied even when the whole repo is editable"
+            );
+        }
+
+        // Naming them explicitly does not grant them either.
+        assert!(!path_allowed_for_edit(".git/config", &[".git".to_string()]));
+
+        // And ordinary product source is untouched.
+        for allowed in ["js/hints.js", "src/main.rs", "docs/README.md"] {
+            assert!(
+                path_allowed_for_edit(allowed, &whole_repo),
+                "{allowed} must still be editable"
+            );
+        }
+
+        // The over-blocking direction, which is the one that costs a run: the
+        // test is on whole path *components*, so no near-neighbour of a blocked
+        // directory name is caught by it.
+        for allowed in [
+            ".gitignore",
+            ".gitattributes",
+            ".github/workflows/ci.yml",
+            "src/building.rs",
+            "docs/targeting.md",
+            "src/factory_floor.rs",
+        ] {
+            assert!(
+                path_allowed_for_edit(allowed, &whole_repo),
+                "{allowed} is not a blocked directory and must stay editable"
+            );
+        }
     }
 
     #[test]

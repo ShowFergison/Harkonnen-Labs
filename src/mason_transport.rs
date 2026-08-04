@@ -21,7 +21,19 @@ quotes, backslashes or newlines. Do not wrap contents in backticks. Emit one \
 block per file, and nothing after the final ### END FILE. Important: file content \
 must not contain any line that starts with '### FILE:' — the parser cannot \
 distinguish such a line from a real file header. Also, no line of content may \
-consist solely of '### END FILE' — the parser uses that exact phrase to mark block ends.";
+consist solely of '### END FILE' — the parser uses that exact phrase to mark block ends. \
+Indenting such a line does NOT make it safe: the parser trims each line before \
+comparing it, so an indented '### END FILE' still ends your block and every line \
+after it is read as ordinary prose and discarded.
+
+IMPORTANT: The format cannot express a file that lacks a trailing newline. Every \
+file written through this transport is given exactly one final newline, which is \
+what nearly every tool expects. If a file genuinely must end without one, say so \
+instead of writing it.
+
+Markers are matched exactly: three hashes, upper case, spelled as shown. \
+'#### FILE:', '### File:' and '## FILE:' are not headers, and a response \
+containing one is rejected rather than guessed at.";
 
 const FILE_MARKER: &str = "### FILE:";
 const END_MARKER: &str = "### END FILE";
@@ -63,9 +75,10 @@ impl FencedEnvelope {
 ///
 /// This is a best-effort scanner, not a structural validator: `parse_fenced_edits`
 /// and `parse_patch_blocks` remain the source of truth for whether the blocks
-/// themselves are well-formed. Shared by four consumers —
+/// themselves are well-formed. Shared by five consumers —
 /// `parse_summary_and_rationale`, `has_top_level_patch_header`,
-/// `parse_patch_blocks`, and `parse_fenced_edits` — one block-tracking
+/// `parse_patch_blocks`, `parse_fenced_edits`, and `unreadable_edit_marker` —
+/// one block-tracking
 /// implementation, so none of them can disagree about what counts as "inside
 /// a block."
 ///
@@ -236,6 +249,144 @@ pub fn has_top_level_patch_header(raw: &str) -> bool {
     false
 }
 
+/// A hash-prefixed line shaped like one of this codebase's edit markers but
+/// spelled wrong — `#### FILE:`, `### File:`, `## PATCH:`, `#### TOOL:`.
+///
+/// **Shared home on purpose.** This matcher was written, and tuned across three
+/// rounds of false-positive work, for the opt-in tool loop
+/// (`mason_tools::unreadable_write_marker`). The single-shot lanes had exactly
+/// the same defect — a near-miss header is top-level prose to
+/// `collect_fenced_edits`, so the whole block behind it is dropped without a
+/// word — and were fixed by reusing this function rather than writing a second
+/// one. Both lanes now call it, so neither can drift into a different idea of
+/// what "nearly a marker" means. Keep it that way: any change here must be
+/// weighed against both `unreadable_write_marker` and `unreadable_edit_marker`.
+///
+/// **The asymmetry here runs the opposite way to a parser's, and getting it
+/// backwards is what made the first version of this function a Critical.** A
+/// missed near-miss costs one file. A *false* near-miss on a terminal message
+/// costs the entire run and every write in it: the rejection is deterministic,
+/// so the model re-emits the same text, this function refuses it identically,
+/// the budget drains, and the caller bails discarding writes it had already
+/// collected. `## Patch notes` over a finished job was enough to do it. So this
+/// matcher is deliberately strict, and anything it is unsure about is left
+/// alone.
+///
+/// Strictness comes from requiring a *marker-shaped terminator*, not merely a
+/// word boundary. A word boundary alone still matches `## Patch notes` and
+/// `## File changes`, because the boundary is the space — and headings of
+/// exactly that form are how a model naturally writes a summary:
+///
+/// - `TOOL` / `FILE` / `PATCH` / `END FILE` carry a path or a name, so they must
+///   be followed by `:`. Nothing else counts, including end-of-line.
+/// - `CONTENT` / `END CONTENT` standing alone are not matched here at all: see
+///   the note at the end of the function for why a bare content marker cannot
+///   be told from a heading, and why letting it through loses nothing.
+pub(crate) fn near_miss_marker_word(trimmed: &str) -> Option<&'static str> {
+    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+    if !(2..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = trimmed[hashes..].trim_start().to_ascii_uppercase();
+
+    // The colon is the whole tell, and it is required. Every genuine marker of
+    // these four introduces a path or a name, so it always has one — while
+    // `## File`, `## Patch` and `## Tool` are ordinary headings a model writes
+    // when summarizing its work. An `after.is_empty()` clause here bought zero
+    // coverage and cost three runs outright. Longest first, so `END FILE`
+    // is never read as `FILE`.
+    for word in ["END FILE", "TOOL", "FILE", "PATCH"] {
+        let Some(after) = rest.strip_prefix(word) else {
+            continue;
+        };
+        if after.starts_with(':') {
+            return Some(word);
+        }
+    }
+
+    // Standalone `CONTENT` / `END CONTENT` / `END FILE` are deliberately NOT
+    // sufficient on their own. `## Content` is shape-identical to `#### CONTENT`
+    // — the line alone cannot be told apart from a heading, and guessing wrong
+    // costs the whole run. They are only meaningful beside a header, which the
+    // callers find first: a block terminator with no header names no path, so
+    // no write can be reconstructed from it and none is lost by letting it
+    // through.
+    None
+}
+
+/// Block-aware pre-scan for the *default* (non-tool-loop) edit transports.
+/// `Some(reason)` means the response carries a line that is trying to open or
+/// close an edit block in a spelling neither `collect_fenced_edits` nor
+/// `parse_patch_blocks` reads.
+///
+/// This is the single-shot mirror of `mason_tools::unreadable_write_marker`,
+/// and it exists because those two parsers recognise a header only on exact
+/// `### FILE:` / `### PATCH:` and a closer only on exact `### END FILE`.
+/// Anything that misses — `#### FILE:`, `### File:`, `###FILE:`, `## FILE:` —
+/// is not a parse error. It is *top-level prose*, and so is every line of the
+/// block behind it. A response mixing one correct block with one misspelled one
+/// therefore returned `Ok` with the misspelled file simply absent: the run
+/// reported success and the operator lost a file they were told was written.
+/// It failed loudly only when *every* block was misspelled.
+///
+/// Three properties make this safe to run on the live path:
+///
+/// - **Block-aware.** Body lines of a well-formed `### FILE:` or `### PATCH:`
+///   block are skipped via `BlockTracker`, because this repo contains several
+///   files that legitimately document these markers, and `#### FILE:` inside a
+///   file's own content is that file's text. A naive substring scan would
+///   reject such a response forever, on every retry — the mistake
+///   `has_top_level_patch_header` was fixed for.
+/// - **Exact markers pass through.** They are what the parsers read; only
+///   near-misses and foreign transports reach the matcher.
+/// - **The matcher is [`near_miss_marker_word`]**, already tuned so ordinary
+///   markdown headings (`## Files changed`, `## Patch notes`) do not match.
+///
+/// The cost of a false positive here is bounded: `complete_edit_proposal_with_retry`
+/// runs two attempts, and the second failure surfaces as a loud
+/// `invalid_llm_edit_response`. That is strictly better than the silent loss it
+/// replaces.
+///
+/// Note this deliberately does *not* look for JSON edit proposals. JSON is
+/// still a live transport on this lane, so a JSON-shaped body must be *routed*
+/// to `parse_mason_edit_proposal`, not rejected — which is why the caller makes
+/// that routing decision before calling this.
+pub fn unreadable_edit_marker(raw: &str) -> Option<String> {
+    let mut tracker = BlockTracker::new();
+
+    for (index, line) in raw.split('\n').enumerate() {
+        let trimmed = line.trim_end_matches('\r').trim();
+
+        // Inside a block body, or on the closer line of one: content, not
+        // structure.
+        if !tracker.consume(trimmed) {
+            continue;
+        }
+
+        // The exact markers these lanes *do* read are fine — they are the
+        // reason the response parses at all.
+        if trimmed.starts_with(FILE_MARKER)
+            || trimmed.starts_with(PATCH_HEADER_MARKER)
+            || trimmed == END_MARKER
+        {
+            continue;
+        }
+
+        if let Some(word) = near_miss_marker_word(trimmed) {
+            return Some(format!(
+                "line {}: {trimmed:?} looks like a '{word}' marker but is not one — this lane \
+                 reads only '{FILE_MARKER}', '{END_MARKER}' and '{PATCH_HEADER_MARKER}', spelled \
+                 exactly, with three hashes and in upper case. Every line of the block behind a \
+                 misspelled marker would be read as prose and dropped, so the response is \
+                 rejected instead.",
+                index + 1
+            ));
+        }
+    }
+
+    None
+}
+
 /// Whole-file blocks, or an error explaining why there are none. For the
 /// fenced transport a response without a single `### FILE:` block is a
 /// failure, so that stays an error here.
@@ -298,10 +449,23 @@ fn collect_fenced_edits(raw: &str) -> Result<Option<FencedEnvelope>> {
             // Check if this line is exactly the END_MARKER
             if trimmed == END_MARKER {
                 let path = path.clone();
-                let content = body.join("\n");
+                // One trailing newline, always — matching what the old JSON
+                // transport produced and what essentially every tool on the
+                // other side of this expects. `body.join("\n")` alone gave
+                // every file written through this transport `\ No newline at
+                // end of file`, failing `cargo fmt --check` and lint gates on
+                // otherwise-correct output and making a read-then-write-
+                // verbatim register as a change. The format cannot express a
+                // file *without* a trailing newline; `FENCED_FORMAT_INSTRUCTION`
+                // says so, exactly as `PATCH_FORMAT_INSTRUCTION` documents the
+                // mirror-image limitation in the patch lane.
+                let mut content = body.join("\n");
+                if !content.is_empty() {
+                    content.push('\n');
+                }
                 files.push(FencedFile { path, content });
                 current = None;
-            } else if let Some(_) = trimmed.strip_prefix(FILE_MARKER) {
+            } else if trimmed.strip_prefix(FILE_MARKER).is_some() {
                 // A FILE_MARKER encountered inside an open block is an error
                 bail!(
                     "encountered a {FILE_MARKER} marker at line {} while the {FILE_MARKER} \
@@ -453,10 +617,15 @@ pub fn parse_patch_blocks(raw: &str) -> Result<Vec<PatchBlock>> {
     // real top-level patch in the same reply.
     let mut file_tracker = BlockTracker::file_blocks_only();
 
-    for (line_idx, line) in raw.lines().enumerate() {
+    // Split on '\n' and keep any trailing '\r', exactly as `collect_fenced_edits`
+    // does. `raw.lines()` strips the '\r' of a CRLF response, so a patch against
+    // a CRLF file produced SEARCH text with LF endings that could never match
+    // the file's CRLF ones. `apply_patch_block` refused — correctly and loudly —
+    // but the model has no way to express a '\r' in this format, so the retry
+    // was deterministic and the file was permanently unpatchable.
+    for (line_idx, line) in raw.split('\n').enumerate() {
         let line_num = line_idx + 1;
-        let trimmed = line.trim_end();
-        let marker_trim = trimmed.trim();
+        let marker_trim = line.trim_end_matches('\r').trim();
 
         // Only consult the FILE tracker between patches. Inside an open patch
         // (`section != 0`) every line belongs to that patch's SEARCH or
@@ -660,7 +829,126 @@ The bonus room ("Dad's Workshop") is optional.
         let envelope = parse_fenced_edits(raw).expect("indented terminator must parse");
         assert_eq!(envelope.files.len(), 1);
         assert_eq!(envelope.files[0].path, "a.txt");
-        assert_eq!(envelope.files[0].content, "content");
+        // Trailing newline is added by the transport — see
+        // `fenced_envelope_gives_every_file_a_trailing_newline`.
+        assert_eq!(envelope.files[0].content, "content\n");
+    }
+
+    #[test]
+    fn fenced_envelope_loses_the_tail_after_an_indented_terminator() {
+        // I4: the round-1 symmetric-trim fix correctly made an indented
+        // `### END FILE` close the block — and thereby turned a loud truncation
+        // into a silent one. Everything after it is top-level prose, which this
+        // transport legitimately ignores (models write closing remarks), so
+        // there is no way to distinguish lost content from a sign-off. It
+        // cannot be made loud without rejecting well-formed responses, so it is
+        // pinned here and stated in FENCED_FORMAT_INSTRUCTION instead.
+        let raw = "SUMMARY: x\n\n### FILE: a.txt\nreal line\n  ### END FILE\nTAIL LINE ONE\n\
+                   TAIL LINE TWO\n";
+        let envelope = parse_fenced_edits(raw).expect("an indented terminator closes the block");
+        assert_eq!(envelope.files.len(), 1);
+        assert_eq!(
+            envelope.files[0].content, "real line\n",
+            "everything after the indented terminator is discarded — the model must be told"
+        );
+        assert!(
+            FENCED_FORMAT_INSTRUCTION.contains("Indenting such a line does NOT make it safe"),
+            "the instruction must warn about this, as TOOL_LOOP_INSTRUCTION does"
+        );
+    }
+
+    #[test]
+    fn fenced_envelope_gives_every_file_a_trailing_newline() {
+        // I3: `body.join("\n")` alone produced content that never ended in a
+        // newline, so every file in every Mason branch carried
+        // `\ No newline at end of file`. The old JSON transport did not.
+        let raw = "SUMMARY: x\n\n### FILE: a.txt\nline1\nline2\n### END FILE\n";
+        let envelope = parse_fenced_edits(raw).expect("must parse");
+        assert_eq!(envelope.files[0].content, "line1\nline2\n");
+
+        // An empty file stays empty — a lone newline is not "no content".
+        let empty = "SUMMARY: x\n\n### FILE: a.txt\n### END FILE\n";
+        let envelope = parse_fenced_edits(empty).expect("must parse");
+        assert_eq!(envelope.files[0].content, "");
+
+        // Content that already ends in a blank line keeps exactly one more
+        // newline, not two — the blank line is a body line of its own.
+        let blank_tail = "SUMMARY: x\n\n### FILE: a.txt\nline1\n\n### END FILE\n";
+        let envelope = parse_fenced_edits(blank_tail).expect("must parse");
+        assert_eq!(envelope.files[0].content, "line1\n\n");
+    }
+
+    #[test]
+    fn unreadable_edit_marker_rejects_near_miss_spellings() {
+        // C1: each of these returned `Ok` with the misspelled block's file
+        // simply absent — one correct block was enough to make the run
+        // "succeed".
+        let cases = [
+            "SUMMARY: x\n\n### FILE: a.js\naaa\n### END FILE\n\n#### FILE: b.js\nbbb\n#### END FILE\n",
+            "SUMMARY: x\n\n### FILE: a.js\naaa\n### END FILE\n\n### File: b.js\nbbb\n### End File\n",
+            "SUMMARY: x\n\n### FILE: a.js\naaa\n### END FILE\n\n###FILE: b.js\nbbb\n###END FILE\n",
+            "SUMMARY: x\n\n### FILE: a.js\naaa\n### END FILE\n\n## FILE: b.js\nbbb\n## END FILE\n",
+            "SUMMARY: x\n\n### FILE: a.js\naaa\n### END FILE\n\n#### PATCH: b.js\n<<<<<<< SEARCH\nq\n=======\nr\n>>>>>>> REPLACE\n",
+            "SUMMARY: x\n\n### PATCH: a.js\n<<<<<<< SEARCH\nq\n=======\nr\n>>>>>>> REPLACE\n\n#### FILE: b.js\nbbb\n#### END FILE\n",
+        ];
+        for raw in cases {
+            assert!(
+                unreadable_edit_marker(raw).is_some(),
+                "a near-miss marker must be rejected, not read as prose: {raw:?}"
+            );
+            // The old behaviour: the parser is perfectly happy, and the
+            // misspelled block is gone.
+            if let Ok(Some(envelope)) = parse_fenced_edits_optional(raw) {
+                assert!(
+                    envelope.files.iter().all(|file| file.path != "b.js"),
+                    "this test is only meaningful while the parser still drops b.js"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_edit_marker_accepts_well_formed_responses() {
+        // The false-positive side, which is the expensive one: a rejection here
+        // is deterministic and costs the whole run.
+        let allowed = [
+            // Exact markers.
+            "SUMMARY: x\n\n### FILE: a.js\naaa\n### END FILE\n",
+            "SUMMARY: x\n\n### PATCH: a.js\n<<<<<<< SEARCH\nq\n=======\nr\n>>>>>>> REPLACE\n",
+            // Ordinary markdown headings a model writes when summarizing.
+            "SUMMARY: x\n\n## Files changed\n## Patch notes\n### Summary of the work\n\
+             ### FILE: a.js\naaa\n### END FILE\n",
+            // Near-miss spellings *inside* a file block are that file's own
+            // content. This repo contains several files that document them.
+            "SUMMARY: x\n\n### FILE: docs/format.md\n#### FILE: example\n#### END FILE\n### END FILE\n",
+            // And inside a patch body.
+            "SUMMARY: x\n\n### PATCH: docs/format.md\n<<<<<<< SEARCH\n#### FILE: example\n\
+             =======\n#### PATCH: example\n>>>>>>> REPLACE\n",
+        ];
+        for raw in allowed {
+            assert_eq!(
+                unreadable_edit_marker(raw),
+                None,
+                "a well-formed response must not be rejected: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_blocks_preserve_crlf_line_endings() {
+        // I5: `raw.lines()` stripped the '\r' of a CRLF response, so the SEARCH
+        // text could never match a CRLF file. `apply_patch_block` refused
+        // correctly — but the format cannot express a '\r', so the retry was
+        // deterministic and the file was permanently unpatchable.
+        let raw = "### PATCH: a.js\r\n<<<<<<< SEARCH\r\nline b\r\n=======\r\nline B\r\n>>>>>>> REPLACE\r\n";
+        let blocks = parse_patch_blocks(raw).expect("must parse");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].search, "line b\r");
+        assert_eq!(blocks[0].replace, "line B\r");
+
+        let original = "line a\r\nline b\r\nline c\r\n";
+        let patched = apply_patch_block(original, &blocks[0]).expect("a CRLF patch must apply");
+        assert_eq!(patched, "line a\r\nline B\r\nline c\r\n");
     }
 
     #[test]
@@ -677,7 +965,9 @@ The bonus room ("Dad's Workshop") is optional.
             envelope.files[0].content.contains("\r"),
             "CRLF must be preserved, not stripped to LF"
         );
-        assert_eq!(envelope.files[0].content, "line1\r\nline2\r");
+        // Plus the one trailing newline every file gets — the second line's
+        // own CR is still there, so the file ends "\r\n" as a CRLF file should.
+        assert_eq!(envelope.files[0].content, "line1\r\nline2\r\n");
     }
 
     #[test]

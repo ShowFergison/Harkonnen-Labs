@@ -26,6 +26,12 @@ use anyhow::{bail, Result};
 use std::path::{Component, Path, PathBuf};
 
 use crate::llm::{LlmProvider, LlmRequest, Message};
+// One matcher, two lanes. `near_miss_marker_word` was written and tuned here,
+// then found to be exactly what the single-shot transports were missing; it
+// lives in `mason_transport` now so this lane and that one cannot drift into
+// different ideas of what "nearly a marker" means. See
+// `mason_transport::unreadable_edit_marker` for the sibling caller.
+use crate::mason_transport::near_miss_marker_word;
 
 const TOOL_MARKER: &str = "### TOOL:";
 const CONTENT_MARKER: &str = "### CONTENT";
@@ -676,10 +682,12 @@ pub async fn run_mason_tool_loop_with_recorder(
 /// of the names, and `list_dir .ssh` returning `id_ecdsa` is still Mason being
 /// shown something these rules promise it is never shown:
 ///
-/// - the same blocked prefixes the single-shot context builder already applies,
-///   shared as a constant so the two lanes cannot drift apart. Matched on path
-///   *components*, so `target` (the directory itself) is refused, not only
-///   `target/build.log`;
+/// - the same blocked prefixes the single-shot lanes apply, shared through
+///   `orchestrator::mason_blocked_path_component` so the read filter and the
+///   write boundary cannot drift apart. Matched on *any* path component, so
+///   `target` (the directory itself) is refused, and so are `sub/.git/config`
+///   and `a/target/x` — checking only the first component let both of those
+///   through;
 /// - credential directories, anywhere in the path. Directory rules age better
 ///   than filename rules: `id_rsa` was blocked while `.ssh/id_ecdsa` — one
 ///   letter different — was not;
@@ -692,6 +700,14 @@ pub async fn run_mason_tool_loop_with_recorder(
 /// named nothing in particular is still readable. The disclosure on
 /// `WorkerHarnessConfig::tool_loop` is what makes that the operator's decision
 /// rather than a silent one.
+///
+/// Scope note, so the sharing claim above is not read as more than it is: only
+/// the *blocked prefixes* are shared with the single-shot lanes. The credential
+/// rules below — credential directories, key material by extension, `.netrc`
+/// and friends — exist in this lane alone, because only this lane lets the
+/// model choose what it reads. The single-shot lane's context files are picked
+/// by the harness (`build_mason_context_files`), so there is nothing there for
+/// these rules to filter.
 fn read_refusal(normalized: &str) -> Option<String> {
     let components = Path::new(normalized)
         .components()
@@ -701,15 +717,11 @@ fn read_refusal(normalized: &str) -> Option<String> {
         })
         .collect::<Vec<_>>();
 
-    if let Some(first) = components.first() {
-        for prefix in crate::orchestrator::MASON_BLOCKED_PATH_PREFIXES {
-            if first == prefix.trim_end_matches('/') {
-                return Some(format!(
-                    "{prefix} is excluded from Mason's reads — it holds build output, VCS \
-                     internals or factory state, not product source"
-                ));
-            }
-        }
+    if let Some(prefix) = crate::orchestrator::mason_blocked_path_component(normalized) {
+        return Some(format!(
+            "{prefix} is excluded from Mason's reads — it holds build output, VCS \
+             internals or factory state, not product source"
+        ));
     }
 
     const CREDENTIAL_DIRS: [&str; 7] = [
@@ -781,9 +793,14 @@ fn read_refusal(normalized: &str) -> Option<String> {
 /// read — which is the difference between a model that has finished and a model
 /// whose output was thrown away.
 ///
-/// This is the guard that makes termination *positive*. `parse_tool_calls`
-/// returning zero calls only means no exact `### TOOL:` header was found, and
-/// there are far more ways to miss that header than to hit it:
+/// This is the guard that stands between "I could not read this" and "the model
+/// is finished". It does **not** make termination positive — see the note at
+/// the end of [`parse_tool_calls`], which enumerates the shapes still known to
+/// slip through and be read as a sign-off. It only lengthens the list of
+/// markers whose *absence* is required, which is a narrower claim and the only
+/// one this function can support. `parse_tool_calls` returning zero calls means
+/// no exact `### TOOL:` header was found, and there are far more ways to miss
+/// that header than to hit it:
 ///
 /// - another live Mason transport (`### FILE:`, `### PATCH:`, a JSON edit
 ///   proposal) — JSON is the likeliest, since it is still a supported transport
@@ -842,61 +859,6 @@ fn unreadable_write_marker(raw: &str) -> Option<String> {
             ));
         }
     }
-    None
-}
-
-/// A hash-prefixed line shaped like one of this lane's markers but spelled
-/// wrong — `#### TOOL:`, `### File:`, `## CONTENT`.
-///
-/// **The asymmetry here runs the opposite way to a parser's, and getting it
-/// backwards is what made the first version of this function a Critical.** A
-/// missed near-miss costs one file. A *false* near-miss on a terminal message
-/// costs the entire run and every write in it: the rejection is deterministic,
-/// so the model re-emits the same sign-off, this function refuses it
-/// identically, the turn budget drains, and the loop bails discarding writes it
-/// had already collected. `## Patch notes` over a finished job was enough to do
-/// it. So this matcher is deliberately strict, and anything it is unsure about
-/// is left alone.
-///
-/// Strictness comes from requiring a *marker-shaped terminator*, not merely a
-/// word boundary. A word boundary alone still matches `## Patch notes` and
-/// `## File changes`, because the boundary is the space — and headings of
-/// exactly that form are how a model naturally writes a summary:
-///
-/// - `TOOL` / `FILE` / `PATCH` / `END FILE` carry a path or a name, so they must
-///   be followed by `:`. Nothing else counts, including end-of-line.
-/// - `CONTENT` / `END CONTENT` standing alone are not matched here at all: see
-///   the note at the end of the function for why a bare content marker cannot
-///   be told from a heading, and why letting it through loses nothing.
-fn near_miss_marker_word(trimmed: &str) -> Option<&'static str> {
-    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
-    if !(2..=6).contains(&hashes) {
-        return None;
-    }
-    let rest = trimmed[hashes..].trim_start().to_ascii_uppercase();
-
-    // The colon is the whole tell, and it is required. Every genuine marker of
-    // these four introduces a path or a name, so it always has one — while
-    // `## File`, `## Patch` and `## Tool` are ordinary headings a model writes
-    // when summarizing its work. An `after.is_empty()` clause here bought zero
-    // coverage and cost those three runs outright. Longest first, so `END FILE`
-    // is never read as `FILE`.
-    for word in ["END FILE", "TOOL", "FILE", "PATCH"] {
-        let Some(after) = rest.strip_prefix(word) else {
-            continue;
-        };
-        if after.starts_with(':') {
-            return Some(word);
-        }
-    }
-
-    // Standalone `CONTENT` / `END CONTENT` / `END FILE` are deliberately NOT
-    // sufficient on their own. `## Content` is shape-identical to `#### CONTENT`
-    // — the line alone cannot be told apart from a heading, and guessing wrong
-    // costs the whole run. They are only meaningful beside a header, which
-    // `unreadable_write_marker` finds first: a content block with no header
-    // names no path, so no write can be reconstructed from it and none is lost
-    // by letting it through.
     None
 }
 

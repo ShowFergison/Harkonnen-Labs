@@ -1,5 +1,33 @@
 # Mason Edit Transport Implementation Plan
 
+> ## ⚠️ THE REFERENCE CODE IN THIS PLAN IS NOT AUTHORITATIVE — THE COMMITTED SOURCE IS
+>
+> Every `rust` snippet below was **written but never executed** before it was
+> put in this document. Four of them shipped **Critical, silent** defects —
+> defects that made the parser return `Ok` while discarding content the model
+> had actually produced. None were found by reading; all were found by
+> compiling the logic standalone and running adversarial input against it.
+>
+> The known-bad reference implementations are in **Tasks 2, 5, 6 and 7**, and
+> each is annotated inline below with a `⚠️ KNOWN-BAD` note. The list is not
+> guaranteed complete — the same method that found four would likely find more.
+>
+> If you are re-deriving this work, or reviewing a diff against it:
+>
+> - **Read `src/mason_transport.rs`, `src/mason_tools.rs` and
+>   `src/orchestrator.rs`, not this file.** They carry the corrected logic and
+>   the reasoning for each correction.
+> - Read the ledger at
+>   `.superpowers/sdd/2026-08-03-mason-edit-transport/progress.md` and the final
+>   fix report beside it for what changed and why.
+> - Treat any snippet here as a sketch of *intent*. Do not copy one into source
+>   without executing it against adversarial input first.
+>
+> A whole-branch review after all seven tasks passed found defects that
+> per-task review structurally could not: the per-task reviews checked each
+> reference implementation against its own brief, and the briefs were derived
+> from the same unexecuted code.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the single-shot JSON-blob edit transport with a retry loop, a fenced-file envelope, a patch format, and finally real tool calls — so Mason can reliably turn a model response into files on disk.
@@ -269,6 +297,17 @@ fn fenced_envelope_rejects_a_path_that_is_not_a_path() {
 
 Run: `cargo test -q --lib -- fenced_envelope`
 Expected: FAIL — module does not exist
+
+> ⚠️ **KNOWN-BAD reference implementation.** The parser below shipped a
+> Critical silent defect: content lines were compared without symmetric
+> trimming and a `### FILE:` marker encountered inside an open block was
+> swallowed rather than refused, so a block could be truncated or a whole file
+> dropped with `Ok` returned. The final review found two more defects the fixed
+> version still carried — near-miss marker spellings (`#### FILE:`, `### File:`)
+> silently dropping whole blocks, and every file losing its trailing newline.
+> See `collect_fenced_edits`, `unreadable_edit_marker` and
+> `near_miss_marker_word` in `src/mason_transport.rs` for what is actually
+> correct.
 
 - [ ] **Step 3: Implement the parser**
 
@@ -724,6 +763,15 @@ fn patch_blocks_parse_from_the_wire_format() {
 Run: `cargo test -q --lib -- patch_block`
 Expected: FAIL — types do not exist
 
+> ⚠️ **KNOWN-BAD reference implementation.** `parse_patch_blocks` below shipped
+> **five** defects, two of them Critical and silent — a `### PATCH:` header
+> arriving while a block was open cleared the accumulated state and discarded
+> the previous patch entirely (two patches in, one out, `Ok`, no signal), and a
+> `### FILE:` block left open swallowed every later patch. It also has no
+> section guards on `<<<<<<< SEARCH`, `=======` or `>>>>>>> REPLACE`, and
+> `raw.lines()` strips the `\r` of a CRLF response so such a patch can never
+> match a CRLF file. See `parse_patch_blocks` in `src/mason_transport.rs`.
+
 - [ ] **Step 3: Implement**
 
 ```rust
@@ -879,6 +927,17 @@ fn a_patch_against_a_missing_file_is_refused_clearly() {
 Run: `cargo test -q --lib -- patches_resolve`
 Expected: FAIL — `cannot find function parse_mason_edit_response_with_staged`
 
+> ⚠️ **KNOWN-BAD reference implementation.** The `parse_patch_blocks(raw).unwrap_or_default()`
+> on the first line of the function below is the Task 6 Critical, verbatim and
+> unfixed: it swallows every patch-parse error, so a malformed patch hiding
+> behind a valid `### FILE:` block vanished with no error anywhere. The same
+> function later grew, and then lost, three more silent-skip defects across four
+> review rounds. The final review added two more findings to this same
+> function: a JSON edit proposal documenting the fenced format parsed as a
+> fenced response naming a file `<path>`, and near-miss markers were never
+> checked at all. See `parse_mason_edit_response_with_staged` and
+> `parse_mason_text_edits` in `src/orchestrator.rs`.
+
 - [ ] **Step 3: Implement**
 
 ```rust
@@ -999,6 +1058,16 @@ fn write_file_tool_carries_its_content_block() {
 
 Run: `cargo test -q --lib -- tool_calls_parse`
 Expected: FAIL — module does not exist
+
+> ⚠️ **KNOWN-BAD reference implementation.** The tool loop below treats
+> `parse_tool_calls` returning zero calls as "the model has finished", which is
+> the Critical: a message carrying a write in a near-miss spelling
+> (`#### TOOL:`, `### Tool:`) or a foreign transport parses to zero calls, and
+> the loop signed off while discarding it. The shipped version adds
+> `unreadable_write_marker` (and `near_miss_marker_word`, now shared with the
+> single-shot lanes in `src/mason_transport.rs`) and a guard so the loop cannot
+> discard writes it has already collected. Termination here is still not
+> positive — see the note on `parse_tool_calls` in `src/mason_tools.rs`.
 
 - [ ] **Step 3: Implement the tool vocabulary**
 
