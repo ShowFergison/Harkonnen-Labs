@@ -23,7 +23,7 @@
 //!    forgotten, and one of them would eventually be.
 
 use anyhow::{bail, Result};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::llm::{LlmProvider, LlmRequest, Message};
 
@@ -61,7 +61,9 @@ Rules:
 refused outright and end the run.
 - read_file and list_dir can reach any file in the workspace, not only the ones \
 you may edit. Read what you need to understand the change; do not go looking \
-through unrelated files.
+through unrelated files. Build output, VCS internals and anything holding \
+credentials are refused — you will get an ERROR result naming the reason, which \
+is not a failure and not something to retry.
 - You may emit more than one tool call in a single message; each is executed in \
 order and every result is returned to you.
 - write_file replaces the whole file. Include the complete contents, exactly as \
@@ -141,11 +143,25 @@ pub fn parse_tool_call(raw: &str) -> Option<MasonTool> {
 /// parser does not read at all — a JSON edit proposal, a `### FILE:` block, or
 /// the right vocabulary one character off (`#### TOOL:`, `### Tool:`) — and
 /// every one of those parses to zero calls here. [`unreadable_write_marker`]
-/// exists to catch exactly that, and
-/// [`run_mason_tool_loop_with_recorder`] consults it before ever concluding the
-/// model is done. Termination in this lane is positive — no calls *and* nothing
-/// unreadable — because "I could not read this" and "the model is finished"
-/// must never be the same outcome.
+/// exists to catch that, and [`run_mason_tool_loop_with_recorder`] consults it
+/// before ever concluding the model is done, because "I could not read this" and
+/// "the model is finished" must never be the same outcome.
+///
+/// Be clear about what that buys, though: termination is **not** positive. It is
+/// still absence-of-markers, only with a longer list of markers. These are known
+/// to slip through and be read as the model signing off, dropping whatever they
+/// carried:
+///
+/// - no hashes at all (`TOOL: write_file`, `FILE: js/a.js`);
+/// - a single hash (`# TOOL:`) or seven or more;
+/// - a fenced ` ```js ` block with the filename in a comment;
+/// - unquoted YAML (`edits:` / `- path:`);
+/// - a pretty-printed JSON proposal whose `"edits"` and `[` land on separate
+///   lines *and* whose `"path":` and `"content":` land on separate lines.
+///
+/// A genuinely positive test — requiring an explicit end-of-work token before
+/// accepting termination — is the real fix and is not what this does. Do not
+/// read the guard as more than it is.
 pub fn parse_tool_calls(raw: &str) -> Result<Vec<MasonTool>> {
     let mut calls: Vec<MasonTool> = Vec::new();
     let mut pending: Option<Pending> = None;
@@ -444,8 +460,10 @@ pub async fn run_mason_tool_loop_with_recorder(
         }
 
         if calls.is_empty() {
-            // No tool calls, and nothing in the message that this lane failed to
-            // read. Only now is the model finished.
+            // No tool calls, and nothing in the message this lane recognized as
+            // an unreadable write. That is the best available evidence the model
+            // is finished — not proof; see `parse_tool_calls` for the shapes
+            // that still get through.
             return Ok(writes
                 .into_iter()
                 .map(|(_resolved, path, content)| (path, content))
@@ -476,6 +494,14 @@ pub async fn run_mason_tool_loop_with_recorder(
             // `/etc/cron.d/evil` as a workspace-relative write. Confined, but
             // not what the model asked for, and not what it was told would
             // happen. Refusing is louder and keeps the instruction honest.
+            //
+            // Only paths absolute *on this platform* are caught. `\etc\passwd`
+            // and `C:\windows\x` are not absolute on Linux, so they normalize to
+            // `etc/passwd` and `C:/windows/x` and are read or written inside the
+            // workspace — the same silent re-rooting this comment says it wanted
+            // to avoid, for the spellings `Path` does not recognize. Harmless
+            // (still confined, still scope-checked at apply time) and consistent
+            // with every other transport, but it is re-rooting, not refusal.
             if Path::new(tool.path()).is_absolute() {
                 bail!(
                     "Mason's '{}' tool call uses the absolute path {:?}. Tool paths must be \
@@ -495,19 +521,26 @@ pub async fn run_mason_tool_loop_with_recorder(
                 )
             })?;
 
+            // Computed once, for reads *and* listings. A listing is a read of
+            // the names: `list_dir .ssh` returning `id_ecdsa` is still Mason
+            // being shown what these rules promise it is never shown, and a
+            // promise the code does not keep is worse than no promise at all.
+            // Not an escape — the path is inside the workspace — so this is a
+            // soft refusal the model can work around, not a boundary violation
+            // that ends the run.
+            let refusal = read_refusal(&normalized);
+
             let result = match tool {
-                MasonTool::ReadFile { path } => match read_refusal(&normalized) {
-                    // Not an escape — the path is inside the workspace — so
-                    // this is a soft refusal the model can work around, not a
-                    // boundary violation that ends the run.
-                    Some(reason) => format!("ERROR: reading {path}: {reason}"),
-                    None => match std::fs::read_to_string(&resolved) {
-                        Ok(text) => text,
-                        // A missing file is information the model asked for, not
-                        // a failure of the loop: it is allowed to probe for a
-                        // file and learn it is not there.
-                        Err(error) => format!("ERROR: reading {path}: {error}"),
-                    },
+                MasonTool::ReadFile { path } | MasonTool::ListDir { path } if refusal.is_some() => {
+                    let reason = refusal.unwrap_or_default();
+                    format!("ERROR: {} {path}: {reason}", tool.name())
+                }
+                MasonTool::ReadFile { path } => match std::fs::read_to_string(&resolved) {
+                    Ok(text) => text,
+                    // A missing file is information the model asked for, not a
+                    // failure of the loop: it is allowed to probe for a file and
+                    // learn it is not there.
+                    Err(error) => format!("ERROR: reading {path}: {error}"),
                 },
                 MasonTool::ListDir { path } => match std::fs::read_dir(&resolved) {
                     Ok(entries) => {
@@ -610,43 +643,90 @@ pub async fn run_mason_tool_loop_with_recorder(
 /// means a `read_file` on `.env` would ship `API_KEY=sk-live-…` verbatim into
 /// the provider conversation, from a file no operator ever chose to share.
 ///
-/// Two rules, both narrow:
+/// Three rules, applied to reads *and* listings — a directory listing is a read
+/// of the names, and `list_dir .ssh` returning `id_ecdsa` is still Mason being
+/// shown something these rules promise it is never shown:
 ///
 /// - the same blocked prefixes the single-shot context builder already applies,
-///   shared as a constant so the two lanes cannot drift apart;
-/// - credential-bearing filenames, which the prefix list does not cover because
-///   they sit at the workspace root.
+///   shared as a constant so the two lanes cannot drift apart. Matched on path
+///   *components*, so `target` (the directory itself) is refused, not only
+///   `target/build.log`;
+/// - credential directories, anywhere in the path. Directory rules age better
+///   than filename rules: `id_rsa` was blocked while `.ssh/id_ecdsa` — one
+///   letter different — was not;
+/// - credential-bearing filenames, for the ones that sit loose in a project.
 ///
-/// This is a filter, not a boundary: refusing a read is reported to the model as
-/// a normal tool error and it can carry on. Nothing the model produced is
-/// discarded, so the loud-failure invariant does not apply here.
+/// This is a filter, not a boundary: refusing is reported to the model as a
+/// normal tool error and it can carry on. Nothing the model produced is
+/// discarded, so the loud-failure invariant does not apply here. It is also a
+/// *denylist*, and therefore incomplete by construction — a secret in a file
+/// named nothing in particular is still readable. The disclosure on
+/// `WorkerHarnessConfig::tool_loop` is what makes that the operator's decision
+/// rather than a silent one.
 fn read_refusal(normalized: &str) -> Option<String> {
-    for prefix in crate::orchestrator::MASON_BLOCKED_PATH_PREFIXES {
-        if normalized.starts_with(prefix) {
+    let components = Path::new(normalized)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(first) = components.first() {
+        for prefix in crate::orchestrator::MASON_BLOCKED_PATH_PREFIXES {
+            if first == prefix.trim_end_matches('/') {
+                return Some(format!(
+                    "{prefix} is excluded from Mason's reads — it holds build output, VCS \
+                     internals or factory state, not product source"
+                ));
+            }
+        }
+    }
+
+    const CREDENTIAL_DIRS: [&str; 7] = [
+        ".ssh", ".aws", ".gnupg", ".gpg", ".docker", ".kube", ".azure",
+    ];
+    for component in &components {
+        if CREDENTIAL_DIRS.contains(&component.as_str()) {
             return Some(format!(
-                "{prefix} is excluded from Mason's reads — it holds build output or factory \
-                 state, not product source"
+                "{component}/ holds credentials and is never shared with a model. Ask the \
+                 operator for any value you need from it."
             ));
         }
     }
 
-    let file_name = Path::new(normalized)
-        .file_name()
-        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+    let Some(file_name) = components.last() else {
+        return None;
+    };
+    let extension = Path::new(file_name.as_str())
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    let secret = file_name == ".env"
-        || file_name.starts_with(".env.")
-        || file_name.ends_with(".pem")
-        || file_name.ends_with(".key")
-        || file_name.ends_with(".p12")
-        || file_name.ends_with(".pfx")
-        || file_name == "credentials.json"
-        || file_name == "credentials"
-        || file_name == ".netrc"
-        || file_name == ".npmrc"
-        || file_name == ".pypirc"
-        || file_name == "id_rsa"
-        || file_name == "id_ed25519";
+    let stem = Path::new(file_name.as_str())
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let secret =
+        // Any `*.env`, not only `.env` — `secrets.env` and `prod.env` are the
+        // same file by another name. Plus `.env.production`, `.envrc`.
+        file_name == ".env"
+            || file_name.starts_with(".env")
+            || extension == "env"
+            // Key material, by extension.
+            || matches!(
+                extension.as_str(),
+                "pem" | "key" | "p12" | "pfx" | "p8" | "jks" | "keystore" | "asc"
+            )
+            // Credential bundles, whatever they are serialized as.
+            || matches!(stem.as_str(), "credentials" | "secrets" | "service-account")
+            || matches!(
+                file_name.as_str(),
+                ".netrc" | ".npmrc" | ".pypirc" | ".htpasswd" | ".pgpass" | ".git-credentials"
+            )
+            // `id_rsa`, `id_ecdsa`, `id_ed25519` and their `.pub` siblings —
+            // extensionless or `.pub` only, so `id_utils.py` is untouched.
+            || (file_name.starts_with("id_") && (extension.is_empty() || extension == "pub"));
     if secret {
         return Some(format!(
             "{file_name} holds credentials and is never shared with a model. Ask the operator \
@@ -725,48 +805,72 @@ fn unreadable_write_marker(raw: &str) -> Option<String> {
     None
 }
 
-/// Matches `^#{2,6}\s*(TOOL|CONTENT|END CONTENT|FILE|PATCH|END FILE)`,
-/// case-insensitively, without pulling in a regex dependency for six literals.
+/// A hash-prefixed line shaped like one of this lane's markers but spelled
+/// wrong — `#### TOOL:`, `### File:`, `## CONTENT`.
+///
+/// **The asymmetry here runs the opposite way to a parser's, and getting it
+/// backwards is what made the first version of this function a Critical.** A
+/// missed near-miss costs one file. A *false* near-miss on a terminal message
+/// costs the entire run and every write in it: the rejection is deterministic,
+/// so the model re-emits the same sign-off, this function refuses it
+/// identically, the turn budget drains, and the loop bails discarding writes it
+/// had already collected. `## Patch notes` over a finished job was enough to do
+/// it. So this matcher is deliberately strict, and anything it is unsure about
+/// is left alone.
+///
+/// Strictness comes from requiring a *marker-shaped terminator*, not merely a
+/// word boundary. A word boundary alone still matches `## Patch notes` and
+/// `## File changes`, because the boundary is the space — and headings of
+/// exactly that form are how a model naturally writes a summary:
+///
+/// - `TOOL` / `FILE` / `PATCH` carry a path or a name, so they must be followed
+///   by `:` or nothing at all.
+/// - `CONTENT` / `END CONTENT` / `END FILE` stand alone, so the line must be
+///   exactly that and nothing more.
 fn near_miss_marker_word(trimmed: &str) -> Option<&'static str> {
     let hashes = trimmed.chars().take_while(|c| *c == '#').count();
     if !(2..=6).contains(&hashes) {
         return None;
     }
     let rest = trimmed[hashes..].trim_start().to_ascii_uppercase();
-    // Longest first: "END CONTENT" must not be shadowed by a prefix match, and
-    // "END FILE" must not be read as "FILE".
-    for word in [
-        "END CONTENT",
-        "END FILE",
-        "CONTENT",
-        "TOOL",
-        "FILE",
-        "PATCH",
-    ] {
-        let Some(after) = rest.strip_prefix(word) else {
-            continue;
-        };
-        // Word boundary, or `## Files changed` in an ordinary summary heading
-        // reads as a mangled `### FILE:` and gets the message rejected — every
-        // turn, until the budget is gone. A marker is followed by a colon, a
-        // space or nothing; never by more letters.
-        if after
-            .chars()
-            .next()
-            .is_none_or(|next| !next.is_alphanumeric() && next != '_')
-        {
+
+    // Standalone markers: exact match or nothing.
+    for word in ["END CONTENT", "END FILE", "CONTENT"] {
+        if rest == word {
             return Some(word);
         }
     }
+
+    // Markers that introduce a value: the colon is the tell. Longest first, so
+    // `END FILE` is never read as `FILE`.
+    for word in ["END FILE", "TOOL", "FILE", "PATCH"] {
+        let Some(after) = rest.strip_prefix(word) else {
+            continue;
+        };
+        if after.is_empty() || after.starts_with(':') {
+            return Some(word);
+        }
+    }
+
     None
 }
 
-/// The shape of the JSON edit lane, which is still a live Mason transport: an
-/// `"edits"` array of `{"path": ..., "content": ...}` objects. Matching the two
-/// keys is enough — a false positive costs one re-asked turn, and a false
-/// negative costs the operator a file.
+/// A line that is structurally part of a JSON edit proposal — still a live
+/// Mason transport, and the one providers revert to most readily.
+///
+/// Same asymmetry as [`near_miss_marker_word`], and the reason this needs two
+/// pieces of evidence on one line rather than one: a single key name appears in
+/// ordinary prose all the time. `Done. I set the "path": key in the manifest.`
+/// is a perfectly good sign-off, and rejecting it deterministically costs the
+/// whole run. So a match requires a key *and* the punctuation that can only
+/// come from the real document:
+///
+/// - `"edits"` together with the `[` that opens its array, or
+/// - `"path":` together with the `"content":` that always accompanies it in an
+///   edit object.
 fn looks_like_json_edit_proposal(trimmed: &str) -> bool {
-    trimmed.contains("\"edits\"") || trimmed.contains("\"path\":")
+    (trimmed.contains("\"edits\"") && trimmed.contains('['))
+        || (trimmed.contains("\"path\":") && trimmed.contains("\"content\":"))
 }
 
 #[cfg(test)]
@@ -1230,30 +1334,122 @@ I will decide what to write once I see it.
         }
     }
 
+    /// The guard's *edge*, not its coverage.
+    ///
+    /// The first version of this test picked only strings from the passing side
+    /// of the boundary (`Files`, `Patching`, `Toolchain` — all suffix cases),
+    /// which documented what the fix handled and gave false assurance about the
+    /// exact risk it exists to guard. Every case below is one the shipped guard
+    /// actually rejected, each of which cost a whole run: the rejection is
+    /// deterministic, so the model re-emits the same sign-off, the guard refuses
+    /// it identically, the budget drains and the loop bails discarding writes it
+    /// had already collected.
     #[test]
-    fn plain_prose_and_markdown_headings_still_terminate() {
-        // The other side of the guard: rejecting too much would strand a model
-        // that really is finished, burning its whole turn budget on a message
-        // that was correct.
+    fn realistic_sign_offs_are_not_read_as_unreadable_writes() {
         for terminal in [
-            "SUMMARY: done\n",
-            "I have written both files. Nothing else is needed.\n",
-            "## Summary\n\nAdded the bonus room and wired it up.\n",
-            "### Notes\n\n- the room id is `bonus`\n",
-            // The near-miss matcher must not read ordinary headings as mangled
-            // markers, or a model that writes a normal summary is rejected
-            // every turn until its budget is gone.
+            // Marker word + space + prose: how markdown headings actually read.
+            // A word boundary alone does not catch these; the boundary IS the
+            // space.
+            "## Patch notes\n\nAdded the bonus room; no patches were needed.\n",
+            "## File changes\n\n- js/a.js\n",
+            "## Content overview\n\nThe room now has a lamp.\n",
+            "## Tool usage\n\nI read two files.\n",
+            "### End of summary\n",
+            // A single JSON key in prose is prose.
+            "Done. I set the \"path\": key in the manifest.\n",
+            "The spec's \"edits\" array is unchanged.\n",
+            "I used \"content\": as the field name.\n",
+            // Suffix cases, kept from the first version.
             "## Files changed\n\n- js/bonus.js\n",
             "### Patching notes\n\nNone needed.\n",
             "#### Toolchain\n\nNo change.\n",
             "### Contents of the room\n\nA lamp.\n",
+            // Plain sign-offs.
+            "SUMMARY: done\n",
+            "I have written both files. Nothing else is needed.\n",
+            "## Summary\n\nAdded the bonus room and wired it up.\n",
+            "### Notes\n\n- the room id is `bonus`\n",
         ] {
             assert_eq!(
                 unreadable_write_marker(terminal),
                 None,
-                "must terminate cleanly: {terminal:?}"
+                "a realistic sign-off must terminate, not cost the run: {terminal:?}"
             );
         }
+    }
+
+    /// The other half of the same boundary: tightening the matcher must not have
+    /// let the Critical back in.
+    #[test]
+    fn genuine_unreadable_writes_are_still_caught() {
+        for raw in [
+            "#### FILE: js/b.js\nb\n#### END FILE\n",
+            "### File: js/b.js\nb\n",
+            "#### TOOL: write_file\npath: js/b.js\n",
+            "### Tool: write_file\n",
+            "## PATCH: js/b.js\n",
+            "#### CONTENT\n",
+            "#### END CONTENT\n",
+            "{\"summary\":\"s\",\"edits\":[{\"path\":\"js/b.js\",\"content\":\"b\"}]}\n",
+            "  \"edits\": [\n",
+            "    {\"path\": \"js/b.js\", \"content\": \"b\"}\n",
+        ] {
+            assert!(
+                unreadable_write_marker(raw).is_some(),
+                "must still be caught: {raw:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_realistic_sign_off_after_a_write_keeps_the_write() {
+        // End-to-end proof of the Critical, on the shape that caused it: one
+        // real write, then a summary with an ordinary heading. Before the fix
+        // this failed the run and discarded the write.
+        for sign_off in [
+            "## Patch notes\n\nAdded the bonus room; no patches were needed.\n",
+            "## File changes\n\n- js/a.js\n",
+            "Done. I set the \"path\": key in the manifest.\n",
+            "## Content overview\n\nThe room now has a lamp.\n",
+        ] {
+            let staged = tempfile::tempdir().expect("tempdir");
+            let provider = ScriptedProvider::new(&[
+                "### TOOL: write_file\npath: js/a.js\n### CONTENT\na\n### END CONTENT\n",
+                sign_off,
+            ]);
+
+            let writes = run_mason_tool_loop(&provider, request(), staged.path(), 12)
+                .await
+                .unwrap_or_else(|error| panic!("{sign_off:?} must end the loop: {error:#}"));
+            assert_eq!(
+                writes,
+                vec![("js/a.js".to_string(), "a".to_string())],
+                "the write must survive the sign-off: {sign_off:?}"
+            );
+            assert_eq!(provider.calls(), 2, "no re-ask: {sign_off:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_heading_beside_a_real_tool_call_does_not_reject_the_turn() {
+        // The guard fires mid-loop too, so this lane's stated allowance for the
+        // model to think out loud around its calls was conditional on avoiding
+        // common headings.
+        let staged = tempfile::tempdir().expect("tempdir");
+        std::fs::write(staged.path().join("data.js"), "G = {};").expect("write");
+        let provider = ScriptedProvider::new(&[
+            "## Patch notes\n\nLet me look first.\n\n### TOOL: read_file\npath: data.js\n",
+            "SUMMARY: done\n",
+        ]);
+
+        run_mason_tool_loop(&provider, request(), staged.path(), 6)
+            .await
+            .expect("prose around a call must not reject the turn");
+        let seen = provider.seen.lock().expect("lock");
+        assert!(
+            seen[1].iter().any(|m| m.content.contains("G = {};")),
+            "the read must actually have happened"
+        );
     }
 
     #[test]
@@ -1333,12 +1529,90 @@ I will decide what to write once I see it.
 
     #[test]
     fn ordinary_source_reads_are_not_refused() {
-        assert_eq!(read_refusal("js/data.js"), None);
-        assert_eq!(read_refusal("src/lib.rs"), None);
-        assert_eq!(read_refusal("environment/setup.md"), None);
-        assert!(read_refusal(".env.local").is_some());
-        assert!(read_refusal("certs/server.pem").is_some());
-        assert!(read_refusal("node_modules/left-pad/index.js").is_some());
+        for allowed in [
+            "js/data.js",
+            "src/lib.rs",
+            "environment/setup.md",
+            "docs/id_generation.md",
+            "src/id_utils.py",
+            "keys.md",
+            "src/monkey.rs",
+        ] {
+            assert_eq!(read_refusal(allowed), None, "must be readable: {allowed}");
+        }
+    }
+
+    #[test]
+    fn credential_paths_are_refused_including_the_gaps_the_filename_list_left() {
+        for refused in [
+            // Was blocked before.
+            ".env",
+            ".env.local",
+            "certs/server.pem",
+            "node_modules/left-pad/index.js",
+            "id_rsa",
+            // Was NOT blocked: one letter from `id_rsa`.
+            ".ssh/id_ecdsa",
+            ".ssh/id_ed25519.pub",
+            ".aws/credentials",
+            ".gnupg/secring.gpg",
+            ".kube/config",
+            // Was NOT blocked: `.env` by another name.
+            "secrets.env",
+            "prod.env",
+            ".envrc",
+            // Was NOT blocked: credential bundles by serialization.
+            "config/credentials.yaml",
+            "secrets.yaml",
+            "service-account.json",
+            ".git-credentials",
+            // Directories themselves, not only files inside them — the prefix
+            // rule used to need a trailing slash to match.
+            "target",
+            ".git",
+        ] {
+            assert!(
+                read_refusal(refused).is_some(),
+                "must be refused: {refused}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_dir_is_filtered_by_the_same_rules_as_read_file() {
+        let staged = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(staged.path().join(".ssh")).expect("mkdir");
+        std::fs::write(staged.path().join(".ssh/id_ecdsa"), "PRIVATE").expect("write");
+        std::fs::create_dir_all(staged.path().join("target")).expect("mkdir");
+        std::fs::write(staged.path().join("target/build.log"), "noise").expect("write");
+
+        let provider = ScriptedProvider::new(&[
+            "### TOOL: list_dir\npath: .ssh\n",
+            "### TOOL: list_dir\npath: target\n",
+            "SUMMARY: done\n",
+        ]);
+
+        run_mason_tool_loop(&provider, request(), staged.path(), 6)
+            .await
+            .expect("a refused listing is not a failure");
+
+        let seen = provider.seen.lock().expect("lock");
+        let after_ssh = seen[1]
+            .last()
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        assert!(
+            !after_ssh.contains("id_ecdsa") && after_ssh.contains("credentials"),
+            "a listing is a read of the names: {after_ssh}"
+        );
+        let after_target = seen[2]
+            .last()
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        assert!(
+            !after_target.contains("build.log"),
+            "the shared prefix list must cover the directory itself: {after_target}"
+        );
     }
 
     #[tokio::test]
