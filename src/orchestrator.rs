@@ -8187,6 +8187,16 @@ CURRENT FILE CONTEXT:
                 } else {
                     summary
                 };
+                // Carried into `mason_edit_application.json`, so the caveat
+                // reaches the artifact an operator actually reads when deciding
+                // whether the run did what the spec asked. The loop concludes
+                // the model is done by failing to recognize a write, so a clean
+                // result is evidence, not proof.
+                let summary = format!(
+                    "{summary} NOTE: tool-loop termination is heuristic — the loop stops on a \
+                     message carrying no recognized tool call or write. Check these edits against \
+                     the spec rather than assuming every requested file is here."
+                );
                 Ok(MasonEditProposal {
                     summary,
                     rationale,

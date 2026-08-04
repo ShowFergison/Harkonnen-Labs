@@ -413,6 +413,21 @@ pub async fn run_mason_tool_loop_with_recorder(
     let mut writes: Vec<(PathBuf, String, String)> = Vec::new();
     let mut last_problem: Option<String> = None;
 
+    // Said out loud, once per run, where an operator reading logs will meet it.
+    // The residual is documented on `parse_tool_calls`, but a doc comment is
+    // only visible to someone already reading the source of the thing they are
+    // worried about. This lane decides it is finished by *not recognizing* a
+    // write, so the operator should know that before trusting a clean result.
+    tracing::warn!(
+        turns,
+        "Mason tool loop enabled. Termination is heuristic: the loop stops when a message \
+         contains no tool call it recognizes and nothing it recognizes as a write in another \
+         format. A write in a shape neither check knows (see the residual list on \
+         mason_tools::parse_tool_calls) is read as the model finishing, and is dropped. Review \
+         mason_edit_application.json against the spec rather than assuming a clean run wrote \
+         everything asked for."
+    );
+
     for _turn in 0..turns {
         let response = provider
             .complete(LlmRequest {
@@ -585,6 +600,20 @@ pub async fn run_mason_tool_loop_with_recorder(
                              itself, which is a directory, not a file."
                         );
                     }
+                    // Read and write must agree about what is off limits. A
+                    // path Mason may not read is a path it may not blindly
+                    // overwrite either — a whole-file write to a file it was
+                    // never shown is a rewrite from nothing, and `.env` is
+                    // exactly the file where that is worst. Loud, because a
+                    // soft refusal here would let the model sign off believing
+                    // the write landed.
+                    if let Some(reason) = &refusal {
+                        bail!(
+                            "Mason's write_file call targets {path:?}, which it is not allowed to \
+                             read: {reason} Refusing to overwrite a file whole that could not be \
+                             read first."
+                        );
+                    }
                     if let Some(recorder) = recorder {
                         if !recorder.record_write(path, content.len()).await? {
                             bail!(
@@ -718,8 +747,19 @@ fn read_refusal(normalized: &str) -> Option<String> {
                 extension.as_str(),
                 "pem" | "key" | "p12" | "pfx" | "p8" | "jks" | "keystore" | "asc"
             )
-            // Credential bundles, whatever they are serialized as.
-            || matches!(stem.as_str(), "credentials" | "secrets" | "service-account")
+            // Credential bundles, whatever they are serialized as — but only
+            // when serialized as *data*. `src/secrets.rs`, `lib/secrets.ts` and
+            // `docs/secrets.md` are source and documentation about secrets, not
+            // secrets, and refusing them was actively harmful: reads are
+            // filtered and writes are not, so Mason asked to modify
+            // `src/secrets.rs` could not read it but could still overwrite it
+            // whole — a blind rewrite of a file it was never allowed to see,
+            // manufactured by the filter meant to protect it.
+            || (matches!(stem.as_str(), "credentials" | "secrets" | "service-account")
+                && matches!(
+                    extension.as_str(),
+                    "" | "json" | "yaml" | "yml" | "toml" | "ini" | "env" | "txt" | "properties"
+                ))
             || matches!(
                 file_name.as_str(),
                 ".netrc" | ".npmrc" | ".pypirc" | ".htpasswd" | ".pgpass" | ".git-credentials"
@@ -823,10 +863,11 @@ fn unreadable_write_marker(raw: &str) -> Option<String> {
 /// `## File changes`, because the boundary is the space — and headings of
 /// exactly that form are how a model naturally writes a summary:
 ///
-/// - `TOOL` / `FILE` / `PATCH` carry a path or a name, so they must be followed
-///   by `:` or nothing at all.
-/// - `CONTENT` / `END CONTENT` / `END FILE` stand alone, so the line must be
-///   exactly that and nothing more.
+/// - `TOOL` / `FILE` / `PATCH` / `END FILE` carry a path or a name, so they must
+///   be followed by `:`. Nothing else counts, including end-of-line.
+/// - `CONTENT` / `END CONTENT` standing alone are not matched here at all: see
+///   the note at the end of the function for why a bare content marker cannot
+///   be told from a heading, and why letting it through loses nothing.
 fn near_miss_marker_word(trimmed: &str) -> Option<&'static str> {
     let hashes = trimmed.chars().take_while(|c| *c == '#').count();
     if !(2..=6).contains(&hashes) {
@@ -834,24 +875,28 @@ fn near_miss_marker_word(trimmed: &str) -> Option<&'static str> {
     }
     let rest = trimmed[hashes..].trim_start().to_ascii_uppercase();
 
-    // Standalone markers: exact match or nothing.
-    for word in ["END CONTENT", "END FILE", "CONTENT"] {
-        if rest == word {
-            return Some(word);
-        }
-    }
-
-    // Markers that introduce a value: the colon is the tell. Longest first, so
-    // `END FILE` is never read as `FILE`.
+    // The colon is the whole tell, and it is required. Every genuine marker of
+    // these four introduces a path or a name, so it always has one — while
+    // `## File`, `## Patch` and `## Tool` are ordinary headings a model writes
+    // when summarizing its work. An `after.is_empty()` clause here bought zero
+    // coverage and cost those three runs outright. Longest first, so `END FILE`
+    // is never read as `FILE`.
     for word in ["END FILE", "TOOL", "FILE", "PATCH"] {
         let Some(after) = rest.strip_prefix(word) else {
             continue;
         };
-        if after.is_empty() || after.starts_with(':') {
+        if after.starts_with(':') {
             return Some(word);
         }
     }
 
+    // Standalone `CONTENT` / `END CONTENT` / `END FILE` are deliberately NOT
+    // sufficient on their own. `## Content` is shape-identical to `#### CONTENT`
+    // — the line alone cannot be told apart from a heading, and guessing wrong
+    // costs the whole run. They are only meaningful beside a header, which
+    // `unreadable_write_marker` finds first: a content block with no header
+    // names no path, so no write can be reconstructed from it and none is lost
+    // by letting it through.
     None
 }
 
@@ -1359,6 +1404,16 @@ I will decide what to write once I see it.
             "Done. I set the \"path\": key in the manifest.\n",
             "The spec's \"edits\" array is unchanged.\n",
             "I used \"content\": as the field name.\n",
+            // The bare marker word as a whole heading — round 3's residual,
+            // found by enumerating the accepting set rather than by listing
+            // more prose.
+            "## File\n\nOnly js/a.js changed.\n",
+            "## Patch\n\nNone needed.\n",
+            "## Tool\n\nread_file, twice.\n",
+            "## Content\n\nThe room now has a lamp.\n",
+            "#### CONTENT\n",
+            "## End content\n",
+            "### END FILE\n",
             // Suffix cases, kept from the first version.
             "## Files changed\n\n- js/bonus.js\n",
             "### Patching notes\n\nNone needed.\n",
@@ -1388,8 +1443,9 @@ I will decide what to write once I see it.
             "#### TOOL: write_file\npath: js/b.js\n",
             "### Tool: write_file\n",
             "## PATCH: js/b.js\n",
-            "#### CONTENT\n",
-            "#### END CONTENT\n",
+            // Bare content markers are caught by the header beside them, which
+            // is the only thing that makes them mean a write.
+            "#### FILE: js/b.js\nb\n#### CONTENT\nb\n#### END CONTENT\n",
             "{\"summary\":\"s\",\"edits\":[{\"path\":\"js/b.js\",\"content\":\"b\"}]}\n",
             "  \"edits\": [\n",
             "    {\"path\": \"js/b.js\", \"content\": \"b\"}\n",
@@ -1397,6 +1453,92 @@ I will decide what to write once I see it.
             assert!(
                 unreadable_write_marker(raw).is_some(),
                 "must still be caught: {raw:?}"
+            );
+        }
+    }
+
+    /// Built the way the previous three boundary tests were not.
+    ///
+    /// Rounds 1-3 each drew the boundary set from the *passing* side: list some
+    /// prose, check it passes. Each set reached exactly as far as that round's
+    /// fix and stopped, so each round shipped a new false positive that cost a
+    /// run — the suffix case, then word-plus-prose, then the bare word. The
+    /// method was the defect, not the strings.
+    ///
+    /// So this enumerates what the matcher *accepts* and asks, of each, whether
+    /// a model could write it while finished. `unreadable_write_marker` accepts
+    /// exactly two families:
+    ///
+    /// A. 2-6 `#`, optional space, then TOOL|FILE|PATCH|END FILE, then `:`
+    /// B. one line holding (`"edits"` and `[`) or (`"path":` and `"content":`)
+    ///
+    /// Family A's accepting set is `{2..6 hashes} x {4 words} x {any case} x
+    /// {anything after the colon}`. The judgement below covers each axis; the
+    /// exhaustive hash/case sweep is mechanical and done in the loop.
+    #[test]
+    fn the_accepting_set_is_enumerated_and_each_shape_judged() {
+        // Axis 1 and 2: hash count and case. Every combination is a marker
+        // spelling, none is prose — a heading does not end in a bare keyword
+        // plus colon by accident.
+        for hashes in ["##", "###", "####", "#####", "######"] {
+            for word in ["TOOL", "tool", "Tool", "FILE", "file", "PATCH", "END FILE"] {
+                let line = format!("{hashes} {word}: js/b.js");
+                // Three hashes plus the exact uppercase marker is this lane's
+                // own vocabulary, not a near-miss, and is handled before the
+                // matcher ever runs.
+                let is_this_lanes_own = hashes == "###" && word == "TOOL";
+                assert_eq!(
+                    unreadable_write_marker(&line).is_some(),
+                    !is_this_lanes_own,
+                    "unexpected verdict for {line:?}"
+                );
+            }
+        }
+
+        // Axis 3: what follows the colon. All of these are writes.
+        for line in [
+            "## FILE:js/b.js",
+            "##FILE: js/b.js",
+            "##   file:   js/b.js",
+            "#### TOOL:",
+        ] {
+            assert!(
+                unreadable_write_marker(line).is_some(),
+                "must be caught: {line:?}"
+            );
+        }
+
+        // The accepting set's genuinely ambiguous members. Each is prose a model
+        // could plausibly write, and each is rejected anyway because it is
+        // shape-identical to a real marker. Rejecting them costs the run, so
+        // they are listed here as known, accepted losses rather than left to be
+        // discovered as a fourth round's Critical.
+        for ambiguous in [
+            "## Patch: none needed",
+            "## File: js/a.js is the only one I touched",
+            "## Tool: none used",
+            "I set both \"path\": and \"content\": in the manifest.",
+            "The \"edits\" list is [empty].",
+        ] {
+            assert!(
+                unreadable_write_marker(ambiguous).is_some(),
+                "documenting a known false positive; if this now passes, that is an \
+                 improvement — update the list: {ambiguous:?}"
+            );
+        }
+
+        // Family B needs both halves on one line. One half is prose.
+        for allowed in [
+            "The \"edits\" array is unchanged.",
+            "I set the \"path\": key.",
+            "Its \"content\": field is a string.",
+            "edits: [",
+            "The array [1, 2] holds ids.",
+        ] {
+            assert_eq!(
+                unreadable_write_marker(allowed),
+                None,
+                "one half of the shape is prose: {allowed:?}"
             );
         }
     }
@@ -1411,6 +1553,11 @@ I will decide what to write once I see it.
             "## File changes\n\n- js/a.js\n",
             "Done. I set the \"path\": key in the manifest.\n",
             "## Content overview\n\nThe room now has a lamp.\n",
+            // Round 3's residual, at run level.
+            "## File\n\nOnly js/a.js changed.\n",
+            "## Patch\n\nNone needed.\n",
+            "## Tool\n\nread_file, twice.\n",
+            "## Content\n\nThe room now has a lamp.\n",
         ] {
             let staged = tempfile::tempdir().expect("tempdir");
             let provider = ScriptedProvider::new(&[
@@ -1537,6 +1684,15 @@ I will decide what to write once I see it.
             "src/id_utils.py",
             "keys.md",
             "src/monkey.rs",
+            // Source and documentation *about* secrets is not a secret. And
+            // refusing it was worse than a nuisance: reads are filtered and
+            // writes were not, so Mason could not read `src/secrets.rs` but
+            // could still overwrite it whole.
+            "src/secrets.rs",
+            "src/credentials.rs",
+            "lib/secrets.ts",
+            "docs/secrets.md",
+            "service-account.go",
         ] {
             assert_eq!(read_refusal(allowed), None, "must be readable: {allowed}");
         }
@@ -1576,6 +1732,27 @@ I will decide what to write once I see it.
                 "must be refused: {refused}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_write_to_a_path_that_cannot_be_read_is_refused() {
+        // Read and write must agree. A whole-file write to a file Mason was
+        // never allowed to see is a rewrite from nothing.
+        let staged = tempfile::tempdir().expect("tempdir");
+        std::fs::write(staged.path().join(".env"), "API_KEY=sk-live-xyz").expect("write");
+        let provider = ScriptedProvider::new(&[
+            "### TOOL: write_file\npath: .env\n### CONTENT\nAPI_KEY=\n### END CONTENT\n",
+        ]);
+
+        let error = run_mason_tool_loop(&provider, request(), staged.path(), 4)
+            .await
+            .expect_err("a blind overwrite of an unreadable file must be refused");
+        assert!(format!("{error:#}").contains("not allowed to read"));
+        assert_eq!(
+            std::fs::read_to_string(staged.path().join(".env")).expect("read"),
+            "API_KEY=sk-live-xyz",
+            "and nothing may have touched it"
+        );
     }
 
     #[tokio::test]
