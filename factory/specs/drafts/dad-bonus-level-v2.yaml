@@ -81,6 +81,11 @@ constraints:
   - all three characters must have distinct written responses, matching their established voices
   - Storm's verbs are Sniff, Fetch and Dig, not the human verb set
 inputs:
+  # Evidence resolving the two questions prior runs left "Unresolved" and were
+  # blocked over. Both were checked against the live source on 2026-08-05.
+  - "verified: rooms are NOT frozen - no Object.freeze, Object.seal or preventExtensions appears anywhere in js/, and G.rooms.living is a plain object literal at js/data.js:388, so appending to its objects[] at runtime is safe"
+  - "verified: the engine reads room.objects live at call time (room.objects.filter at js/engine.js:272), not snapshotted at load, so an entrance appended after data.js runs is picked up"
+  - "verified: gameplay starts on DOMContentLoaded (js/main.js:138) and classic <script src> tags execute in document order, so js/bonus.js loading after js/data.js is guaranteed to see G.rooms.living already defined - script order is satisfied by tag placement alone"
   - "project: the dad-was-right-game repository"
   - "room reference: js/data.js G.rooms.living for the canonical room and object shape"
   - "art reference: js/hd-house.js for how a room is drawn at 640x400"
@@ -144,3 +149,7 @@ worker_harness:
   git_branch: true
 test_commands:
   - node --check js/bonus.js
+  # Visible runtime validation, not just a syntax check: actually loads the module
+  # against a stubbed G and proves the room registered, has its four objects, and
+  # appended its entrance - the runtime mutation node --check cannot catch.
+  - "node -e \"globalThis.G={rooms:{living:{objects:[]}},flags:{}};require('./js/bonus.js');var ids=Object.keys(G.rooms).filter(function(k){return k!=='living'});if(!ids.length)throw new Error('no bonus room registered on G.rooms');var r=G.rooms[ids[0]];['id','name','floor','draw','objects'].forEach(function(k){if(!(k in r))throw new Error('bonus room missing '+k)});if(r.objects.length<4)throw new Error('bonus room needs at least 4 objects, has '+r.objects.length);if(!G.rooms.living.objects.length)throw new Error('no entrance appended to the existing room');console.log('bonus room OK:',ids[0],r.objects.length,'objects')\""

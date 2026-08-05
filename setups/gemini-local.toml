@@ -58,7 +58,7 @@ type         = "google"
 # Free-tier quota is 20 requests/day PER MODEL, so a burned model is unblocked by
 # moving to a sibling rather than waiting. gemini-3.6-flash exhausted 2026-08-04;
 # gemini-3-flash-preview and gemma-4-31b-it were still open as of that switch.
-model        = "gemini-3.6-flash"
+model        = "gemma-4-31b-it"
 api_key_env  = "GEMINI_API_KEY"
 enabled      = true
 usage_rights = "standard"
@@ -83,6 +83,17 @@ surface      = "antigravity"
 #   lms load google/gemma-4-e4b --context-length 32768 --identifier gemma4
 # 32768 is the practical ceiling on 8 GB of VRAM, which is why the spec's
 # code_under_test surface has to name individual files rather than all of js/.
+# Quota is per model, so splitting agents across two models doubles the daily
+# budget available to a single run. Mason gets the larger model because its
+# edit lane is the call that actually has to produce code.
+[providers.gemini-bulk]
+type         = "google"
+model        = "gemini-3.1-flash-lite"
+api_key_env  = "GEMINI_API_KEY"
+enabled      = true
+usage_rights = "standard"
+surface      = "antigravity"
+
 [providers.local-gemma]
 type         = "lmstudio"
 model        = "google/gemma-4-e4b"
@@ -110,15 +121,15 @@ schema_path = "factory/coobie_semantic/typedb/schema.tql"
 reasoning_mode = "function_backed"
 
 [routing.agents]
-scout   = "gemini"
-sable   = "gemini"
-coobie  = "gemini"
+scout   = "gemini-bulk"
+sable   = "gemini-bulk"
+coobie  = "gemini-bulk"
 mason   = "gemini"
-bramble = "gemini"
-keeper  = "gemini"
-piper   = "gemini"
+bramble = "gemini-bulk"
+keeper  = "gemini-bulk"
+piper   = "gemini-bulk"
 ash     = "gemini"
-flint   = "gemini"
+flint   = "gemini-bulk"
 
 [[mcp.servers]]
 name         = "filesystem"
