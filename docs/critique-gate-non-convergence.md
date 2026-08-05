@@ -1,7 +1,7 @@
 # The Implementation Gate Does Not Converge
 
 **Status:** open architectural problem. An interim control shipped (`HARKONNEN_CRITIQUE_ADVISORY`); the real fix is roadmap item v1-A.
-**Written:** 2026-08-05, after 20 live runs of `dad-bonus-level-v2` against `~/Desktop/dad-was-right-game`.
+**Written:** 2026-08-05, after 20 live runs of one spec against a real browser-JS product repo.
 **Audience:** anyone trying to make the factory author code end-to-end.
 
 ---
@@ -52,13 +52,14 @@ fresh set of blockers.
 
 | Run | Blockers | What the critic demanded |
 |---|---|---|
-| `7db36804` | 2 | Plan patched `G.rooms.living` (**a genuinely good catch**); missing evidence-change note |
+| `7db36804` | 2 | Plan mutated an existing module the spec forbade touching (**a genuinely good catch**); missing evidence-change note |
 | `108d08b7` | 3 | Two Severity-100 stale lessons marked "Unresolved"; no post-injection runtime validation |
-| `c3f7fe58` | 3 | Failed to challenge `bonusRoomIntegrationScore`; no evidence artifacts per validation claim; a *different* stale lesson left unresolved |
+| `c3f7fe58` | 3 | Failed to challenge a named optimization program; no evidence artifacts per validation claim; a *different* stale lesson left unresolved |
 
 Between `108d08b7` and `c3f7fe58` the spec gained hard evidence resolving both Severity-100
-questions (verified against source: no `Object.freeze` anywhere in `js/`; `room.objects` read
-live at `js/engine.js:272`; load order guaranteed by tag placement, `js/main.js:138`) **and** a
+questions (verified against source: the target objects are never frozen, they are read live at
+call time rather than snapshotted at load, and load order is guaranteed by script-tag
+placement) **and** a
 real runtime validation command. The critic accepted none of it as closing the point and raised
 three new objections instead.
 
@@ -95,9 +96,9 @@ asked to write. A plan could satisfy every word of its instructions and still be
 prompt sites now share one `MASON_PLAN_TASK_CONTRACT`.
 
 **4.4 The spec could not write the files its own criteria required.**
-Mason may only write paths declared `code_under_test`. The spec declared `js/` while requiring
-edits to `index.html` (which carries the `<script src>` ladder) and `README.md`. Run `31d334b1`
-died `edit_outside_scope` proposing exactly the README edit the spec demanded.
+Mason may only write paths declared `code_under_test`. The spec declared one source directory
+while its acceptance criteria also required edits to two files outside it. Run `31d334b1` died
+`edit_outside_scope` proposing exactly the edit the spec demanded.
 
 Note that 4.1 and 4.3 are the *same shape of bug*: a producer and a consumer disagreeing about
 a contract, with the failure surfacing as "the model did something wrong."
@@ -188,17 +189,17 @@ to the current spec and pass the top N.
 ## 8. Reproducing
 
 ```bash
-cd ~/Harkonnen-Labs/.claude/worktrees/phase6-typedb-adapter
+cd <harkonnen-worktree>
 
 # Blocked by the gate (default behavior):
 ./target/debug/harkonnen-labs run start \
-  factory/specs/drafts/dad-bonus-level-v2.yaml \
-  --product-path ~/Desktop/dad-was-right-game
+  factory/specs/drafts/<spec>.yaml \
+  --product-path <path-to-product-repo>
 
 # Proceeds, concerns recorded as advisory:
 HARKONNEN_CRITIQUE_ADVISORY=1 ./target/debug/harkonnen-labs run start \
-  factory/specs/drafts/dad-bonus-level-v2.yaml \
-  --product-path ~/Desktop/dad-was-right-game
+  factory/specs/drafts/<spec>.yaml \
+  --product-path <path-to-product-repo>
 
 # Inspect what the critic said:
 python3 -c "import json;d=json.load(open('factory/workspaces/<run-id>/run/coobie_critique.json'));[print('-',x) for x in d['blocking_concerns']]"

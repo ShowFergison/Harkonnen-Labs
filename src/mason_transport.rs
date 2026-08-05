@@ -623,9 +623,9 @@ pub fn apply_patch_block(original: &str, block: &PatchBlock) -> Result<String> {
 /// Second chance for a SEARCH block that is correct except for a uniform
 /// indentation shift.
 ///
-/// Models re-indent. Observed on run b19b7236: gemma proposed adding the bonus
-/// script tag to `index.html` with its SEARCH line indented four spaces, while
-/// the real file has that tag at column zero. Everything else — the text, the
+/// Models re-indent. Observed on run b19b7236: gemma proposed a one-line
+/// insertion into an HTML file with its SEARCH line indented four spaces, while
+/// the real file has that line at column zero. Everything else — the text, the
 /// intent, the surrounding edits — was right, and the whole four-file proposal
 /// was thrown away over the leading whitespace of one line.
 ///
@@ -857,24 +857,26 @@ pub fn parse_patch_blocks(raw: &str) -> Result<Vec<PatchBlock>> {
 mod tests {
     use super::*;
 
-    /// Regression for run b19b7236: the real `index.html` case. SEARCH was
+    /// Regression for run b19b7236: a real observed case. SEARCH was
     /// indented four spaces, the file has the tag at column zero.
     #[test]
     fn patch_tolerates_a_uniform_indentation_shift() {
         let original = "<script src=\"js/music.js\"></script>\n\
-                        <script src=\"js/hints.js\"></script>\n\
+                        <script src=\"js/one.js\"></script>\n\
                         </body>\n";
         let block = PatchBlock {
             path: "index.html".into(),
-            search: "    <script src=\"js/hints.js\"></script>".into(),
-            replace: "    <script src=\"js/hints.js\"></script>\n    <script src=\"js/bonus.js\"></script>".into(),
+            search: "    <script src=\"js/one.js\"></script>".into(),
+            replace:
+                "    <script src=\"js/one.js\"></script>\n    <script src=\"js/two.js\"></script>"
+                    .into(),
         };
 
         let patched = apply_patch_block(original, &block).expect("a re-indented patch must apply");
 
-        assert!(patched.contains("\n<script src=\"js/bonus.js\"></script>"));
+        assert!(patched.contains("\n<script src=\"js/two.js\"></script>"));
         assert!(
-            !patched.contains("    <script src=\"js/bonus.js\">"),
+            !patched.contains("    <script src=\"js/two.js\">"),
             "the inserted line must take the file's indentation, not the patch's"
         );
         assert!(patched.contains("<script src=\"js/music.js\">"));
@@ -887,7 +889,7 @@ mod tests {
         let original = "<script src=\"js/other.js\"></script>\n";
         let block = PatchBlock {
             path: "index.html".into(),
-            search: "    <script src=\"js/hints.js\"></script>".into(),
+            search: "    <script src=\"js/one.js\"></script>".into(),
             replace: "    nope".into(),
         };
 
@@ -916,26 +918,26 @@ mod tests {
     /// correct edits.
     #[test]
     fn trailing_end_file_after_a_patch_block_is_tolerated() {
-        let raw = "SUMMARY: add the bonus room\n\
+        let raw = "SUMMARY: add the module\n\
                    RATIONALE:\n\
                    - created the module\n\
                    \n\
-                   ### FILE: js/bonus.js\n\
-                   G.rooms.attic = { id: 'attic' };\n\
+                   ### FILE: js/two.js\n\
+                   G.registry.item = { id: 'item' };\n\
                    ### END FILE\n\
                    \n\
                    ### PATCH: README.md\n\
                    <<<<<<< SEARCH\n\
                    - **Act 3**\n\
                    =======\n\
-                   - **Bonus Level**\n\
+                   - **New Section**\n\
                    - **Act 3**\n\
                    >>>>>>> REPLACE\n\
                    ### END FILE\n";
 
         let envelope = parse_fenced_edits(raw).expect("a trailing END FILE must not reject");
         assert_eq!(envelope.files.len(), 1, "the FILE block must still parse");
-        assert_eq!(envelope.files[0].path, "js/bonus.js");
+        assert_eq!(envelope.files[0].path, "js/two.js");
     }
 
     /// The tolerance above must not extend to a response with no patch in it:
@@ -957,37 +959,37 @@ mod tests {
 
     #[test]
     fn fenced_envelope_passes_source_code_through_verbatim() {
-        let raw = r#"SUMMARY: Add the bonus room
+        let raw = r#"SUMMARY: Add the module
 RATIONALE:
 - followed the existing G.rooms shape
 - registered the room in main.js
 
-### FILE: js/bonus.js
-G.rooms.bonus = {
-  id: 'bonus',
-  verbs: { lookat: "A dusty attic", open: "It creaks" },
+### FILE: js/two.js
+G.registry.entry = {
+  id: 'entry',
+  verbs: { lookat: "A dusty shelf", open: "It creaks" },
   note: "quotes \" and backslashes \\ survive"
 };
 ### END FILE
 
 ### FILE: README.md
-The bonus room ("Dad's Workshop") is optional.
+The extra entry ("Workshop") is optional.
 ### END FILE
 "#;
 
         let envelope = parse_fenced_edits(raw).expect("must parse");
 
-        assert_eq!(envelope.summary, "Add the bonus room");
+        assert_eq!(envelope.summary, "Add the module");
         assert_eq!(envelope.rationale.len(), 2);
         assert_eq!(envelope.files.len(), 2);
-        assert_eq!(envelope.files[0].path, "js/bonus.js");
+        assert_eq!(envelope.files[0].path, "js/two.js");
         assert!(envelope.files[0]
             .content
-            .contains(r#"lookat: "A dusty attic""#));
+            .contains(r#"lookat: "A dusty shelf""#));
         assert!(envelope.files[0]
             .content
             .contains(r#"backslashes \\ survive"#));
-        assert!(envelope.files[1].content.contains(r#"("Dad's Workshop")"#));
+        assert!(envelope.files[1].content.contains(r#"("Workshop")"#));
         assert!(
             !envelope.files[0].content.contains("### END FILE"),
             "the terminator must not leak into content"
