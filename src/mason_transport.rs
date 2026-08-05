@@ -437,6 +437,16 @@ fn collect_fenced_edits(raw: &str) -> Result<Option<FencedEnvelope>> {
     // is handled by the `current` branch below, before we get here.
     let mut patch_tracker = BlockTracker::patch_blocks_only();
 
+    // Whether a top-level `### PATCH:` header has been seen. A patch block has
+    // no terminator of its own — it ends at `>>>>>>> REPLACE` — while
+    // `FENCED_FORMAT_INSTRUCTION` tells the model there must be "nothing after
+    // the final ### END FILE". A model that closes a response whose last block
+    // is a patch therefore reaches for `### END FILE`, which is the only
+    // closing convention it was given. Observed verbatim on run 82f6fb01: two
+    // FILE blocks, two PATCH blocks, and a single trailing `### END FILE`.
+    // Rejecting that discards a fully correct set of edits over punctuation.
+    let mut saw_patch_header = false;
+
     // Split on \n but preserve original lines (including trailing \r for CRLF)
     let lines: Vec<&str> = raw.split('\n').collect();
     for (line_num, line) in lines.iter().enumerate() {
@@ -495,7 +505,15 @@ fn collect_fenced_edits(raw: &str) -> Result<Option<FencedEnvelope>> {
                 bail!("a {FILE_MARKER} block declared an implausible path: {path:?}");
             }
             current = Some((path, Vec::new()));
+        } else if trimmed.starts_with(PATCH_HEADER_MARKER) {
+            saw_patch_header = true;
         } else if trimmed == END_MARKER {
+            if saw_patch_header {
+                // Closes out a response whose last block was a patch. No file
+                // block is open, so this cannot be file content — the intent is
+                // unambiguous and there is nothing to gain by refusing it.
+                continue;
+            }
             // A stray END_MARKER outside any open block is an error
             bail!(
                 "found a stray {END_MARKER} at line {} not associated with any open file block — \
@@ -551,6 +569,10 @@ When changing an existing file, emit a patch rather than the whole file:
 <text to put in its place>
 >>>>>>> REPLACE
 
+A patch block ends at its '>>>>>>> REPLACE' line. It has no terminator of its \
+own: do NOT write '### END FILE' after a patch — that marker closes ### FILE: \
+blocks only.
+
 The SEARCH text must appear exactly once in the file, copied character for \
 character including indentation. Use a whole ### FILE: block instead when \
 creating a new file.
@@ -582,10 +604,13 @@ pub fn apply_patch_block(original: &str, block: &PatchBlock) -> Result<String> {
     }
     let occurrences = original.matches(block.search.as_str()).count();
     match occurrences {
-        0 => bail!(
-            "patch for {} did not match: the SEARCH text is not present in the file",
-            block.path
-        ),
+        0 => match apply_reindented_patch(original, block) {
+            Some(patched) => Ok(patched),
+            None => bail!(
+                "patch for {} did not match: the SEARCH text is not present in the file",
+                block.path
+            ),
+        },
         1 => Ok(original.replacen(block.search.as_str(), &block.replace, 1)),
         n => bail!(
             "patch for {} is ambiguous: the SEARCH text matched {n} times, so the target is \
@@ -593,6 +618,98 @@ pub fn apply_patch_block(original: &str, block: &PatchBlock) -> Result<String> {
             block.path
         ),
     }
+}
+
+/// Second chance for a SEARCH block that is correct except for a uniform
+/// indentation shift.
+///
+/// Models re-indent. Observed on run b19b7236: gemma proposed adding the bonus
+/// script tag to `index.html` with its SEARCH line indented four spaces, while
+/// the real file has that tag at column zero. Everything else — the text, the
+/// intent, the surrounding edits — was right, and the whole four-file proposal
+/// was thrown away over the leading whitespace of one line.
+///
+/// The match is deliberately conservative. Lines must agree exactly once their
+/// own indentation is removed, the whole block must shift by the *same* amount
+/// (so relative nesting is real, not guessed), and the result must be unique in
+/// the file. Anything less certain falls through to the ordinary error, because
+/// a wrong patch applied silently is far worse than a rejected one.
+fn apply_reindented_patch(original: &str, block: &PatchBlock) -> Option<String> {
+    let search_lines: Vec<&str> = block.search.split('\n').collect();
+    let file_lines: Vec<&str> = original.split('\n').collect();
+    if search_lines.is_empty() || search_lines.len() > file_lines.len() {
+        return None;
+    }
+
+    let indent_of = |line: &str| -> String {
+        line.chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect()
+    };
+
+    // Every candidate window whose lines match once indentation is stripped and
+    // whose shift is consistent across the block.
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    for start in 0..=(file_lines.len() - search_lines.len()) {
+        let window = &file_lines[start..start + search_lines.len()];
+
+        let mut shift: Option<String> = None;
+        let matched = window.iter().zip(search_lines.iter()).all(|(have, want)| {
+            if have.trim() != want.trim() {
+                return false;
+            }
+            if have.trim().is_empty() {
+                return true; // a blank line carries no indentation signal
+            }
+            let have_indent = indent_of(have);
+            match &shift {
+                None => {
+                    shift = Some(have_indent);
+                    true
+                }
+                // The shift must be the same everywhere, or the block's own
+                // nesting differs from the file's and this is not a re-indent.
+                Some(first) => {
+                    let want_first = indent_of(search_lines[0]);
+                    let want_here = indent_of(want);
+                    have_indent.len() as i64 - want_here.len() as i64
+                        == first.len() as i64 - want_first.len() as i64
+                }
+            }
+        });
+
+        if matched {
+            hits.push((start, shift.unwrap_or_default()));
+        }
+    }
+
+    let (start, file_indent) = match hits.as_slice() {
+        [single] => single.clone(),
+        _ => return None, // no match, or ambiguous — let the caller report it
+    };
+
+    // Re-indent REPLACE from the block's own indentation onto the file's.
+    let search_indent = indent_of(search_lines.iter().find(|l| !l.trim().is_empty())?);
+    let replace_lines: Vec<String> = block
+        .replace
+        .split('\n')
+        .map(|line| {
+            if line.trim().is_empty() {
+                return line.to_string();
+            }
+            let stripped = line.strip_prefix(search_indent.as_str()).unwrap_or(line);
+            format!("{file_indent}{stripped}")
+        })
+        .collect();
+
+    let mut out: Vec<String> = file_lines[..start].iter().map(|l| l.to_string()).collect();
+    out.extend(replace_lines);
+    out.extend(
+        file_lines[start + search_lines.len()..]
+            .iter()
+            .map(|l| l.to_string()),
+    );
+    Some(out.join("\n"))
 }
 
 pub fn parse_patch_blocks(raw: &str) -> Result<Vec<PatchBlock>> {
@@ -739,6 +856,104 @@ pub fn parse_patch_blocks(raw: &str) -> Result<Vec<PatchBlock>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for run b19b7236: the real `index.html` case. SEARCH was
+    /// indented four spaces, the file has the tag at column zero.
+    #[test]
+    fn patch_tolerates_a_uniform_indentation_shift() {
+        let original = "<script src=\"js/music.js\"></script>\n\
+                        <script src=\"js/hints.js\"></script>\n\
+                        </body>\n";
+        let block = PatchBlock {
+            path: "index.html".into(),
+            search: "    <script src=\"js/hints.js\"></script>".into(),
+            replace: "    <script src=\"js/hints.js\"></script>\n    <script src=\"js/bonus.js\"></script>".into(),
+        };
+
+        let patched = apply_patch_block(original, &block).expect("a re-indented patch must apply");
+
+        assert!(patched.contains("\n<script src=\"js/bonus.js\"></script>"));
+        assert!(
+            !patched.contains("    <script src=\"js/bonus.js\">"),
+            "the inserted line must take the file's indentation, not the patch's"
+        );
+        assert!(patched.contains("<script src=\"js/music.js\">"));
+    }
+
+    /// The tolerance must not invent a match. Different *text* stays an error
+    /// however the whitespace lines up.
+    #[test]
+    fn patch_reindent_does_not_match_different_text() {
+        let original = "<script src=\"js/other.js\"></script>\n";
+        let block = PatchBlock {
+            path: "index.html".into(),
+            search: "    <script src=\"js/hints.js\"></script>".into(),
+            replace: "    nope".into(),
+        };
+
+        assert!(apply_patch_block(original, &block).is_err());
+    }
+
+    /// Nor may it pick one of several equally plausible sites.
+    #[test]
+    fn patch_reindent_refuses_an_ambiguous_match() {
+        let original = "  a\nb\n  a\n";
+        let block = PatchBlock {
+            path: "f".into(),
+            search: "a".into(),
+            replace: "c".into(),
+        };
+
+        let err = apply_patch_block(original, &block)
+            .expect_err("two candidate sites must not be guessed between");
+        assert!(err.to_string().contains("ambiguous") || err.to_string().contains("not present"));
+    }
+
+    /// Regression for run 82f6fb01. Mason emitted two FILE blocks, two PATCH
+    /// blocks, and closed the response with a single `### END FILE` after the
+    /// last patch — the only closing convention the prompt had given it. The
+    /// parser rejected the whole proposal over that one line, discarding four
+    /// correct edits.
+    #[test]
+    fn trailing_end_file_after_a_patch_block_is_tolerated() {
+        let raw = "SUMMARY: add the bonus room\n\
+                   RATIONALE:\n\
+                   - created the module\n\
+                   \n\
+                   ### FILE: js/bonus.js\n\
+                   G.rooms.attic = { id: 'attic' };\n\
+                   ### END FILE\n\
+                   \n\
+                   ### PATCH: README.md\n\
+                   <<<<<<< SEARCH\n\
+                   - **Act 3**\n\
+                   =======\n\
+                   - **Bonus Level**\n\
+                   - **Act 3**\n\
+                   >>>>>>> REPLACE\n\
+                   ### END FILE\n";
+
+        let envelope = parse_fenced_edits(raw).expect("a trailing END FILE must not reject");
+        assert_eq!(envelope.files.len(), 1, "the FILE block must still parse");
+        assert_eq!(envelope.files[0].path, "js/bonus.js");
+    }
+
+    /// The tolerance above must not extend to a response with no patch in it:
+    /// there, a stray terminator really is malformed content.
+    #[test]
+    fn trailing_end_file_without_any_patch_is_still_rejected() {
+        let raw = "SUMMARY: s\n\
+                   \n\
+                   ### FILE: js/a.js\n\
+                   var a = 1;\n\
+                   ### END FILE\n\
+                   ### END FILE\n";
+
+        assert!(
+            parse_fenced_edits(raw).is_err(),
+            "a stray terminator with no patch block is still an error"
+        );
+    }
 
     #[test]
     fn fenced_envelope_passes_source_code_through_verbatim() {
