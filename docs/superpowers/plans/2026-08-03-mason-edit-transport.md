@@ -1239,10 +1239,10 @@ cp ~/Harkonnen-Labs/.env .env
 docker compose -f docker-compose.calvin.yml up -d typedb
 HARKONNEN_SETUP=gemini-local HARKONNEN_HTTP_TIMEOUT_SECS=600 \
   cargo run -q -- run start factory/specs/drafts/dad-bonus-level-v2.yaml \
-  --product-path ~/Desktop/dad-was-right-game
+  --product-path <path-to-product-repo>
 ```
 
-Then approve the checkpoint and confirm `mason_edit_application.json` reports `status: applied` with four changed files, and that `~/Desktop/dad-was-right-game` has a `mason/*` branch whose diff is reviewable. The bonus level actually appearing in the game is the acceptance test for this whole plan.
+Then approve the checkpoint and confirm `mason_edit_application.json` reports `status: applied` with four changed files, and that the product repo has a `mason/*` branch whose diff is reviewable. The feature actually appearing in the product is the acceptance test for this whole plan.
 
 Note the daily free-tier quota on `gemini-flash-latest`; `setups/gemini-local.toml` can be pointed at whichever model has quota that day.
 
