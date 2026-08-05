@@ -570,16 +570,28 @@ struct GeminiThinkingConfig {
     thinking_budget: i32,
 }
 
-/// Reasoning-token budget for Gemini calls. Defaults to `0` (no thinking) so
-/// the whole output budget is available for the answer. Set
-/// `GEMINI_THINKING_BUDGET` to a positive token count to allow that much
-/// deliberation, or to `-1` to omit the field entirely and let the model
-/// decide — the pre-fix behavior, which starves long generations.
+/// Reasoning-token budget for Gemini calls.
+///
+/// The default is a small *positive* allowance rather than `0`. Zero is the
+/// obvious choice — it gives the whole budget to the answer — but not every
+/// model may disable thinking: `gemini-3.6-flash` rejects `thinkingBudget: 0`
+/// with a bare `400 INVALID_ARGUMENT`, while accepting 128, 512 and 1024. A
+/// zero default therefore breaks that model outright for anyone who never sets
+/// the variable, trading a silent starvation bug for a hard failure. A small
+/// allowance is accepted everywhere tested and still leaves the bulk of
+/// `maxOutputTokens` for the answer.
+///
+/// Set `GEMINI_THINKING_BUDGET` to any positive token count to widen it, to `0`
+/// to disable thinking on models that permit it (2.5 and 3.5 do), or to `-1` to
+/// omit the field and let the model decide — the pre-fix behavior, which
+/// starves long generations.
+const GEMINI_DEFAULT_THINKING_BUDGET: i32 = 512;
+
 fn gemini_thinking_budget() -> Option<i32> {
     let configured = std::env::var("GEMINI_THINKING_BUDGET")
         .ok()
         .and_then(|value| value.trim().parse::<i32>().ok())
-        .unwrap_or(0);
+        .unwrap_or(GEMINI_DEFAULT_THINKING_BUDGET);
     if configured < 0 {
         None
     } else {
@@ -932,6 +944,17 @@ mod tests {
         let err = gemini_content_from_response(&response)
             .expect_err("thought-only parts carry no answer");
         assert!(err.to_string().contains("empty"), "message was: {err}");
+    }
+
+    /// `gemini-3.6-flash` answers `thinkingBudget: 0` with a bare 400, so the
+    /// default must not be zero or that model fails for every caller who never
+    /// sets the variable.
+    #[test]
+    fn gemini_default_thinking_budget_is_positive() {
+        assert!(
+            super::GEMINI_DEFAULT_THINKING_BUDGET > 0,
+            "a zero default is rejected outright by gemini-3.6-flash"
+        );
     }
 
     #[test]

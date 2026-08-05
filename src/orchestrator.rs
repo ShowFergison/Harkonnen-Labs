@@ -2983,8 +2983,18 @@ impl AppContext {
                     .await;
                 }
                 if !critique.passed {
-                    implementation_approval_blockers
-                        .extend(critique.blocking_concerns.iter().cloned());
+                    if critique_is_advisory() {
+                        tracing::warn!(
+                            blocking = critique.blocking_concerns.len(),
+                            dead_ends = critique.dead_end_matches.len(),
+                            "Coobie plan critique raised blocking concerns but \
+                             HARKONNEN_CRITIQUE_ADVISORY is set — recording them as advisory \
+                             and allowing the implementation boundary to proceed"
+                        );
+                    } else {
+                        implementation_approval_blockers
+                            .extend(critique.blocking_concerns.iter().cloned());
+                    }
                     push_unique(&mut blackboard.open_blockers, "coobie_plan_critique_failed");
                     tracing::warn!(
                         blocking = critique.blocking_concerns.len(),
@@ -24385,6 +24395,64 @@ fn resolve_path_for_staged_workspace(
         }
     }
 
+    resolve_not_yet_created_path(trimmed, source_root, repo_root)
+}
+
+/// Resolve a declared path that does not exist on disk *yet*.
+///
+/// `canonicalize` fails on a missing path, so the loop above skips it and the
+/// whole entry is dropped. That silently made it impossible for a spec to
+/// declare a file it wants **created**: `js/bonus.js` was listed as
+/// `code_under_test`, resolved to nothing, and Mason's own proposal to create
+/// it was then rejected as "outside the editable scope" (run a9bf44cf) — after
+/// a 30 KB response had already been generated and parsed.
+///
+/// Containment is still enforced, just against the nearest ancestor that does
+/// exist: the parent directory is canonicalized and must sit inside the source
+/// root, so `../../etc/passwd` resolves outside and is still refused. Only the
+/// final, missing components are taken on trust.
+fn resolve_not_yet_created_path(
+    trimmed: &str,
+    source_root: &Path,
+    repo_root: &Path,
+) -> Option<String> {
+    let candidate = PathBuf::from(trimmed);
+    let candidates = if candidate.is_absolute() {
+        vec![candidate]
+    } else {
+        vec![source_root.join(trimmed), repo_root.join(trimmed)]
+    };
+
+    for candidate in candidates {
+        // Walk up to the nearest existing ancestor, remembering what we skipped.
+        let mut missing = Vec::new();
+        let mut cursor = candidate.as_path();
+        loop {
+            let Some(parent) = cursor.parent() else { break };
+            let Some(name) = cursor.file_name() else {
+                break;
+            };
+            missing.push(name.to_owned());
+            if let Ok(anchor) = parent.canonicalize() {
+                if !anchor.starts_with(source_root) && anchor != source_root {
+                    break; // outside the workspace — not ours to write
+                }
+                let mut resolved = anchor;
+                for part in missing.iter().rev() {
+                    resolved.push(part);
+                }
+                let relative = resolved.strip_prefix(source_root).ok()?;
+                let normalized = normalize_project_path(&relative.display().to_string());
+                return if normalized.is_empty() {
+                    None
+                } else {
+                    Some(normalized)
+                };
+            }
+            cursor = parent;
+        }
+    }
+
     None
 }
 
@@ -30093,6 +30161,36 @@ Required sections, all of them:
 
 Treat every guardrail and required check in the constraints as a hard requirement that the plan must visibly address, not merely respect.";
 
+/// Operator override that demotes Coobie's plan critique from blocking to
+/// advisory. **Off by default** — set `HARKONNEN_CRITIQUE_ADVISORY=1`.
+///
+/// The critique gates the implementation boundary: any blocking concern pauses
+/// the run before Mason writes, and there is no resume-into-implementation path
+/// once that happens, so a blocked run must be started over. The critic is an
+/// LLM judging a plan against a large auto-generated guardrail set, and it does
+/// not converge: across runs 7db36804, 108d08b7 and c3f7fe58 — same spec, each
+/// plan addressing the previous round's objections — it returned a different
+/// set of blockers every time. That makes "satisfy the critic" an unbounded
+/// loop rather than a fixable defect.
+///
+/// This does not discard the critique. The concerns are still written to
+/// `coobie_critique.json`, still logged, and still mark the blackboard blocker,
+/// so the reviewer sees exactly what was raised. It only stops them from
+/// halting the run, which is safe to opt into because Mason's edits land in a
+/// staged workspace and commit to a `mason/*` branch rather than to the
+/// operator's working tree.
+///
+/// Closing this properly is roadmap item v1-A (Guardrail Enforcement), which
+/// needs a real resume-into-implementation path; this is the interim control.
+fn critique_is_advisory() -> bool {
+    std::env::var("HARKONNEN_CRITIQUE_ADVISORY")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && value != "0" && value != "false"
+        })
+        .unwrap_or(false)
+}
+
 /// Upper bound on how much of the plan is handed to the critique. Generous on
 /// purpose: a Mason plan runs about 4–7 KB, so this holds a whole one with room
 /// to spare and only engages against a runaway generation.
@@ -32630,6 +32728,69 @@ mod tests {
     use chrono::{Duration, TimeZone};
     use serde_json::{json, Value};
     use std::sync::Mutex;
+
+    /// Regression for run a9bf44cf: a spec must be able to declare a file it
+    /// wants created. Before this, `js/bonus.js` resolved to nothing because it
+    /// did not exist, and Mason's proposal to create it was rejected as
+    /// "outside the editable scope".
+    #[test]
+    fn a_declared_path_resolves_before_the_file_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonicalize");
+        std::fs::create_dir_all(root.join("js")).expect("mkdir js");
+        std::fs::write(root.join("js/data.js"), "// existing\n").expect("write");
+
+        assert_eq!(
+            resolve_path_for_staged_workspace("js/data.js", &root, &root),
+            Some("js/data.js".to_string()),
+            "an existing file must still resolve"
+        );
+        assert_eq!(
+            resolve_path_for_staged_workspace("js/bonus.js", &root, &root),
+            Some("js/bonus.js".to_string()),
+            "a file that does not exist yet must resolve so it can be created"
+        );
+    }
+
+    /// Containment still holds for a missing path — the nearest existing
+    /// ancestor is what gets checked, so escaping the workspace is refused.
+    #[test]
+    fn a_missing_path_outside_the_workspace_is_still_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonicalize");
+        std::fs::create_dir_all(root.join("inner")).expect("mkdir");
+        let inner = root.join("inner");
+
+        assert_eq!(
+            resolve_path_for_staged_workspace("../escape.js", &inner, &inner),
+            None,
+            "a missing path resolving outside the source root must not be editable"
+        );
+    }
+
+    /// The override must be opt-in, and must not trip on the spellings a person
+    /// would plausibly use to turn it *off*.
+    #[test]
+    fn critique_advisory_override_is_off_unless_explicitly_enabled() {
+        let restore = std::env::var("HARKONNEN_CRITIQUE_ADVISORY").ok();
+
+        std::env::remove_var("HARKONNEN_CRITIQUE_ADVISORY");
+        assert!(!critique_is_advisory(), "unset must block");
+
+        for off in ["0", "false", "", "  "] {
+            std::env::set_var("HARKONNEN_CRITIQUE_ADVISORY", off);
+            assert!(!critique_is_advisory(), "{off:?} must block");
+        }
+        for on in ["1", "true", "yes"] {
+            std::env::set_var("HARKONNEN_CRITIQUE_ADVISORY", on);
+            assert!(critique_is_advisory(), "{on:?} must be advisory");
+        }
+
+        match restore {
+            Some(value) => std::env::set_var("HARKONNEN_CRITIQUE_ADVISORY", value),
+            None => std::env::remove_var("HARKONNEN_CRITIQUE_ADVISORY"),
+        }
+    }
 
     /// Regression for run 3b74a3e9. A realistic ~7 KB plan must reach the critic
     /// whole; the old 3000-char cut sliced off the Twin Narrative and Risks
