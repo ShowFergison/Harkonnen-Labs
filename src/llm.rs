@@ -549,10 +549,47 @@ struct GeminiGenerationConfig {
     #[serde(rename = "maxOutputTokens")]
     max_output_tokens: u32,
     temperature: f32,
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<GeminiThinkingConfig>,
+}
+
+/// Gemini 2.5+ and 3.x bill *reasoning* tokens against `maxOutputTokens`. A
+/// thinking-heavy prompt can therefore spend the entire budget before emitting
+/// a single token of answer: measured against `gemini-3.5-flash` with a 300
+/// token budget, `thoughtsTokenCount` came back 284 and the reply was a 12
+/// token fragment. Sending `thinkingBudget: 0` moved all 296 tokens to the
+/// answer, so the budget is spent on output rather than on deliberation.
+///
+/// This matters here more than it would elsewhere: Mason's edit lane must
+/// return whole files in one response, and a starved reply reaches the parser
+/// looking like a malformed one, which sends the caller hunting a formatting
+/// bug that does not exist.
+#[derive(Serialize)]
+struct GeminiThinkingConfig {
+    #[serde(rename = "thinkingBudget")]
+    thinking_budget: i32,
+}
+
+/// Reasoning-token budget for Gemini calls. Defaults to `0` (no thinking) so
+/// the whole output budget is available for the answer. Set
+/// `GEMINI_THINKING_BUDGET` to a positive token count to allow that much
+/// deliberation, or to `-1` to omit the field entirely and let the model
+/// decide — the pre-fix behavior, which starves long generations.
+fn gemini_thinking_budget() -> Option<i32> {
+    let configured = std::env::var("GEMINI_THINKING_BUDGET")
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(0);
+    if configured < 0 {
+        None
+    } else {
+        Some(configured)
+    }
 }
 
 #[derive(Deserialize)]
 struct GeminiResponse {
+    #[serde(default)]
     candidates: Vec<GeminiCandidate>,
     #[serde(rename = "usageMetadata", default)]
     usage_metadata: GeminiUsageMetadata,
@@ -564,21 +601,87 @@ struct GeminiUsageMetadata {
     prompt_token_count: u32,
     #[serde(rename = "candidatesTokenCount", default)]
     candidates_token_count: u32,
+    #[serde(rename = "thoughtsTokenCount", default)]
+    thoughts_token_count: u32,
 }
 
 #[derive(Deserialize)]
 struct GeminiCandidate {
-    content: GeminiCandidateContent,
+    /// Absent when the candidate carries no content at all — which is exactly
+    /// what a fully thought-starved response looks like.
+    #[serde(default)]
+    content: Option<GeminiCandidateContent>,
+    #[serde(rename = "finishReason", default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct GeminiCandidateContent {
+    #[serde(default)]
     parts: Vec<GeminiResponsePart>,
 }
 
 #[derive(Deserialize)]
 struct GeminiResponsePart {
+    /// A thought part carries no `text`, so this must tolerate its absence
+    /// rather than failing the whole response.
+    #[serde(default)]
     text: String,
+}
+
+/// Turn a parsed Gemini response into answer text, refusing anything the caller
+/// would otherwise mistake for a complete reply.
+///
+/// Two failures are indistinguishable from success downstream unless caught
+/// here: an empty answer, and one cut off at the token ceiling. Both previously
+/// returned `Ok("")` or `Ok(<fragment>)`, so the caller reported "the model
+/// returned nothing parseable" and the real cause — the budget — stayed hidden.
+fn gemini_content_from_response(parsed: &GeminiResponse) -> Result<String> {
+    let finish_reason = parsed
+        .candidates
+        .first()
+        .and_then(|candidate| candidate.finish_reason.clone())
+        .unwrap_or_default();
+
+    let content = parsed
+        .candidates
+        .iter()
+        .filter_map(|candidate| candidate.content.as_ref())
+        .flat_map(|content| content.parts.iter())
+        .map(|part| part.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+
+    let thoughts = parsed.usage_metadata.thoughts_token_count;
+    let answered = parsed.usage_metadata.candidates_token_count;
+
+    if finish_reason == "MAX_TOKENS" {
+        bail!(
+            "Gemini stopped at the output token ceiling (finishReason=MAX_TOKENS) after \
+             emitting {answered} answer token(s) and spending {thoughts} on reasoning. The \
+             reply is truncated, not malformed. Reasoning tokens are billed against \
+             maxOutputTokens, so either raise the caller's token budget or lower \
+             GEMINI_THINKING_BUDGET (currently {budget}).",
+            budget = gemini_thinking_budget()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unset — model decides".to_string())
+        );
+    }
+
+    if content.trim().is_empty() {
+        bail!(
+            "Gemini returned an empty response (finishReason={reason}, {thoughts} reasoning \
+             token(s), {answered} answer token(s)). An empty body is a failed call, not an \
+             empty answer.",
+            reason = if finish_reason.is_empty() {
+                "unreported"
+            } else {
+                &finish_reason
+            }
+        );
+    }
+
+    Ok(content)
 }
 
 #[async_trait::async_trait]
@@ -620,6 +723,8 @@ impl LlmProvider for GeminiClient {
             generation_config: GeminiGenerationConfig {
                 max_output_tokens: req.max_tokens,
                 temperature: req.temperature,
+                thinking_config: gemini_thinking_budget()
+                    .map(|thinking_budget| GeminiThinkingConfig { thinking_budget }),
             },
         };
 
@@ -647,13 +752,7 @@ impl LlmProvider for GeminiClient {
             output_tokens: parsed.usage_metadata.candidates_token_count,
             latency_ms,
         });
-        let content = parsed
-            .candidates
-            .into_iter()
-            .flat_map(|c| c.content.parts)
-            .map(|p| p.text)
-            .collect::<Vec<_>>()
-            .join("");
+        let content = gemini_content_from_response(&parsed)?;
 
         Ok(LlmResponse { content, usage })
     }
@@ -765,10 +864,93 @@ impl LlmProvider for OpenAiClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        anthropic_messages_url, gemini_generate_content_url, openai_chat_completions_url,
-        optional_api_key, ProviderBackend,
+        anthropic_messages_url, gemini_content_from_response, gemini_generate_content_url,
+        openai_chat_completions_url, optional_api_key, GeminiResponse, ProviderBackend,
     };
     use crate::setup::ProviderConfig;
+
+    fn parse_gemini(raw: &str) -> GeminiResponse {
+        serde_json::from_str(raw).expect("fixture must deserialize")
+    }
+
+    /// Captured verbatim from `gemini-3.5-flash` with `maxOutputTokens: 300`:
+    /// 284 of the 300 tokens went to reasoning and the answer was a fragment.
+    /// The old parser returned that fragment as if it were the whole reply.
+    #[test]
+    fn gemini_truncated_by_thinking_is_an_error_not_a_fragment() {
+        let response = parse_gemini(
+            r#"{
+              "candidates": [{
+                "content": {"parts": [{"text": "To create a rich, interactive"}], "role": "model"},
+                "finishReason": "MAX_TOKENS"
+              }],
+              "usageMetadata": {
+                "promptTokenCount": 40,
+                "candidatesTokenCount": 12,
+                "thoughtsTokenCount": 284
+              }
+            }"#,
+        );
+
+        let err = gemini_content_from_response(&response)
+            .expect_err("a truncated reply must not be reported as success");
+        let message = err.to_string();
+        assert!(message.contains("MAX_TOKENS"), "message was: {message}");
+        assert!(message.contains("284"), "message was: {message}");
+    }
+
+    /// A fully thought-starved candidate carries no `content` at all. This used
+    /// to fail deserialization or collapse to `Ok("")` depending on the shape.
+    #[test]
+    fn gemini_candidate_without_content_is_an_error() {
+        let response = parse_gemini(
+            r#"{
+              "candidates": [{"finishReason": "STOP"}],
+              "usageMetadata": {"thoughtsTokenCount": 512, "candidatesTokenCount": 0}
+            }"#,
+        );
+
+        let err = gemini_content_from_response(&response)
+            .expect_err("an empty body is a failed call, not an empty answer");
+        assert!(err.to_string().contains("empty"), "message was: {err}");
+    }
+
+    /// Thought parts arrive without a `text` field. They must not break parsing,
+    /// but a response consisting only of them still has no answer in it.
+    #[test]
+    fn gemini_thought_only_parts_do_not_count_as_an_answer() {
+        let response = parse_gemini(
+            r#"{
+              "candidates": [{
+                "content": {"parts": [{"thoughtSignature": "EroJCrcJARFNMg"}], "role": "model"},
+                "finishReason": "STOP"
+              }],
+              "usageMetadata": {"thoughtsTokenCount": 300, "candidatesTokenCount": 0}
+            }"#,
+        );
+
+        let err = gemini_content_from_response(&response)
+            .expect_err("thought-only parts carry no answer");
+        assert!(err.to_string().contains("empty"), "message was: {err}");
+    }
+
+    #[test]
+    fn gemini_complete_response_returns_joined_text() {
+        let response = parse_gemini(
+            r#"{
+              "candidates": [{
+                "content": {"parts": [{"text": "var a = 1;"}, {"text": "\nvar b = 2;"}], "role": "model"},
+                "finishReason": "STOP"
+              }],
+              "usageMetadata": {"candidatesTokenCount": 12}
+            }"#,
+        );
+
+        assert_eq!(
+            gemini_content_from_response(&response).expect("a complete reply must parse"),
+            "var a = 1;\nvar b = 2;"
+        );
+    }
 
     #[test]
     fn openai_base_url_defaults_to_public_api() {
