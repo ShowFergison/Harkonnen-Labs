@@ -7832,14 +7832,13 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
             let prompt_support = self.agent_prompt_support("mason", spec_obj, target_source);
             let system_instruction = prompt_support
                 .as_ref()
-                .map(|support| format!(
-                    "{}
-
-Task contract:
-You are Mason, an implementation planning specialist for a software factory. You receive a YAML spec and operating constraints. Produce a clear, actionable implementation plan in Markdown with sections: ## Target, ## Scope, ## Acceptance Criteria, ## Recommended Steps, ## Risks. Be specific and avoid filler.",
-                    support.system_instruction
-                ))
-                .unwrap_or_else(|| "You are Mason, an implementation planning specialist for a software factory. You receive a YAML spec and operating constraints. Produce a clear, actionable implementation plan in Markdown with sections: ## Target, ## Scope, ## Acceptance Criteria, ## Recommended Steps, ## Risks. Be specific and avoid filler.".to_string());
+                .map(|support| {
+                    format!(
+                        "{}\n\nTask contract:\n{MASON_PLAN_TASK_CONTRACT}",
+                        support.system_instruction
+                    )
+                })
+                .unwrap_or_else(|| MASON_PLAN_TASK_CONTRACT.to_string());
             let repo_context_block = prompt_support
                 .as_ref()
                 .map(|support| support.repo_context_block.as_str())
@@ -11124,7 +11123,7 @@ Produce the validation analysis and note any checks Coobie asked for that are st
                      Identify any blind spots and return your critique as JSON.",
                     spec_id = spec_obj.id,
                     spec_title = spec_obj.title,
-                    plan = implementation_plan.chars().take(3000).collect::<String>(),
+                    plan = critique_plan_excerpt(&implementation_plan),
                 ),
             );
 
@@ -30066,6 +30065,67 @@ fn summarize_episode_state_diff(
     })
 }
 
+/// The section contract Mason's plan must satisfy.
+///
+/// This has to stay in step with what Coobie's critique enforces, because the
+/// critique gates the implementation boundary: a blocking concern pauses the
+/// run before Mason writes anything. The earlier contract asked for five
+/// sections while the critique judged the plan against the guardrails and
+/// required checks it was handed — so a plan could satisfy every word of its
+/// own instructions and still be blocked for omitting a planning-choices log
+/// nobody ever asked it to write. Runs 6488912b, 5dec7801 and 9b5e37c0 all
+/// died that way. The last four sections exist to answer the critique's
+/// standing demands directly.
+const MASON_PLAN_TASK_CONTRACT: &str = "You are Mason, an implementation planning specialist for a software factory. \
+You receive a YAML spec and operating constraints. Produce a clear, actionable implementation plan in Markdown. \
+Be specific and avoid filler.
+
+Required sections, all of them:
+## Target
+## Scope
+## Acceptance Criteria
+## Recommended Steps
+## Risks
+## Major Planning Choices Log — for each significant decision, record *Chosen*, *Rejected* (the alternatives you did not take) and *Justification*. Where the constraints name a learned intervention or an optimization program, reopen that alternative here and say plainly whether you are keeping or overturning the prior justification.
+## Stale Memory Revalidation — list every challenged or stale lesson named in the constraints by its exact identifier, and for each one state whether current file evidence confirms it, supersedes it, or leaves it unresolved.
+## Evidence Changes — if the constraints cite prior forge or run evidence, explain what has changed since that evidence before you claim any command path will now pass.
+## Twin Narrative & Missing Production Conditions — name which external systems are simulated, stubbed, or absent, and which production conditions the environment does not reproduce.
+
+Treat every guardrail and required check in the constraints as a hard requirement that the plan must visibly address, not merely respect.";
+
+/// Upper bound on how much of the plan is handed to the critique. Generous on
+/// purpose: a Mason plan runs about 4–7 KB, so this holds a whole one with room
+/// to spare and only engages against a runaway generation.
+const CRITIQUE_PLAN_MAX_CHARS: usize = 24_000;
+
+/// Render the implementation plan for Coobie's critique **without silently
+/// dropping the back half of it**.
+///
+/// This used to be `plan.chars().take(3000)`. Coobie gates the implementation
+/// boundary — any blocking concern it raises pauses the run before Mason writes
+/// a line — and it was being asked to judge completeness from the first 3000
+/// characters of a ~7000 character document. Every plan longer than the cut
+/// therefore looked truncated *because it was*, and Coobie correctly reported
+/// the missing tail as missing sections. Measured on run 3b74a3e9: the window
+/// ended mid-sentence at "3. **Choice**: ", and the plan's Twin Narrative
+/// (char 3378) and Risks (char 6431) sections were never shown. All three
+/// blockers it returned were accurate descriptions of the truncated text.
+///
+/// If a plan ever does exceed the cap, the excerpt says so in-band, so the
+/// critic can tell a real omission from a display limit.
+fn critique_plan_excerpt(plan: &str) -> String {
+    if plan.chars().count() <= CRITIQUE_PLAN_MAX_CHARS {
+        return plan.to_string();
+    }
+
+    let head: String = plan.chars().take(CRITIQUE_PLAN_MAX_CHARS).collect();
+    format!(
+        "{head}\n\n[EXCERPT TRUNCATED at {CRITIQUE_PLAN_MAX_CHARS} characters for review. \
+         The plan continues past this point — do NOT report the sections below this line as \
+         missing.]"
+    )
+}
+
 fn build_implementation_transaction_boundary(
     run_id: &str,
     spec_id: &str,
@@ -32570,6 +32630,44 @@ mod tests {
     use chrono::{Duration, TimeZone};
     use serde_json::{json, Value};
     use std::sync::Mutex;
+
+    /// Regression for run 3b74a3e9. A realistic ~7 KB plan must reach the critic
+    /// whole; the old 3000-char cut sliced off the Twin Narrative and Risks
+    /// sections and the run was blocked for "missing" content that was present.
+    #[test]
+    fn critique_sees_the_whole_plan_not_just_the_first_3000_chars() {
+        let mut plan = String::from("## Target\nthe product\n\n### Major Planning Choices Log\n");
+        while plan.chars().count() < 3200 {
+            plan.push_str("1. **Choice**: a decision with rationale and alternatives.\n");
+        }
+        plan.push_str("\n## Twin Narrative & Missing Production Conditions\noffline only\n");
+        plan.push_str("\n## Risks\n| Pack Phase Breakdown | Medium | atomic edits |\n");
+
+        let excerpt = critique_plan_excerpt(&plan);
+
+        assert!(
+            excerpt.contains("Twin Narrative"),
+            "the section that used to fall past the cut must be visible"
+        );
+        assert!(
+            excerpt.contains("Pack Phase Breakdown"),
+            "the Risks table must be visible"
+        );
+        assert_eq!(excerpt, plan, "a normal plan must pass through untouched");
+    }
+
+    /// A runaway plan is still capped, but the cut is announced so the critic
+    /// does not report the truncation itself as a missing section.
+    #[test]
+    fn critique_excerpt_labels_truncation_when_the_plan_is_enormous() {
+        let plan = "x".repeat(CRITIQUE_PLAN_MAX_CHARS + 500);
+
+        let excerpt = critique_plan_excerpt(&plan);
+
+        assert!(excerpt.contains("EXCERPT TRUNCATED"));
+        assert!(excerpt.contains("do NOT report the sections below this line as missing"));
+        assert!(excerpt.chars().count() < plan.chars().count() + 400);
+    }
 
     #[tokio::test]
     async fn edit_proposal_retry_feeds_the_parse_error_back_and_succeeds() {
